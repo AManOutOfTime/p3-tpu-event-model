@@ -72,6 +72,7 @@ int main(int argc, char** argv) {
     engine.register_unit(std::make_unique<DelayUnit>("access_core_1", 0));
     engine.register_unit(std::make_unique<DelayUnit>("access_core_2", 0));
     engine.register_unit(std::make_unique<DelayUnit>("dma",           0));
+    engine.register_unit(std::make_unique<DelayUnit>("vector_core",   0));
 
     // Register ops and build scheduler.
     OpRegistry reg;

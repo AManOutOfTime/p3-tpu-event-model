@@ -1,0 +1,384 @@
+# FlashAttention-2 forward pass — single tile simulation
+# One outer iteration (i=0) × one inner iteration (j=0).
+#
+# Algorithm source: Dao, T. "FlashAttention-2: Faster Attention with Better
+#   Parallelism and Work Partitioning." ICLR 2024. Algorithm 1.
+# Attention formula: Vaswani et al. "Attention Is All You Need." NeurIPS 2017.
+#   Attention(Q,K,V) = softmax(Q K^T / sqrt(d_k)) V
+#
+# Hardware unit mapping (Google TPU v4 style):
+#   dma          — HBM <-> SRAM transfers (single channel; ops are serialized)
+#   access_core_1 — transpose, init-fill, scatter/gather  [Jouppi et al. 2017]
+#   systolic     — GEMM on systolic array (Q@K^T, P@V)   [Jouppi et al. 2017]
+#   tandem_1     — elementwise vector ops: scale, exp, accumulate
+#   vector_core  — reduction ops: rowmax, rowsum, log
+#
+# Dependency notes:
+#   - All DMA ops are serialized (single channel): 0→4→5→6→15→20→21
+#   - Pre-inner state (m, l, O_acc) explicitly wired into inner-body consumers
+#     because the flat schedule has no implicit phase ordering.
+#   - Resource contention on access_core_1 is modeled via explicit deps
+#     between sequential ops on the same unit.
+#   - latency_cycles values are placeholder estimates; real units will derive
+#     them from arch params (systolic dims, HBM bandwidth, etc.).
+#
+# Changes from fa2-edited-schedule.yaml:
+#   1. Flattened sub_schedule/loops/pre_inner/inner_body/post_inner into a
+#      flat 'schedule:' list (required by our YAML parser).
+#   2. Unit names fixed: tandem→tandem_1, access_core→access_core_1;
+#      vector_core added as a registered unit in sim_main.
+#   3. Added latency_cycles to every op (required by DelayUnit / 'delay' op).
+#   4. Added explicit pre_inner→inner_body deps for first-iteration state:
+#        update_m_correction depends on init_m   (reads m_old)
+#        update_l            depends on init_l   (reads l_old)
+#        rescale_O           depends on init_O_acc (reads O_acc)
+#   5. Removed init_m→init_O_acc data dependency (no data flow between them;
+#      kept serialization via access_core_1 resource dep chain 1→2→3).
+#   6. Removed unnecessary load_V dep from load_P_systolic_array; matmul_PV
+#      retains the explicit load_V dep for operand-readiness documentation.
+
+schedule:
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Phase 1 — pre-inner: load Q and initialize per-row accumulators
+  # (runs once per outer iteration before the inner j-loop)
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Load Q tile from HBM into shared IBUF
+  # Data: Q_i ← HBM  (FA2 Alg.1 line 3)
+  - id: 0
+    op: delay
+    unit: dma
+    label: "[PRE] DMA load Q_tile [i*Br:(i+1)*Br, 0:d_head]"
+    params:
+      latency_cycles: 50
+      source:      "HBM.Q[i*Br:(i+1)*Br, 0:d_head]"
+      destination: "shared_ibuf.Q_tile"
+      rows: "Br"
+      cols: "d_head"
+
+  # Initialize O accumulator tile to zero
+  # Data: O_i ← 0  (FA2 Alg.1 line 4)
+  - id: 1
+    op: delay
+    unit: access_core_1
+    label: "[PRE] Init O_acc = 0  [Br x d_head]"
+    params:
+      latency_cycles: 10
+      destination: "shared_obuf.O_acc"
+      rows: "Br"
+      cols: "d_head"
+      init_value: 0
+
+  # Initialize running row-max to -inf (independent of O_acc init)
+  # Data: m_i ← -inf  (FA2 Alg.1 line 4)
+  # Note: depends on [1] to serialize on access_core_1, not for data flow.
+  - id: 2
+    op: delay
+    unit: access_core_1
+    depends_on: [1]
+    label: "[PRE] Init m = -inf  [Br]"
+    params:
+      latency_cycles: 5
+      destination: "shared_obuf.m"
+      length: "Br"
+      init_value: "-inf"
+
+  # Initialize running row-sum to zero
+  # Data: l_i ← 0  (FA2 Alg.1 line 4)
+  # Note: depends on [2] to serialize on access_core_1.
+  - id: 3
+    op: delay
+    unit: access_core_1
+    depends_on: [2]
+    label: "[PRE] Init l = 0  [Br]"
+    params:
+      latency_cycles: 5
+      destination: "shared_obuf.l"
+      length: "Br"
+      init_value: 0
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Phase 2 — inner body: one K/V column block (j=0)
+  # (runs Tc times total; this models the first and only iteration)
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Issue Q_tile from IBUF to systolic array input register
+  # Must wait for Q to be loaded (0) and DMA to be free.
+  - id: 4
+    op: delay
+    unit: dma
+    depends_on: [0]
+    label: "[INNER j=0] DMA issue Q_tile -> systolic_array.Q_operand"
+    params:
+      latency_cycles: 10
+      source:      "shared_ibuf.Q_tile"
+      destination: "systolic_array.Q_operand"
+      rows: "Br"
+      cols: "d_head"
+
+  # Load K tile from HBM (serialized after Q issue on single DMA channel)
+  # Data: K_j ← HBM  (FA2 Alg.1 line 6)
+  - id: 5
+    op: delay
+    unit: dma
+    depends_on: [4]
+    label: "[INNER j=0] DMA load K_tile [j*Bc:(j+1)*Bc, 0:d_head]"
+    params:
+      latency_cycles: 50
+      source:      "HBM.K[j*Bc:(j+1)*Bc, 0:d_head]"
+      destination: "shared_ibuf.K_tile"
+      rows: "Bc"
+      cols: "d_head"
+
+  # Load V tile from HBM (serialized after K load on single DMA channel)
+  # Data: V_j ← HBM  (FA2 Alg.1 line 6)
+  - id: 6
+    op: delay
+    unit: dma
+    depends_on: [5]
+    label: "[INNER j=0] DMA load V_tile [j*Bc:(j+1)*Bc, 0:d_head]"
+    params:
+      latency_cycles: 50
+      source:      "HBM.V[j*Bc:(j+1)*Bc, 0:d_head]"
+      destination: "shared_ibuf.V_tile"
+      rows: "Bc"
+      cols: "d_head"
+
+  # Transpose K_tile: [Bc x d_head] -> [d_head x Bc] for Q @ K^T
+  # Source: Q K^T requires K transposed (Vaswani 2017 Eq. 1)
+  # Runs on access_core_1; starts when K is in IBUF (5) and AC is free (after 3).
+  - id: 7
+    op: delay
+    unit: access_core_1
+    depends_on: [5]
+    label: "[INNER j=0] Transpose K_tile -> K_tile_T  [d_head x Bc]"
+    params:
+      latency_cycles: 20
+      source:      "shared_ibuf.K_tile"
+      destination: "shared_ibuf.K_tile_T"
+      input_rows:  "Bc"
+      input_cols:  "d_head"
+      output_rows: "d_head"
+      output_cols: "Bc"
+
+  # GEMM: S_tile = Q_tile @ K_tile_T  [Br x Bc]
+  # Data: S_ij = Q_i K_j^T  (FA2 Alg.1 line 7)
+  # Needs Q in systolic operand register (4) and K^T in IBUF (7).
+  - id: 8
+    op: delay
+    unit: systolic
+    depends_on: [4, 7]
+    label: "[INNER j=0] GEMM: S_tile = Q_tile @ K_tile_T  [Br x Bc]"
+    params:
+      latency_cycles: 200
+      source_a:    "systolic_array.Q_operand"
+      source_b:    "shared_ibuf.K_tile_T"
+      destination: "shared_obuf.S_tile"
+      M: "Br"
+      N: "Bc"
+      K: "d_head"
+
+  # Scale S by 1/sqrt(d_head) — temperature scaling
+  # Source: Vaswani 2017 Eq. 1: Attention = softmax(QK^T / sqrt(d_k)) V
+  - id: 9
+    op: delay
+    unit: tandem_1
+    depends_on: [8]
+    label: "[INNER j=0] Scale S_tile /= sqrt(d_head)"
+    params:
+      latency_cycles: 15
+      source:      "shared_obuf.S_tile"
+      destination: "shared_obuf.S_tile"
+      rows: "Br"
+      cols: "Bc"
+      scale: "1/sqrt(d_head)"
+
+  # Row-max reduction: rowmax_tmp[Br] = max over cols of S_tile
+  # Data: m_ij = rowmax(S_ij)  (FA2 Alg.1 line 8)
+  - id: 10
+    op: delay
+    unit: vector_core
+    depends_on: [9]
+    label: "[INNER j=0] rowmax(S_tile) -> rowmax_tmp  [Br]"
+    params:
+      latency_cycles: 10
+      source:      "shared_obuf.S_tile"
+      destination: "private_tandem_memory.rowmax_tmp"
+      rows: "Br"
+      cols: "Bc"
+
+  # Update running row-max and compute correction factor
+  # m_new = max(m_old, rowmax_tmp)
+  # correction = exp(m_old - m_new)           (FA2 Alg.1 lines 9, 10)
+  # Reads m_old from shared_obuf.m (written by init_m id=2, first iter).
+  - id: 11
+    op: delay
+    unit: vector_core
+    depends_on: [10, 2]
+    label: "[INNER j=0] Update m: m=max(m,rowmax); correction=exp(m_old-m_new)  [Br]"
+    params:
+      latency_cycles: 15
+      source_m_old:            "shared_obuf.m"
+      source_rowmax:           "private_tandem_memory.rowmax_tmp"
+      destination_m:           "shared_obuf.m"
+      destination_correction:  "shared_obuf.correction"
+      length: "Br"
+
+  # Compute attention weights: P_tile = exp(S_tile - m_new)  [Br x Bc]
+  # Data: P_ij = exp(S_ij - m_i^new)  (FA2 Alg.1 line 11)
+  # Uses updated m from (11); broadcasts m over columns.
+  - id: 12
+    op: delay
+    unit: tandem_1
+    depends_on: [11]
+    label: "[INNER j=0] Compute P_tile = exp(S_tile - m_new)  [Br x Bc]"
+    params:
+      latency_cycles: 30
+      source_s:    "shared_obuf.S_tile"
+      source_m:    "shared_obuf.m"
+      destination: "shared_ibuf.P_tile"
+      rows: "Br"
+      cols: "Bc"
+
+  # Update running row-sum: l = correction * l_old + rowsum(P_tile)  [Br]
+  # Data: l_i^new = exp(m_i-m_i^new)*l_i + rowsum(P_ij)  (FA2 Alg.1 line 12)
+  # Reads l_old from shared_obuf.l (written by init_l id=3, first iter).
+  - id: 13
+    op: delay
+    unit: vector_core
+    depends_on: [12, 11, 3]
+    label: "[INNER j=0] Update l: l = correction*l_old + rowsum(P_tile)  [Br]"
+    params:
+      latency_cycles: 15
+      source_p:          "shared_ibuf.P_tile"
+      source_correction: "shared_obuf.correction"
+      source_l_old:      "shared_obuf.l"
+      destination:       "shared_obuf.l"
+      rows: "Br"
+      cols: "Bc"
+
+  # Rescale O accumulator: O_acc *= correction  (row-wise broadcast)
+  # Data: diag(exp(m_i-m_i^new)) * O_i  (FA2 Alg.1 line 13, first term)
+  # Reads O_acc from shared_obuf.O_acc (written by init_O_acc id=1, first iter).
+  # Can run in parallel with compute_P (12) and update_l (13) — different unit.
+  - id: 14
+    op: delay
+    unit: tandem_1
+    depends_on: [11, 1]
+    label: "[INNER j=0] Rescale O_acc *= correction  [Br x d_head]"
+    params:
+      latency_cycles: 30
+      source_o:          "shared_obuf.O_acc"
+      source_correction: "shared_obuf.correction"
+      destination:       "shared_obuf.O_acc"
+      rows: "Br"
+      cols: "d_head"
+
+  # Issue P_tile from IBUF to systolic array for P @ V GEMM
+  # Waits for P to be computed (12) and for DMA to be free (after load_V id=6).
+  - id: 15
+    op: delay
+    unit: dma
+    depends_on: [12, 6]
+    label: "[INNER j=0] DMA issue P_tile -> systolic_array.P_operand"
+    params:
+      latency_cycles: 10
+      source:      "shared_ibuf.P_tile"
+      destination: "systolic_array.P_operand"
+      rows: "Br"
+      cols: "Bc"
+
+  # GEMM: Temp = P_tile @ V_tile  [Br x d_head]
+  # Data: P_ij @ V_j  (FA2 Alg.1 line 13, second term)
+  # Needs P in systolic operand (15) and V_tile in IBUF (6, explicit for clarity).
+  - id: 16
+    op: delay
+    unit: systolic
+    depends_on: [15, 6]
+    label: "[INNER j=0] GEMM: Temp = P_tile @ V_tile  [Br x d_head]"
+    params:
+      latency_cycles: 200
+      source_a:    "systolic_array.P_operand"
+      source_b:    "shared_ibuf.V_tile"
+      destination: "shared_obuf.Temp"
+      M: "Br"
+      N: "d_head"
+      K: "Bc"
+
+  # Accumulate: O_acc += Temp  (add rescaled old O and new P@V contribution)
+  # Data: O_i = diag(exp(m_i-m_i^new))*O_i + P_ij@V_j  (FA2 Alg.1 line 13)
+  - id: 17
+    op: delay
+    unit: tandem_1
+    depends_on: [14, 16]
+    label: "[INNER j=0] Accumulate O_acc += Temp  [Br x d_head]"
+    params:
+      latency_cycles: 20
+      source_o:    "shared_obuf.O_acc"
+      source_temp: "shared_obuf.Temp"
+      destination: "shared_obuf.O_acc"
+      rows: "Br"
+      cols: "d_head"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Phase 3 — post-inner: normalize output and store to HBM
+  # (runs once per outer iteration after all j-iterations complete)
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Normalize: O_tile = O_acc / l  (diag(1/l) applied row-wise)
+  # Data: O_i = diag(l_i^{-1}) * O_i  (FA2 Alg.1 line 15)
+  - id: 18
+    op: delay
+    unit: tandem_1
+    depends_on: [17, 13]
+    label: "[POST] Finalize O_tile = O_acc / l  [Br x d_head]"
+    params:
+      latency_cycles: 30
+      source_o:    "shared_obuf.O_acc"
+      source_l:    "shared_obuf.l"
+      destination: "shared_obuf.O_tile"
+      rows: "Br"
+      cols: "d_head"
+
+  # Compute logsumexp: L_tile = m + log(l)  [Br]
+  # Data: L_i = m_i + log(l_i)  (FA2 Alg.1 line 16)
+  # Depends on finalize_O (18) to ensure O is computed before L is finalized.
+  - id: 19
+    op: delay
+    unit: vector_core
+    depends_on: [11, 13, 18]
+    label: "[POST] Finalize L_tile = m + log(l)  [Br]"
+    params:
+      latency_cycles: 10
+      source_m:    "shared_obuf.m"
+      source_l:    "shared_obuf.l"
+      destination: "shared_obuf.L_tile"
+      length: "Br"
+
+  # Store O tile to HBM
+  # Data: write O_i to HBM  (FA2 Alg.1 line 17)
+  - id: 20
+    op: delay
+    unit: dma
+    depends_on: [18]
+    label: "[POST] DMA store O[i*Br:(i+1)*Br, 0:d_head] -> HBM"
+    params:
+      latency_cycles: 50
+      source:      "shared_obuf.O_tile"
+      destination: "HBM.O[i*Br:(i+1)*Br, 0:d_head]"
+      rows: "Br"
+      cols: "d_head"
+
+  # Store L tile to HBM (serialized after store_O on single DMA channel)
+  # Data: write L_i to HBM  (FA2 Alg.1 line 18)
+  - id: 21
+    op: delay
+    unit: dma
+    depends_on: [19, 20]
+    label: "[POST] DMA store L[i*Br:(i+1)*Br] -> HBM"
+    params:
+      latency_cycles: 10
+      source:      "shared_obuf.L_tile"
+      destination: "HBM.L[i*Br:(i+1)*Br]"
+      length: "Br"
