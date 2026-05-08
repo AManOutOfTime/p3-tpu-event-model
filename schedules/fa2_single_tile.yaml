@@ -8,7 +8,7 @@
 #
 # Hardware unit mapping (Google TPU v4 style):
 #   dma          — HBM <-> SRAM transfers (single channel; ops are serialized)
-#   access_core_1 — transpose, init-fill, scatter/gather  [Jouppi et al. 2017]
+#   access_core — transpose, init-fill, scatter/gather  [Jouppi et al. 2017]
 #   systolic     — GEMM on systolic array (Q@K^T, P@V)   [Jouppi et al. 2017]
 #   vector_core     — elementwise vector ops: scale, exp, accumulate
 #   vector_core  — reduction ops: rowmax, rowsum, log
@@ -17,7 +17,7 @@
 #   - All DMA ops are serialized (single channel): 0→4→5→6→15→20→21
 #   - Pre-inner state (m, l, O_acc) explicitly wired into inner-body consumers
 #     because the flat schedule has no implicit phase ordering.
-#   - Resource contention on access_core_1 is modeled via explicit deps
+#   - Resource contention on access_core is modeled via explicit deps
 #     between sequential ops on the same unit.
 #   - latency_cycles values are placeholder estimates; real units will derive
 #     them from arch params (systolic dims, HBM bandwidth, etc.).
@@ -32,7 +32,7 @@
 #        update_l            depends on init_l   (reads l_old)
 #        rescale_O           depends on init_O_acc (reads O_acc)
 #   5. Removed init_m→init_O_acc data dependency (no data flow between them;
-#      kept serialization via access_core_1 resource dep chain 1→2→3).
+#      kept serialization via access_core resource dep chain 1→2→3).
 #   6. Removed unnecessary load_V dep from load_P_systolic_array; matmul_PV
 #      retains the explicit load_V dep for operand-readiness documentation.
 
@@ -60,7 +60,7 @@ schedule:
   # Data: O_i ← 0  (FA2 Alg.1 line 4)
   - id: 1
     op: delay
-    unit: access_core_1
+    unit: access_core
     label: "[PRE] Init O_acc = 0  [Br x d_head]"
     params:
       latency_cycles: 10
@@ -71,10 +71,10 @@ schedule:
 
   # Initialize running row-max to -inf (independent of O_acc init)
   # Data: m_i ← -inf  (FA2 Alg.1 line 4)
-  # Note: depends on [1] to serialize on access_core_1, not for data flow.
+  # Note: depends on [1] to serialize on access_core, not for data flow.
   - id: 2
     op: delay
-    unit: access_core_1
+    unit: access_core
     depends_on: [1]
     label: "[PRE] Init m = -inf  [Br]"
     params:
@@ -85,10 +85,10 @@ schedule:
 
   # Initialize running row-sum to zero
   # Data: l_i ← 0  (FA2 Alg.1 line 4)
-  # Note: depends on [2] to serialize on access_core_1.
+  # Note: depends on [2] to serialize on access_core.
   - id: 3
     op: delay
-    unit: access_core_1
+    unit: access_core
     depends_on: [2]
     label: "[PRE] Init l = 0  [Br]"
     params:
@@ -146,10 +146,10 @@ schedule:
 
   # Transpose K_tile: [Bc x d_head] -> [d_head x Bc] for Q @ K^T
   # Source: Q K^T requires K transposed (Vaswani 2017 Eq. 1)
-  # Runs on access_core_1; starts when K is in IBUF (5) and AC is free (after 3).
+  # Runs on access_core; starts when K is in IBUF (5) and AC is free (after 3).
   - id: 7
     op: delay
-    unit: access_core_1
+    unit: access_core
     depends_on: [5]
     label: "[INNER j=0] Transpose K_tile -> K_tile_T  [d_head x Bc]"
     params:
