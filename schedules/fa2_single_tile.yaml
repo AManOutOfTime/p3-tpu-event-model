@@ -14,7 +14,8 @@
 #   vector_core  — reduction ops: rowmax, rowsum, log
 #
 # Dependency notes:
-#   - All DMA ops are serialized (single channel): 0→4→5→6→15→20→21
+#   - DMA ops are serialized by the hardware table; explicit deps keep the
+#     intended single-tile load/store order: 0→4→5→14→19→20
 #   - Pre-inner state (m, l, O_acc) explicitly wired into inner-body consumers
 #     because the flat schedule has no implicit phase ordering.
 #   - Resource contention is handled by the scheduler: same-unit work starts
@@ -101,24 +102,24 @@ schedule:
 
   # Issue Q_tile from IBUF to systolic array input register
   # Must wait for Q to be loaded (0) and DMA to be free.
+  # - id: 4
+  #   op: delay
+  #   unit: dma
+  #   depends_on: [0]
+  #   label: "[INNER j=0] DMA issue Q_tile -> systolic_array.Q_operand"
+  #   params:
+  #     latency_cycles: 10
+  #     source:      "shared_ibuf.Q_tile"
+  #     destination: "systolic_array.Q_operand"
+  #     rows: "Br"
+  #     cols: "d_k"
+
+  # Load K tile from HBM (serialized after Q issue on single DMA channel)
+  # Data: K_j ← HBM  (FA2 Alg.1 line 6)
   - id: 4
     op: delay
     unit: dma
     depends_on: [0]
-    label: "[INNER j=0] DMA issue Q_tile -> systolic_array.Q_operand"
-    params:
-      latency_cycles: 10
-      source:      "shared_ibuf.Q_tile"
-      destination: "systolic_array.Q_operand"
-      rows: "Br"
-      cols: "d_k"
-
-  # Load K tile from HBM (serialized after Q issue on single DMA channel)
-  # Data: K_j ← HBM  (FA2 Alg.1 line 6)
-  - id: 5
-    op: delay
-    unit: dma
-    depends_on: [4]
     label: "[INNER j=0] DMA load K_tile [j*Bc:(j+1)*Bc, 0:d_k]"
     params:
       latency_cycles: 50
@@ -129,10 +130,10 @@ schedule:
 
   # Load V tile from HBM (serialized after K load on single DMA channel)
   # Data: V_j ← HBM  (FA2 Alg.1 line 6)
-  - id: 6
+  - id: 5
     op: delay
     unit: dma
-    depends_on: [5]
+    depends_on: [4]
     label: "[INNER j=0] DMA load V_tile [j*Bc:(j+1)*Bc, 0:d_head]"
     params:
       latency_cycles: 50
@@ -143,11 +144,11 @@ schedule:
 
   # Transpose K_tile: [Bc x d_k] -> [d_k x Bc] for Q @ K^T
   # Source: Q K^T requires K transposed (Vaswani 2017 Eq. 1)
-  # Runs on access_core; starts when K is in IBUF (5) and AC is free (after 3).
-  - id: 7
+  # Runs on access_core; starts when K is in IBUF (4) and AC is free.
+  - id: 6
     op: delay
     unit: access_core
-    depends_on: [5]
+    depends_on: [4]
     label: "[INNER j=0] Transpose K_tile -> K_tile_T  [d_k x Bc]"
     params:
       latency_cycles: 20
@@ -160,11 +161,11 @@ schedule:
 
   # GEMM: S_tile = Q_tile @ K_tile_T  [Br x Bc]
   # Data: S_ij = Q_i K_j^T  (FA2 Alg.1 line 7)
-  # Needs Q in systolic operand register (4) and K^T in IBUF (7).
-  - id: 8
+  # Needs Q in IBUF (0) and K^T in IBUF (6).
+  - id: 7
     op: gemm
     unit: systolic
-    depends_on: [4, 7]
+    depends_on: [0, 6]
     label: "[INNER j=0] GEMM: S_tile = Q_tile @ K_tile_T  [Br x Bc]"
     params:
       latency_cycles: 200
@@ -177,10 +178,10 @@ schedule:
 
   # Scale S by 1/sqrt(d_k) — temperature scaling
   # Source: Vaswani 2017 Eq. 1: Attention = softmax(QK^T / sqrt(d_k)) V
-  - id: 9
+  - id: 8
     op: delay
     unit: vector_core
-    depends_on: [8]
+    depends_on: [7]
     label: "[INNER j=0] Scale S_tile /= sqrt(d_k)"
     params:
       latency_cycles: 15
@@ -192,10 +193,10 @@ schedule:
 
   # Row-max reduction: rowmax_tmp[Br] = max over cols of S_tile
   # Data: m_ij = rowmax(S_ij)  (FA2 Alg.1 line 8)
-  - id: 10
+  - id: 9
     op: delay
     unit: vector_core
-    depends_on: [9]
+    depends_on: [8]
     label: "[INNER j=0] rowmax(S_tile) -> rowmax_tmp  [Br]"
     params:
       latency_cycles: 10
@@ -208,10 +209,10 @@ schedule:
   # m_new = max(m_old, rowmax_tmp)
   # correction = exp(m_old - m_new)           (FA2 Alg.1 lines 9, 10)
   # Reads m_old from shared_obuf.m (written by init_m id=2, first iter).
-  - id: 11
+  - id: 10
     op: delay
     unit: vector_core
-    depends_on: [10, 2]
+    depends_on: [9, 2]
     label: "[INNER j=0] Update m: m=max(m,rowmax); correction=exp(m_old-m_new)  [Br]"
     params:
       latency_cycles: 15
@@ -224,10 +225,10 @@ schedule:
   # Compute attention weights: P_tile = exp(S_tile - m_new)  [Br x Bc]
   # Data: P_ij = exp(S_ij - m_i^new)  (FA2 Alg.1 line 11)
   # Uses updated m from (11); broadcasts m over columns.
-  - id: 12
+  - id: 11
     op: delay
     unit: vector_core
-    depends_on: [11]
+    depends_on: [10]
     label: "[INNER j=0] Compute P_tile = exp(S_tile - m_new)  [Br x Bc]"
     params:
       latency_cycles: 30
@@ -240,10 +241,10 @@ schedule:
   # Update running row-sum: l = correction * l_old + rowsum(P_tile)  [Br]
   # Data: l_i^new = exp(m_i-m_i^new)*l_i + rowsum(P_ij)  (FA2 Alg.1 line 12)
   # Reads l_old from shared_obuf.l (written by init_l id=3, first iter).
-  - id: 13
+  - id: 12
     op: delay
     unit: vector_core
-    depends_on: [12, 11, 3]
+    depends_on: [11, 10, 3]
     label: "[INNER j=0] Update l: l = correction*l_old + rowsum(P_tile)  [Br]"
     params:
       latency_cycles: 15
@@ -258,10 +259,10 @@ schedule:
   # Data: diag(exp(m_i-m_i^new)) * O_i  (FA2 Alg.1 line 13, first term)
   # Reads O_acc from shared_obuf.O_acc (written by init_O_acc id=1, first iter).
   # Can run in parallel with compute_P (12) and update_l (13) — different unit.
-  - id: 14
+  - id: 13
     op: delay
     unit: vector_core
-    depends_on: [11, 1]
+    depends_on: [10, 1]
     label: "[INNER j=0] Rescale O_acc *= correction  [Br x d_head]"
     params:
       latency_cycles: 30
@@ -271,12 +272,13 @@ schedule:
       rows: "Br"
       cols: "d_head"
 
-  # Issue P_tile from IBUF to systolic array for P @ V GEMM
-  # Waits for P to be computed (12) and for DMA to be free (after load_V id=6).
-  - id: 15
+  # Issue P_tile from IBUF to systolic array for P @ V GEMM.
+  # Data dependency: P_tile must be computed by id=11.
+  # DMA availability is handled by the hardware table, not by depends_on.
+  - id: 14
     op: delay
     unit: dma
-    depends_on: [12, 6]
+    depends_on: [11]
     label: "[INNER j=0] DMA issue P_tile -> systolic_array.P_operand"
     params:
       latency_cycles: 10
@@ -287,11 +289,11 @@ schedule:
 
   # GEMM: Temp = P_tile @ V_tile  [Br x d_head]
   # Data: P_ij @ V_j  (FA2 Alg.1 line 13, second term)
-  # Needs P in systolic operand (15) and V_tile in IBUF (6, explicit for clarity).
-  - id: 16
+  # Needs P in systolic operand (14) and V_tile in IBUF (5).
+  - id: 15
     op: delay
     unit: systolic
-    depends_on: [15, 6]
+    depends_on: [14, 5]
     label: "[INNER j=0] GEMM: Temp = P_tile @ V_tile  [Br x d_head]"
     params:
       latency_cycles: 200
@@ -304,10 +306,10 @@ schedule:
 
   # Accumulate: O_acc += Temp  (add rescaled old O and new P@V contribution)
   # Data: O_i = diag(exp(m_i-m_i^new))*O_i + P_ij@V_j  (FA2 Alg.1 line 13)
-  - id: 17
+  - id: 16
     op: delay
     unit: vector_core
-    depends_on: [14, 16]
+    depends_on: [13, 15]
     label: "[INNER j=0] Accumulate O_acc += Temp  [Br x d_head]"
     params:
       latency_cycles: 20
@@ -324,10 +326,10 @@ schedule:
 
   # Normalize: O_tile = O_acc / l  (diag(1/l) applied row-wise)
   # Data: O_i = diag(l_i^{-1}) * O_i  (FA2 Alg.1 line 15)
-  - id: 18
+  - id: 17
     op: delay
     unit: vector_core
-    depends_on: [17, 13]
+    depends_on: [16, 12]
     label: "[POST] Finalize O_tile = O_acc / l  [Br x d_head]"
     params:
       latency_cycles: 30
@@ -339,11 +341,11 @@ schedule:
 
   # Compute logsumexp: L_tile = m + log(l)  [Br]
   # Data: L_i = m_i + log(l_i)  (FA2 Alg.1 line 16)
-  # Depends on finalize_O (18) to ensure O is computed before L is finalized.
-  - id: 19
+  # Depends on finalize_O (17) so post-inner outputs are finalized in order.
+  - id: 18
     op: delay
     unit: vector_core
-    depends_on: [11, 13, 18]
+    depends_on: [10, 12, 17]
     label: "[POST] Finalize L_tile = m + log(l)  [Br]"
     params:
       latency_cycles: 10
@@ -354,10 +356,10 @@ schedule:
 
   # Store O tile to HBM
   # Data: write O_i to HBM  (FA2 Alg.1 line 17)
-  - id: 20
+  - id: 19
     op: delay
     unit: dma
-    depends_on: [18]
+    depends_on: [17]
     label: "[POST] DMA store O[i*Br:(i+1)*Br, 0:d_head] -> HBM"
     params:
       latency_cycles: 50
@@ -368,10 +370,10 @@ schedule:
 
   # Store L tile to HBM (serialized after store_O on single DMA channel)
   # Data: write L_i to HBM  (FA2 Alg.1 line 18)
-  - id: 21
+  - id: 20
     op: delay
     unit: dma
-    depends_on: [19, 20]
+    depends_on: [18, 19]
     label: "[POST] DMA store L[i*Br:(i+1)*Br] -> HBM"
     params:
       latency_cycles: 10

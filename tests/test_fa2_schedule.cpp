@@ -64,12 +64,12 @@ bool has_dep(const Instruction& inst, InstructionId dep) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Test 1: File loads and has exactly 22 instructions with correct fields
+// Test 1: File loads and has exactly 21 instructions with correct fields
 // ---------------------------------------------------------------------------
-TEST_CASE("fa2 file: parses 22 instructions with correct ids and units") {
+TEST_CASE("fa2 file: parses 21 instructions with correct ids and units") {
     Schedule s = Schedule::from_yaml_file(FA2_PATH);
 
-    REQUIRE(s.instructions.size() == 22);
+    REQUIRE(s.instructions.size() == 21);
 
     // id=0: first DMA load (load Q tile from HBM)
     REQUIRE(s.instructions[0].id   == 0);
@@ -82,23 +82,23 @@ TEST_CASE("fa2 file: parses 22 instructions with correct ids and units") {
     REQUIRE(s.instructions[1].unit == "access_core");
     REQUIRE(pget_int(s.instructions[1].params, "latency_cycles") == 10);
 
-    // id=8: first GEMM on systolic (Q @ K^T)
-    REQUIRE(s.instructions[8].id   == 8);
-    REQUIRE(s.instructions[8].unit == "systolic");
-    REQUIRE(pget_int(s.instructions[8].params, "latency_cycles") == 200);
+    // id=7: first GEMM on systolic (Q @ K^T)
+    REQUIRE(s.instructions[7].id   == 7);
+    REQUIRE(s.instructions[7].unit == "systolic");
+    REQUIRE(pget_int(s.instructions[7].params, "latency_cycles") == 200);
 
-    // id=10: rowmax on vector_core
-    REQUIRE(s.instructions[10].id   == 10);
-    REQUIRE(s.instructions[10].unit == "vector_core");
+    // id=9: rowmax on vector_core
+    REQUIRE(s.instructions[9].id   == 9);
+    REQUIRE(s.instructions[9].unit == "vector_core");
 
-    // id=16: second GEMM on systolic (P @ V)
-    REQUIRE(s.instructions[16].id   == 16);
-    REQUIRE(s.instructions[16].unit == "systolic");
-    REQUIRE(pget_int(s.instructions[16].params, "latency_cycles") == 200);
+    // id=15: second GEMM on systolic (P @ V)
+    REQUIRE(s.instructions[15].id   == 15);
+    REQUIRE(s.instructions[15].unit == "systolic");
+    REQUIRE(pget_int(s.instructions[15].params, "latency_cycles") == 200);
 
-    // id=21: last DMA store (store L to HBM)
-    REQUIRE(s.instructions[21].id   == 21);
-    REQUIRE(s.instructions[21].unit == "dma");
+    // id=20: last DMA store (store L to HBM)
+    REQUIRE(s.instructions[20].id   == 20);
+    REQUIRE(s.instructions[20].unit == "dma");
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ TEST_CASE("fa2 file: params are parsed correctly from YAML") {
     }
 
     // Spot-check GEMM params use "M", "N", "K" keys (set in the YAML)
-    const auto& qk = s.instructions[8];
+    const auto& qk = s.instructions[7];
     REQUIRE(qk.params.count("M") == 1);
     REQUIRE(qk.params.count("N") == 1);
     REQUIRE(qk.params.count("K") == 1);
@@ -131,40 +131,42 @@ TEST_CASE("fa2 file: params are parsed correctly from YAML") {
 TEST_CASE("fa2 file: dependency edges are algorithmically correct") {
     Schedule s = Schedule::from_yaml_file(FA2_PATH);
 
-    // GEMM QK (8) needs Q issued to systolic (4) AND K transposed (7)
-    REQUIRE(s.instructions[8].depends_on.size() == 2);
-    REQUIRE(has_dep(s.instructions[8], 4));
-    REQUIRE(has_dep(s.instructions[8], 7));
+    // GEMM QK (7) needs Q loaded (0) AND K transposed (6)
+    REQUIRE(s.instructions[7].depends_on.size() == 2);
+    REQUIRE(has_dep(s.instructions[7], 0));
+    REQUIRE(has_dep(s.instructions[7], 6));
 
-    // update_m_correction (11): needs rowmax (10) AND m_old written by init_m (2)
-    REQUIRE(has_dep(s.instructions[11], 10));
-    REQUIRE(has_dep(s.instructions[11], 2));
+    // update_m_correction (10): needs rowmax (9) AND m_old written by init_m (2)
+    REQUIRE(has_dep(s.instructions[10], 9));
+    REQUIRE(has_dep(s.instructions[10], 2));
 
-    // update_l (13): needs l_old written by init_l (3) — pre-inner → inner link
-    REQUIRE(has_dep(s.instructions[13], 3));
+    // update_l (12): needs P (11), correction (10), and l_old from init_l (3)
+    REQUIRE(has_dep(s.instructions[12], 11));
+    REQUIRE(has_dep(s.instructions[12], 10));
+    REQUIRE(has_dep(s.instructions[12], 3));
 
-    // rescale_O (14): needs O_acc written by init_O_acc (1) — pre-inner → inner link
-    REQUIRE(has_dep(s.instructions[14], 1));
+    // rescale_O (13): needs correction (10) and O_acc from init_O_acc (1)
+    REQUIRE(has_dep(s.instructions[13], 10));
+    REQUIRE(has_dep(s.instructions[13], 1));
 
-    // load_P_systolic (15): waits for compute_P (12) AND load_V done (6)
-    REQUIRE(has_dep(s.instructions[15], 12));
-    REQUIRE(has_dep(s.instructions[15], 6));
+    // load_P_systolic (14): waits for compute_P (11)
+    REQUIRE(has_dep(s.instructions[14], 11));
 
-    // matmul_PV (16): needs P in systolic (15) and V tile in IBUF (6)
-    REQUIRE(has_dep(s.instructions[16], 15));
-    REQUIRE(has_dep(s.instructions[16], 6));
+    // matmul_PV (15): needs P in systolic (14) and V tile in IBUF (5)
+    REQUIRE(has_dep(s.instructions[15], 14));
+    REQUIRE(has_dep(s.instructions[15], 5));
 
-    // finalize_O (18): needs accumulate_O (17) AND final l (13)
-    REQUIRE(has_dep(s.instructions[18], 17));
-    REQUIRE(has_dep(s.instructions[18], 13));
+    // finalize_O (17): needs accumulate_O (16) AND final l (12)
+    REQUIRE(has_dep(s.instructions[17], 16));
+    REQUIRE(has_dep(s.instructions[17], 12));
 
-    // store_L (21): waits for finalize_L (19) AND store_O (20)
-    REQUIRE(has_dep(s.instructions[21], 19));
-    REQUIRE(has_dep(s.instructions[21], 20));
+    // store_L (20): waits for finalize_L (18) AND store_O (19)
+    REQUIRE(has_dep(s.instructions[20], 18));
+    REQUIRE(has_dep(s.instructions[20], 19));
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: Full simulation — all 22 instructions complete with all_done()
+// Test 4: Full simulation — all 21 instructions complete with all_done()
 // ---------------------------------------------------------------------------
 TEST_CASE("fa2 file: all 22 instructions complete") {
     std::stringstream ss;
@@ -184,7 +186,7 @@ TEST_CASE("fa2 file: all 22 instructions complete") {
 
 // ---------------------------------------------------------------------------
 // Test 5: DMA ops are fully serialized (single channel)
-// DMA chain must be: 0→4→5→6→15→20→21 in strictly increasing start cycles.
+// DMA chain must be: 0→4→5→14→19→20 in strictly increasing start cycles.
 // ---------------------------------------------------------------------------
 TEST_CASE("fa2 file: DMA ops are serialized in order") {
     std::stringstream ss;
@@ -205,9 +207,9 @@ TEST_CASE("fa2 file: DMA ops are serialized in order") {
     sched.launch();
     engine.run();
 
-    // DMA serialization order: load_Q(0) -> Q_issue(4) -> load_K(5) ->
-    //   load_V(6) -> load_P_systolic(15) -> store_O(20) -> store_L(21)
-    const std::vector<InstructionId> dma_order = {0, 4, 5, 6, 15, 20, 21};
+    // DMA serialization order: load_Q(0) -> load_K(4) -> load_V(5) ->
+    //   load_P_systolic(14) -> store_O(19) -> store_L(20)
+    const std::vector<InstructionId> dma_order = {0, 4, 5, 14, 19, 20};
     for (size_t i = 1; i < dma_order.size(); i++) {
         InstructionId prev = dma_order[i - 1];
         InstructionId cur  = dma_order[i];
@@ -215,7 +217,7 @@ TEST_CASE("fa2 file: DMA ops are serialized in order") {
             "DMA instr ", cur, " started before instr ", prev);
     }
     // store_L must start strictly after store_O finishes
-    REQUIRE(start_at[21] > start_at[20]);
+    REQUIRE(start_at[20] > start_at[19]);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,9 +244,9 @@ TEST_CASE("fa2 file: pre-inner completes before inner GEMM starts") {
     engine.run();
 
     // init_l (id=3) is the last pre-inner op on access_core
-    // GEMM QK (id=8) must start after init_m (id=2) which is in pre-inner
-    REQUIRE(start_at[8] > done_at[2]);   // GEMM starts after m is initialised
-    REQUIRE(done_at[8]  > done_at[3]);   // GEMM ends after all pre-inner done
+    // GEMM QK (id=7) must start after init_m (id=2) which is in pre-inner
+    REQUIRE(start_at[7] > done_at[2]);   // GEMM starts after m is initialised
+    REQUIRE(done_at[7]  > done_at[3]);   // GEMM ends after all pre-inner done
 }
 
 // ---------------------------------------------------------------------------
