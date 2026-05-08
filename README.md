@@ -86,9 +86,9 @@ Expected output for `dummy_example.yaml` (320-cycle serial chain):
 
 ```
 == simulation start  instructions=4 ==
-[cycle        0 | 0.000 ns]  OP_START     -> dma                "DMA load K_tile from HBM"
-  [dma]  START  instr=0  @cycle=0  lat=50  "DMA load K_tile from HBM"
-  [dma]  DONE   instr=0  @cycle=50  "DMA load K_tile from HBM"
+[cycle        0 | 0.000 ns]  OP_START     -> dma_0              "DMA load K_tile from HBM"
+  [dma_0]  START  instr=0  @cycle=0  lat=50  "DMA load K_tile from HBM"
+  [dma_0]  DONE   instr=0  @cycle=50  "DMA load K_tile from HBM"
 ...
 == simulation done  cycle=320  (320.000 ns)  outstanding=0 ==
 ```
@@ -99,8 +99,8 @@ Expected output for `dummy_example.yaml` (320-cycle serial chain):
 
 1. Copy `src/units/delay_unit.h/.cpp` → `src/units/my_unit.h/.cpp`, rename class, implement `handle()`.
 2. Add `units/my_unit.cpp` to the `SIM_CORE_SOURCES` list in `src/CMakeLists.txt`.
-3. Register in `apps/sim_main.cpp`: `engine.register_unit(std::make_unique<MyUnit>("my_unit", arch, ...))`.
-4. Reference `unit: my_unit` in your schedule YAML.
+3. Register physical instances in `apps/sim_main.cpp`, e.g. `my_unit_0`, `my_unit_1`.
+4. Reference the logical pool name in YAML, e.g. `unit: my_unit`; the scheduler picks the earliest-free physical instance.
 
 ## How to add a new op (any granularity)
 
@@ -131,12 +131,12 @@ TEST_CASE("my test") { REQUIRE(1 + 1 == 2); }
 | `clock_ghz` | 1.0 | Clock frequency. `cycles / clock_ghz = ns`. |
 | `systolic.rows/cols` | 128×128 | Systolic array dimensions |
 | `systolic.precision` | BF16 | FP8 / FP16 / BF16 / FP32 |
-| `vector_cores` | 3 | Number of Tandem vector cores |
-| `access_cores` | 2 | Number of Access Cores (transpose, scatter-gather) |
+| `vector_cores` | 3 | Number of vector cores |
+| `access_cores` | 1 | Number of Access Cores (transpose, scatter-gather) |
 | `sram.ibuf_kb` | 4096 | Shared input buffer |
 | `sram.obuf_kb` | 4096 | Shared output buffer |
 | `sram.banking_factor` | 8 | Concurrent r/w ports per cycle |
-| `sram.private_tandem_kb` | 512 | Per-vector-core private SRAM |
+| `sram.private_vector_kb` | 512 | Per-vector-core private SRAM |
 | `hbm.bandwidth_tb_s` | 2.0 | HBM bandwidth (TB/s) |
 | `hbm.latency_cycles` | 200 | HBM round-trip latency in cycles |
 | `dma.channels` | 1 | DMA channels |

@@ -27,11 +27,11 @@ sub_schedule:
       unit: dma
       label: "DMA load Q_tile [i*Br : (i+1)*Br]"
       params:
-        source: "HBM.Q[i*Br:(i+1)*Br, 0:d_head]"
+        source: "HBM.Q[i*Br:(i+1)*Br, 0:d_k]"
         destination: "shared_ibuf.Q_tile"
-        memory_range: "Q rows i*Br:(i+1)*Br, cols 0:d_head"
+        memory_range: "Q rows i*Br:(i+1)*Br, cols 0:d_k"
         rows: "Br"
-        cols: "d_head"
+        cols: "d_k"
         double_buffered_destination: true
 
     - id: init_O_acc
@@ -83,20 +83,20 @@ sub_schedule:
       params:
         source: "shared_ibuf.Q_tile"
         destination: "systolic_array.Q_operand"
-        memory_range: "Q_tile rows 0:Br, cols 0:d_head"
+        memory_range: "Q_tile rows 0:Br, cols 0:d_k"
         rows: "Br"
-        cols: "d_head"
+        cols: "d_k"
 
     - id: load_K
       op: delay
       unit: dma
       label: "DMA load K_tile [j*Bc : (j+1)*Bc]"
       params:
-        source: "HBM.K[j*Bc:(j+1)*Bc, 0:d_head]"
+        source: "HBM.K[j*Bc:(j+1)*Bc, 0:d_k]"
         destination: "shared_ibuf.K_tile"
-        memory_range: "K rows j*Bc:(j+1)*Bc, cols 0:d_head"
+        memory_range: "K rows j*Bc:(j+1)*Bc, cols 0:d_k"
         rows: "Bc"
-        cols: "d_head"
+        cols: "d_k"
         double_buffered_destination: true
 
     - id: load_V
@@ -120,10 +120,10 @@ sub_schedule:
       params:
         source: "shared_ibuf.K_tile"
         destination: "shared_ibuf.K_tile_T"
-        memory_range: "K_tile transpose Bc x d_head -> d_head x Bc"
+        memory_range: "K_tile transpose Bc x d_k -> d_k x Bc"
         input_rows: "Bc"
-        input_cols: "d_head"
-        output_rows: "d_head"
+        input_cols: "d_k"
+        output_rows: "d_k"
         output_cols: "Bc"
 
     - id: matmul_QK
@@ -138,20 +138,20 @@ sub_schedule:
         memory_range: "S_tile rows 0:Br, cols 0:Bc"
         m: "Br"
         n: "Bc"
-        k: "d_head"
+        k: "d_k"
 
     - id: scale_S
       op: delay
       unit: tandem
       depends_on: [matmul_QK]
-      label: "S_tile /= sqrt(head_dim)"
+      label: "S_tile /= sqrt(d_k)"
       params:
         source: "shared_obuf.S_tile"
         destination: "shared_obuf.S_tile"
         memory_range: "S_tile rows 0:Br, cols 0:Bc"
         rows: "Br"
         cols: "Bc"
-        scale: "1/sqrt(d_head)"
+        scale: "1/sqrt(d_k)"
 
     - id: rowmax_S
       op: delay

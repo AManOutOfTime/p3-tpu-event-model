@@ -26,24 +26,27 @@ static const std::string FA2_PATH =
 namespace {
 
 void add_delay_op(OpRegistry& reg) {
-    reg.register_op("delay", [](const IssueCtx& ctx) {
-        UnitId t = ctx.engine.find_unit(ctx.inst.unit);
-        REQUIRE(t != INVALID_UNIT);
+    auto fixed_latency_op = [](const IssueCtx& ctx) {
+        std::vector<UnitId> targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        REQUIRE(!targets.empty());
+        Cycle latency = static_cast<Cycle>(pget_int(ctx.inst.params, "latency_cycles", 10));
+        UnitReservation reservation = ctx.scheduler.reserve_unit_pool(targets, latency);
         Event e;
         e.type    = EventType::OP_START;
-        e.target  = t;
-        e.cycle   = ctx.engine.current_cycle();
+        e.target  = reservation.id;
+        e.cycle   = reservation.start;
         e.instr   = ctx.inst.id;
         e.label   = ctx.inst.label;
-        e.payload = static_cast<int64_t>(
-                        pget_int(ctx.inst.params, "latency_cycles", 10));
+        e.payload = static_cast<int64_t>(latency);
         ctx.engine.schedule(std::move(e));
-    });
+    };
+    reg.register_op("delay", fixed_latency_op);
+    reg.register_op("gemm", fixed_latency_op);
 }
 
 void register_fa2_units(EventEngine& engine, std::ostream& ss) {
-    for (const char* n : {"systolic", "tandem_1", "access_core_1",
-                          "vector_core", "dma"})
+    for (const char* n : {"systolic", "access_core_0", "vector_core_0",
+                          "vector_core_1", "vector_core_2", "dma_0"})
         engine.register_unit(std::make_unique<DelayUnit>(n, 0, nullptr, ss));
 }
 
@@ -74,9 +77,9 @@ TEST_CASE("fa2 file: parses 22 instructions with correct ids and units") {
     REQUIRE(s.instructions[0].unit == "dma");
     REQUIRE(pget_int(s.instructions[0].params, "latency_cycles") == 50);
 
-    // id=1: init O_acc on access_core_1
+    // id=1: init O_acc on access_core
     REQUIRE(s.instructions[1].id   == 1);
-    REQUIRE(s.instructions[1].unit == "access_core_1");
+    REQUIRE(s.instructions[1].unit == "access_core");
     REQUIRE(pget_int(s.instructions[1].params, "latency_cycles") == 10);
 
     // id=8: first GEMM on systolic (Q @ K^T)
@@ -238,7 +241,7 @@ TEST_CASE("fa2 file: pre-inner completes before inner GEMM starts") {
     sched.launch();
     engine.run();
 
-    // init_l (id=3) is the last pre-inner op on access_core_1
+    // init_l (id=3) is the last pre-inner op on access_core
     // GEMM QK (id=8) must start after init_m (id=2) which is in pre-inner
     REQUIRE(start_at[8] > done_at[2]);   // GEMM starts after m is initialised
     REQUIRE(done_at[8]  > done_at[3]);   // GEMM ends after all pre-inner done

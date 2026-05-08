@@ -10,13 +10,13 @@ systolic:
   precision: BF16          # FP8 | FP16 | BF16 | FP32
 
 vector_cores: 3
-access_cores: 2
+access_cores: 1
 
 sram:
   ibuf_kb:           4096   # shared input buffer
   obuf_kb:           4096   # shared output buffer
   banking_factor:    8      # concurrent r/w ports per cycle
-  private_tandem_kb: 512    # per-vector-core private SRAM
+  private_vector_kb: 512    # per-vector-core private SRAM
 
 hbm:
   bandwidth_tb_s: 2.0       # H100 ~3.35 TB/s; TPUv4 ~1.2 TB/s

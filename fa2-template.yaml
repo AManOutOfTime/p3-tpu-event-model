@@ -62,7 +62,7 @@ sub_schedule:
 
     - id: load_Q_systolic_array
       op: delay
-      unit: dma # include param section. in params add source: shared-ibuf/destination: systolic array
+      unit: dma # include param section. in params add source: shared-ibuf/destination: systolic array. Q dim is Br x d_k.
       label: "DMA load Q_tile [i*Br : (i+1)*Br]"
 
     - id: load_K
@@ -92,7 +92,7 @@ sub_schedule:
       op: delay
       unit: tandem_1 #create params section. Source: obuff/destination: obuff. Include matrix size in params. 
       depends_on: [matmul_QK]
-      label: "S_tile /= sqrt(head_dim)"
+      label: "S_tile /= sqrt(d_k)"
 
     - id: rowmax_S
       op: delay #

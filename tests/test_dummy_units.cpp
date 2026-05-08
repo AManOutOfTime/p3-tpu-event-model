@@ -17,15 +17,17 @@ namespace {
 // Register the built-in "delay" op that fires a single OP_START on inst.unit.
 void add_delay_op(OpRegistry& reg) {
     reg.register_op("delay", [](const IssueCtx& ctx) {
-        UnitId t = ctx.engine.find_unit(ctx.inst.unit);
-        REQUIRE(t != INVALID_UNIT);
+        std::vector<UnitId> targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        REQUIRE(!targets.empty());
+        Cycle latency = static_cast<Cycle>(pget_int(ctx.inst.params, "latency_cycles", 10));
+        UnitReservation reservation = ctx.scheduler.reserve_unit_pool(targets, latency);
         Event e;
         e.type    = EventType::OP_START;
-        e.target  = t;
-        e.cycle   = ctx.engine.current_cycle();
+        e.target  = reservation.id;
+        e.cycle   = reservation.start;
         e.instr   = ctx.inst.id;
         e.label   = ctx.inst.label;
-        e.payload = static_cast<int64_t>(pget_int(ctx.inst.params, "latency_cycles", 10));
+        e.payload = static_cast<int64_t>(latency);
         ctx.engine.schedule(std::move(e));
     });
 }
@@ -104,6 +106,88 @@ schedule:
     REQUIRE(final_cycle == 100);  // max of {100, 50, 75}
 }
 
+TEST_CASE("independent ops on one unit are serialized by scheduler reservation") {
+    std::stringstream ss;
+    EventEngine engine;
+    engine.register_unit(std::make_unique<DelayUnit>("vector_core", 0, nullptr, ss));
+
+    std::vector<Cycle> starts;
+    engine.set_trace([&](const Event& e) {
+        if (e.type == EventType::OP_START)
+            starts.push_back(e.cycle);
+    });
+
+    const char* yaml = R"(
+schedule:
+  - id: 0
+    op: delay
+    unit: vector_core
+    params: { latency_cycles: 100 }
+  - id: 1
+    op: delay
+    unit: vector_core
+    params: { latency_cycles: 50 }
+  - id: 2
+    op: delay
+    unit: vector_core
+    params: { latency_cycles: 75 }
+)";
+    Schedule   s = Schedule::from_yaml_string(yaml);
+    OpRegistry reg; add_delay_op(reg);
+    Scheduler  sched(engine, reg, s);
+    wire(engine, sched);
+
+    sched.launch();
+    Cycle final_cycle = engine.run();
+    REQUIRE(sched.all_done());
+    REQUIRE(starts == std::vector<Cycle>{0, 100, 150});
+    REQUIRE(final_cycle == 225);
+}
+
+TEST_CASE("logical unit pool picks the earliest free physical unit") {
+    std::stringstream ss;
+    EventEngine engine;
+    engine.register_unit(std::make_unique<DelayUnit>("vector_core_0", 0, nullptr, ss));
+    engine.register_unit(std::make_unique<DelayUnit>("vector_core_1", 0, nullptr, ss));
+
+    std::vector<Cycle> starts;
+    std::vector<std::string> targets;
+    engine.set_trace([&](const Event& e) {
+        if (e.type == EventType::OP_START) {
+            starts.push_back(e.cycle);
+            targets.push_back(engine.get_unit(e.target)->name());
+        }
+    });
+
+    const char* yaml = R"(
+schedule:
+  - id: 0
+    op: delay
+    unit: vector_core
+    params: { latency_cycles: 100 }
+  - id: 1
+    op: delay
+    unit: vector_core
+    params: { latency_cycles: 50 }
+  - id: 2
+    op: delay
+    unit: vector_core
+    params: { latency_cycles: 75 }
+)";
+    Schedule   s = Schedule::from_yaml_string(yaml);
+    OpRegistry reg; add_delay_op(reg);
+    Scheduler  sched(engine, reg, s);
+    wire(engine, sched);
+
+    sched.launch();
+    Cycle final_cycle = engine.run();
+    REQUIRE(sched.all_done());
+    REQUIRE(starts == std::vector<Cycle>{0, 0, 50});
+    REQUIRE(targets == std::vector<std::string>{
+        "vector_core_0", "vector_core_1", "vector_core_1"});
+    REQUIRE(final_cycle == 125);
+}
+
 TEST_CASE("diamond dependency graph: critical path determines final cycle") {
     // A(10) -> B(20), A(10) -> C(30) -> D(5)
     // Critical path: A + C + D = 10 + 30 + 5 = 45
@@ -146,13 +230,13 @@ schedule:
 }
 
 TEST_CASE("coarse op fires events across multiple units simultaneously") {
-    // A composite 'fa2_tile' op issues OP_START to dma, systolic, and tandem
+    // A composite 'fa2_tile' op issues OP_START to dma, systolic, and vector_core
     // at the same cycle. The longest (systolic, 60 cycles) determines the end.
     std::stringstream ss;
     EventEngine engine;
     engine.register_unit(std::make_unique<DelayUnit>("dma",      0, nullptr, ss));
     engine.register_unit(std::make_unique<DelayUnit>("systolic", 0, nullptr, ss));
-    engine.register_unit(std::make_unique<DelayUnit>("tandem",   0, nullptr, ss));
+    engine.register_unit(std::make_unique<DelayUnit>("vector_core", 0, nullptr, ss));
 
     // Track how many events fire at which cycle.
     std::vector<Cycle> event_cycles;
@@ -164,7 +248,7 @@ TEST_CASE("coarse op fires events across multiple units simultaneously") {
         for (auto sub : std::vector<Sub>{
                 {"dma",      30, "load_K"},
                 {"systolic", 60, "QK_T"},
-                {"tandem",   20, "scale"}}) {
+                {"vector_core", 20, "scale"}}) {
             Event e;
             e.type    = EventType::OP_START;
             e.target  = ctx.engine.find_unit(sub.unit);
@@ -215,10 +299,10 @@ TEST_CASE("dummy round-trip: sim_main style setup runs without errors") {
     std::stringstream ss;
     EventEngine engine(1.0);
 
-    engine.register_unit(std::make_unique<DelayUnit>("systolic",      0, nullptr, ss));
-    engine.register_unit(std::make_unique<DelayUnit>("tandem_1",      0, nullptr, ss));
-    engine.register_unit(std::make_unique<DelayUnit>("access_core_1", 0, nullptr, ss));
-    engine.register_unit(std::make_unique<DelayUnit>("dma",           0, nullptr, ss));
+    engine.register_unit(std::make_unique<DelayUnit>("systolic",    0, nullptr, ss));
+    engine.register_unit(std::make_unique<DelayUnit>("access_core_0", 0, nullptr, ss));
+    engine.register_unit(std::make_unique<DelayUnit>("dma_0",         0, nullptr, ss));
+    engine.register_unit(std::make_unique<DelayUnit>("vector_core_0", 0, nullptr, ss));
 
     const char* yaml = R"(
 schedule:
@@ -229,7 +313,7 @@ schedule:
     label: "DMA load K_tile"
   - id: 1
     op: delay
-    unit: access_core_1
+    unit: access_core
     params: { latency_cycles: 30 }
     depends_on: [0]
     label: "transpose"
@@ -241,7 +325,7 @@ schedule:
     label: "GEMM"
   - id: 3
     op: delay
-    unit: tandem_1
+    unit: vector_core
     params: { latency_cycles: 40 }
     depends_on: [2]
     label: "softmax"

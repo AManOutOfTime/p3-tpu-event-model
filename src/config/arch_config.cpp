@@ -29,7 +29,7 @@ ArchConfig parse(const YAML::Node& root) {
         try_load(s, "ibuf_kb",           c.sram.ibuf_kb);
         try_load(s, "obuf_kb",           c.sram.obuf_kb);
         try_load(s, "banking_factor",    c.sram.banking_factor);
-        try_load(s, "private_tandem_kb", c.sram.private_tandem_kb);
+        try_load(s, "private_vector_kb", c.sram.private_vector_kb);
     }
     if (auto s = root["hbm"]) {
         try_load(s, "bandwidth_tb_s", c.hbm.bandwidth_tb_s);
@@ -66,7 +66,7 @@ std::string ArchConfig::to_yaml_string() const {
             << YAML::Key << "ibuf_kb"           << YAML::Value << sram.ibuf_kb
             << YAML::Key << "obuf_kb"           << YAML::Value << sram.obuf_kb
             << YAML::Key << "banking_factor"    << YAML::Value << sram.banking_factor
-            << YAML::Key << "private_tandem_kb" << YAML::Value << sram.private_tandem_kb
+            << YAML::Key << "private_vector_kb" << YAML::Value << sram.private_vector_kb
             << YAML::EndMap
         << YAML::Key << "hbm"          << YAML::BeginMap
             << YAML::Key << "bandwidth_tb_s" << YAML::Value << hbm.bandwidth_tb_s

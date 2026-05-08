@@ -11,11 +11,11 @@ TEST_CASE("ArchConfig has correct defaults") {
     REQUIRE(c.systolic.cols          == 128);
     REQUIRE(c.systolic.precision     == "BF16");
     REQUIRE(c.vector_cores           == 3);
-    REQUIRE(c.access_cores           == 2);
+    REQUIRE(c.access_cores           == 1);
     REQUIRE(c.sram.ibuf_kb           == 4096);
     REQUIRE(c.sram.obuf_kb           == 4096);
     REQUIRE(c.sram.banking_factor    == 8);
-    REQUIRE(c.sram.private_tandem_kb == 512);
+    REQUIRE(c.sram.private_vector_kb == 512);
     REQUIRE(c.hbm.bandwidth_tb_s     == doctest::Approx(2.0));
     REQUIRE(c.hbm.latency_cycles     == 200);
     REQUIRE(c.dma.channels           == 1);
@@ -34,7 +34,7 @@ sram:
   ibuf_kb: 8192
   obuf_kb: 2048
   banking_factor: 16
-  private_tandem_kb: 1024
+  private_vector_kb: 1024
 hbm:
   bandwidth_tb_s: 3.35
   latency_cycles: 150
@@ -51,7 +51,7 @@ dma:
     REQUIRE(c.sram.ibuf_kb           == 8192);
     REQUIRE(c.sram.obuf_kb           == 2048);
     REQUIRE(c.sram.banking_factor    == 16);
-    REQUIRE(c.sram.private_tandem_kb == 1024);
+    REQUIRE(c.sram.private_vector_kb == 1024);
     REQUIRE(c.hbm.bandwidth_tb_s     == doctest::Approx(3.35));
     REQUIRE(c.hbm.latency_cycles     == 150);
     REQUIRE(c.dma.channels           == 2);

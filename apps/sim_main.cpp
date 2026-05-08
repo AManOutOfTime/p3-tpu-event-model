@@ -7,6 +7,8 @@
 #include "units/delay_unit.h"
 #include <iostream>
 #include <string>
+#include <stdexcept>
+#include <vector>
 
 using namespace sim;
 
@@ -15,23 +17,39 @@ using namespace sim;
 // constructing the Scheduler.
 // ---------------------------------------------------------------------------
 
-// "delay" op: issues one OP_START on inst.unit; latency from
+static void register_unit_pool(EventEngine& engine, const std::string& logical_name,
+                               uint32_t count) {
+    if (count == 0)
+        throw std::runtime_error("unit pool '" + logical_name + "' must have at least one unit");
+
+    for (uint32_t i = 0; i < count; i++)
+        engine.register_unit(std::make_unique<DelayUnit>(
+            logical_name + "_" + std::to_string(i), 0));
+}
+
+// Fixed-latency ops: issue one OP_START on inst.unit; latency comes from
 // params["latency_cycles"] (default 10). Works with any DelayUnit target.
 static void register_builtin_ops(OpRegistry& reg) {
-    reg.register_op("delay", [](const IssueCtx& ctx) {
-        UnitId target = ctx.engine.find_unit(ctx.inst.unit);
-        if (target == INVALID_UNIT)
-            throw std::runtime_error("delay op: unknown unit '" + ctx.inst.unit + "'");
+    auto fixed_latency_op = [](const IssueCtx& ctx) {
+        std::vector<UnitId> targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty())
+            throw std::runtime_error(ctx.inst.op + " op: unknown unit pool '" + ctx.inst.unit + "'");
+
+        Cycle latency = static_cast<Cycle>(pget_int(ctx.inst.params, "latency_cycles", 10));
+        UnitReservation reservation = ctx.scheduler.reserve_unit_pool(targets, latency);
 
         Event e;
         e.type    = EventType::OP_START;
-        e.target  = target;
-        e.cycle   = ctx.engine.current_cycle();
+        e.target  = reservation.id;
+        e.cycle   = reservation.start;
         e.instr   = ctx.inst.id;
         e.label   = ctx.inst.label;
-        e.payload = static_cast<int64_t>(pget_int(ctx.inst.params, "latency_cycles", 10));
+        e.payload = static_cast<int64_t>(latency);
         ctx.engine.schedule(std::move(e));
-    });
+    };
+
+    reg.register_op("delay", fixed_latency_op);
+    reg.register_op("gemm", fixed_latency_op);
 }
 
 int main(int argc, char** argv) {
@@ -61,18 +79,16 @@ int main(int argc, char** argv) {
               << "hbm_bytes_per_cycle=" << arch.hbm_bytes_per_cycle() << "\n\n";
 
     // Build engine and register hardware units.
-    // Unit names must match the 'unit:' fields in your schedule YAML.
+    // Schedule YAML uses logical unit names (for example `vector_core`).
+    // The engine registers physical units (for example `vector_core_0`) from
+    // the architecture config; the scheduler picks the earliest-free unit.
     // Swap DelayUnit for a real hardware model (SystolicUnit, DmaUnit, etc.)
     // when that phase is ready -- everything else stays the same.
     EventEngine engine(arch.clock_ghz);
-    engine.register_unit(std::make_unique<DelayUnit>("systolic",      0));
-    engine.register_unit(std::make_unique<DelayUnit>("tandem_1",      0));
-    engine.register_unit(std::make_unique<DelayUnit>("tandem_2",      0));
-    engine.register_unit(std::make_unique<DelayUnit>("tandem_3",      0));
-    engine.register_unit(std::make_unique<DelayUnit>("access_core_1", 0));
-    engine.register_unit(std::make_unique<DelayUnit>("access_core_2", 0));
-    engine.register_unit(std::make_unique<DelayUnit>("dma",           0));
-    engine.register_unit(std::make_unique<DelayUnit>("vector_core",   0));
+    engine.register_unit(std::make_unique<DelayUnit>("systolic", 0));
+    register_unit_pool(engine, "access_core", arch.access_cores);
+    register_unit_pool(engine, "dma", arch.dma.channels);
+    register_unit_pool(engine, "vector_core", arch.vector_cores);
 
     // Register ops and build scheduler.
     OpRegistry reg;

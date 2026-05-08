@@ -16,7 +16,7 @@ schedule:
 
   - id: 1
     op: delay
-    unit: access_core_1
+    unit: access_core
     params: { latency_cycles: 30 }
     depends_on: [0]
     label: "transpose K_tile -> K_tile_T"
@@ -30,7 +30,7 @@ schedule:
 
   - id: 3
     op: delay
-    unit: tandem_1
+    unit: vector_core
     params: { latency_cycles: 40 }
     depends_on: [2]
     label: "softmax: row_max + exp + normalize"

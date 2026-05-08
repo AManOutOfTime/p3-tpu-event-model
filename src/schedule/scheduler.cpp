@@ -28,6 +28,16 @@ void Scheduler::notify_done(InstructionId id) {
             try_issue(s);
 }
 
+Cycle Scheduler::reserve_unit(UnitId id, Cycle duration) {
+    return reserve_unit_pool(std::vector<UnitId>{id}, duration).start;
+}
+
+UnitReservation Scheduler::reserve_unit_pool(const std::vector<UnitId>& ids,
+                                             Cycle duration,
+                                             uint64_t buffer_bytes) {
+    return engine_.reserve_unit_pool(ids, duration, buffer_bytes);
+}
+
 void Scheduler::try_issue(InstructionId id) {
     if (!issued_.insert(id).second) return;  // already issued
 

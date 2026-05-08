@@ -14,7 +14,7 @@ struct SramConfig {
     uint32_t ibuf_kb           = 4096;   // shared input buffer
     uint32_t obuf_kb           = 4096;   // shared output buffer
     uint32_t banking_factor    = 8;      // concurrent r/w ports per cycle
-    uint32_t private_tandem_kb = 512;    // per-vector-core private SRAM
+    uint32_t private_vector_kb = 512;    // per-vector-core private SRAM
 };
 
 struct HbmConfig {
@@ -30,7 +30,7 @@ struct ArchConfig {
     double         clock_ghz   = 1.0;
     SystolicConfig systolic;
     uint32_t       vector_cores = 3;
-    uint32_t       access_cores = 2;
+    uint32_t       access_cores = 1;
     SramConfig     sram;
     HbmConfig      hbm;
     DmaConfig      dma;

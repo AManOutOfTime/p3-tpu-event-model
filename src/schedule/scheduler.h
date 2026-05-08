@@ -4,6 +4,7 @@
 #include "core/event_engine.h"
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace sim {
 
@@ -25,6 +26,11 @@ public:
     // Called by op handlers or units when instruction `id` is finished.
     // Automatically issues any dependents that are now unblocked.
     void notify_done(InstructionId id);
+
+    // Reserve hardware resources for an operation.
+    Cycle reserve_unit(UnitId id, Cycle duration);
+    UnitReservation reserve_unit_pool(const std::vector<UnitId>& ids, Cycle duration,
+                                      uint64_t buffer_bytes = 0);
 
     bool   all_done()    const { return done_count_ == sched_.instructions.size(); }
     size_t outstanding() const { return sched_.instructions.size() - done_count_; }

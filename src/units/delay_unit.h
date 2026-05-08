@@ -6,6 +6,11 @@ namespace sim {
 
 class Scheduler;
 
+struct DelayPayload {
+    int64_t  latency_cycles = 0;
+    uint64_t buffer_bytes = 0;
+};
+
 // Models a fixed-latency hardware unit.
 //
 //   OP_START received -> print, schedule OP_DONE (default_latency cycles later)
@@ -14,7 +19,7 @@ class Scheduler;
 // Per-event latency override: set event.payload = int64_t before scheduling
 // OP_START (the 'delay' op handler does this using params["latency_cycles"]).
 //
-// This is the starting template for real units (systolic array, DMA, tandem).
+// This is the starting template for real units (systolic array, DMA, vector).
 // Real units override handle() and replace the fixed latency with a computed
 // one based on operation shape, SRAM availability, backpressure, etc.
 class DelayUnit : public Unit {
