@@ -36,6 +36,7 @@
 #   6. Removed unnecessary load_V dep from load_P_systolic_array; matmul_PV
 #      retains the explicit load_V dep for operand-readiness documentation.
 
+# yaml needs buffer_bytes field for buffer pressure to affect placement. 
 schedule:
 
   # ════════════════════════════════════════════════════════════════════════
