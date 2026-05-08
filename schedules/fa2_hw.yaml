@@ -1,0 +1,196 @@
+# fa2_hw.yaml  —  FlashAttention-2 forward pass, single tile
+#
+# REAL HARDWARE OPS — latencies computed from arch config, not hardcoded.
+# All data sizes are for LLaMA-3-8B: head_dim=128, Br=Bc=128, dtype=BF16 (2B).
+#
+# Tile data sizes:
+#   Q/K/V/S/P/O tile: 128×128 × 2 bytes = 32,768 bytes  (~32 KB)
+#   Row vectors (m, l, L): 128 × 2 bytes = 256 bytes
+#
+# Expected latencies at defaults (1 GHz, 128×128 SA, bw=2TB/s, simd=64):
+#   dma_load  32KB  : 200 + ceil(32768/2000) = 217 cycles
+#   gemm      128³  : 128 + 127 + 127        = 382 cycles (unidir)
+#   transpose 128²  : ceil(16384/64)         = 256 cycles
+#   exp       128²  : 1×256 + 4×256          = 1280 cycles
+#   softmax-like ops: see per-instruction comments
+#
+# Run:
+#   ./build/apps/sim_main --schedule schedules/fa2_hw.yaml
+
+schedule:
+
+  # ══════════════════════════════════════════════════════════════════
+  # Phase 1 — pre-inner
+  # ══════════════════════════════════════════════════════════════════
+
+  # Load Q tile from HBM → shared_ibuf  [128×128 BF16 = 32768 bytes]
+  - id: 0
+    op: dma_load
+    unit: dma
+    params: { rows: 128, cols: 128 }
+    label: "[PRE] DMA load Q_tile from HBM"
+
+  # Init O_acc = 0  [128×128 elements via access_core_1]
+  - id: 1
+    op: init_fill
+    unit: access_core_1
+    params: { rows: 128, cols: 128 }
+    label: "[PRE] Init O_acc = 0  [128x128]"
+
+  # Init m = -inf  [128 elements], serialized on access_core_1
+  - id: 2
+    op: init_fill
+    unit: access_core_1
+    depends_on: [1]
+    params: { length: 128 }
+    label: "[PRE] Init m = -inf  [Br=128]"
+
+  # Init l = 0  [128 elements], serialized on access_core_1
+  - id: 3
+    op: init_fill
+    unit: access_core_1
+    depends_on: [2]
+    params: { length: 128 }
+    label: "[PRE] Init l = 0  [Br=128]"
+
+  # ══════════════════════════════════════════════════════════════════
+  # Phase 2 — inner body (j=0)
+  # ══════════════════════════════════════════════════════════════════
+
+  # Load K tile from HBM → shared_ibuf  [32768 bytes]
+  # Serialized on DMA after Q load (single channel).
+  - id: 4
+    op: dma_load
+    unit: dma
+    depends_on: [0]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] DMA load K_tile from HBM"
+
+  # Load V tile from HBM → shared_ibuf  [32768 bytes]
+  - id: 5
+    op: dma_load
+    unit: dma
+    depends_on: [4]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] DMA load V_tile from HBM"
+
+  # Transpose K_tile [128×128 → 128×128]  on access_core_1
+  # Waits for K in IBUF (4) and access_core_1 free (after init_l=3).
+  - id: 6
+    op: transpose
+    unit: access_core_1
+    depends_on: [4, 3]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] Transpose K_tile -> K_tile_T"
+
+  # GEMM: S = Q @ K^T  [128×128×128]
+  # Waits for Q loaded (0) and K transposed (6).
+  - id: 7
+    op: gemm
+    unit: systolic
+    depends_on: [0, 6]
+    params: { M: 128, K: 128, N: 128 }
+    label: "[INNER j=0] GEMM S = Q @ K^T  [128x128x128]"
+
+  # Scale: S /= sqrt(128)  element-wise  [128×128 elements]
+  - id: 8
+    op: scale
+    unit: tandem_1
+    depends_on: [7]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] Scale S /= sqrt(d_head)"
+
+  # Row-max reduction: rowmax_tmp[128] = rowmax(S)
+  - id: 9
+    op: rowmax
+    unit: vector_core
+    depends_on: [8]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] rowmax(S) -> rowmax_tmp"
+
+  # Update running row-max + compute correction = exp(m_old - m_new)
+  # Reads m_old (init_m id=2). Uses exp → exp_ops=1.
+  - id: 10
+    op: exp
+    unit: vector_core
+    depends_on: [9, 2]
+    params: { length: 128 }
+    label: "[INNER j=0] Update m, correction = exp(m_old - m_new)"
+
+  # Compute P = exp(S - m_new)  [128×128 elements, exp_ops=1]
+  - id: 11
+    op: exp
+    unit: tandem_1
+    depends_on: [10]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] P = exp(S - m_new)"
+
+  # Update running row-sum: l = correction*l_old + rowsum(P)
+  - id: 12
+    op: rowsum
+    unit: vector_core
+    depends_on: [11, 10, 3]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] l = correction*l_old + rowsum(P)"
+
+  # Rescale O_acc *= correction  [128×128 elements]
+  # Can overlap with compute_P (11) — different unit (tandem_2).
+  - id: 13
+    op: scale
+    unit: tandem_2
+    depends_on: [10, 1]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] Rescale O_acc *= correction"
+
+  # GEMM: Temp = P @ V  [128×128×128]
+  # Waits for P computed (11) and V loaded (5).
+  - id: 14
+    op: gemm
+    unit: systolic
+    depends_on: [11, 5]
+    params: { M: 128, K: 128, N: 128 }
+    label: "[INNER j=0] GEMM Temp = P @ V  [128x128x128]"
+
+  # Accumulate: O_acc += Temp
+  - id: 15
+    op: accumulate
+    unit: tandem_1
+    depends_on: [13, 14]
+    params: { rows: 128, cols: 128 }
+    label: "[INNER j=0] O_acc += Temp"
+
+  # ══════════════════════════════════════════════════════════════════
+  # Phase 3 — post-inner
+  # ══════════════════════════════════════════════════════════════════
+
+  # Normalize: O_tile = O_acc / l
+  - id: 16
+    op: normalize
+    unit: tandem_1
+    depends_on: [15, 12]
+    params: { rows: 128, cols: 128 }
+    label: "[POST] O_tile = O_acc / l"
+
+  # Compute logsumexp: L = m + log(l)  [128 elements, log → exp_ops=1]
+  - id: 17
+    op: logsumexp
+    unit: vector_core
+    depends_on: [10, 12, 16]
+    params: { length: 128 }
+    label: "[POST] L = m + log(l)"
+
+  # Store O_tile to HBM  [32768 bytes]
+  - id: 18
+    op: dma_store
+    unit: dma
+    depends_on: [16, 5]
+    params: { rows: 128, cols: 128 }
+    label: "[POST] DMA store O_tile -> HBM"
+
+  # Store L tile to HBM  [256 bytes], serialized after store_O
+  - id: 19
+    op: dma_store
+    unit: dma
+    depends_on: [17, 18]
+    params: { rows: 1, cols: 128 }
+    label: "[POST] DMA store L_tile -> HBM"

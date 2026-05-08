@@ -1,0 +1,322 @@
+# FlashAttention-2 sub-event template
+# -----------------------------------
+# One symbolic outer/inner iteration for simulation.
+# Architecture mapping:
+#   - HBM traffic uses dma.
+#   - Q/K/V/P movement into the systolic array is modeled as dma issue traffic.
+#   - GEMM runs on systolic.
+#   - Softmax/exp/normalization style vector work runs on tandem/vector resources.
+#   - Transpose, reductions, and scatter/gather style moves run on access_core.
+#   - Shared IBUF and Shared OBUF are double-buffered on-chip memories.
+#
+# Params are flat scalars only. Source/destination/memory_range fields are strings.
+
+sub_schedule:
+
+  loops:
+    outer: { var: i, range_param: Tr }   # Tr = ceil(seq_len / Br)
+    inner: { var: j, range_param: Tc }   # Tc = ceil(seq_len / Bc)
+
+  # ----------------------------------------------------------------------
+  # Phase 1: per-outer-iter setup: load Q and initialize row accumulators
+  # ----------------------------------------------------------------------
+  pre_inner:
+
+    - id: load_Q
+      op: delay
+      unit: dma
+      label: "DMA load Q_tile [i*Br : (i+1)*Br]"
+      params:
+        source: "HBM.Q[i*Br:(i+1)*Br, 0:d_k]"
+        destination: "shared_ibuf.Q_tile"
+        memory_range: "Q rows i*Br:(i+1)*Br, cols 0:d_k"
+        rows: "Br"
+        cols: "d_k"
+        double_buffered_destination: true
+
+    - id: init_O_acc
+      op: delay
+      unit: access_core
+      label: "init O_acc = 0"
+      params:
+        destination: "shared_obuf.O_acc"
+        memory_range: "O_acc rows 0:Br, cols 0:d_head"
+        rows: "Br"
+        cols: "d_head"
+        init_value: 0
+        double_buffered_destination: true
+
+    - id: init_m
+      op: delay
+      unit: access_core
+      depends_on: [init_O_acc]
+      label: "init m = -inf"
+      params:
+        destination: "shared_obuf.m"
+        memory_range: "m rows 0:Br"
+        length: "Br"
+        init_value: "-inf"
+        semantic: "running row max"
+
+    - id: init_l
+      op: delay
+      unit: access_core
+      depends_on: [init_m]
+      label: "init l = 0"
+      params:
+        destination: "shared_obuf.l"
+        memory_range: "l rows 0:Br"
+        length: "Br"
+        init_value: 0
+        semantic: "running row sum"
+
+  # ----------------------------------------------------------------------
+  # Phase 2: inner loop body: process one K/V column block for fixed Q rows
+  # ----------------------------------------------------------------------
+  inner_body:
+
+    - id: load_Q_systolic_array
+      op: delay
+      unit: dma
+      depends_on: [load_Q]
+      label: "DMA issue Q_tile to systolic array"
+      params:
+        source: "shared_ibuf.Q_tile"
+        destination: "systolic_array.Q_operand"
+        memory_range: "Q_tile rows 0:Br, cols 0:d_k"
+        rows: "Br"
+        cols: "d_k"
+
+    - id: load_K
+      op: delay
+      unit: dma
+      label: "DMA load K_tile [j*Bc : (j+1)*Bc]"
+      params:
+        source: "HBM.K[j*Bc:(j+1)*Bc, 0:d_k]"
+        destination: "shared_ibuf.K_tile"
+        memory_range: "K rows j*Bc:(j+1)*Bc, cols 0:d_k"
+        rows: "Bc"
+        cols: "d_k"
+        double_buffered_destination: true
+
+    - id: load_V
+      op: delay
+      unit: dma
+      depends_on: [load_K]
+      label: "DMA load V_tile [j*Bc : (j+1)*Bc]"
+      params:
+        source: "HBM.V[j*Bc:(j+1)*Bc, 0:d_head]"
+        destination: "shared_ibuf.V_tile"
+        memory_range: "V rows j*Bc:(j+1)*Bc, cols 0:d_head"
+        rows: "Bc"
+        cols: "d_head"
+        double_buffered_destination: true
+
+    - id: transpose_K
+      op: delay
+      unit: access_core
+      depends_on: [load_K]
+      label: "K_tile_T = transpose(K_tile)"
+      params:
+        source: "shared_ibuf.K_tile"
+        destination: "shared_ibuf.K_tile_T"
+        memory_range: "K_tile transpose Bc x d_k -> d_k x Bc"
+        input_rows: "Bc"
+        input_cols: "d_k"
+        output_rows: "d_k"
+        output_cols: "Bc"
+
+    - id: matmul_QK
+      op: delay
+      unit: systolic
+      depends_on: [load_Q_systolic_array, transpose_K]
+      label: "S_tile = Q_tile @ K_tile_T"
+      params:
+        source_a: "systolic_array.Q_operand"
+        source_b: "shared_ibuf.K_tile_T"
+        destination: "shared_obuf.S_tile"
+        memory_range: "S_tile rows 0:Br, cols 0:Bc"
+        m: "Br"
+        n: "Bc"
+        k: "d_k"
+
+    - id: scale_S
+      op: delay
+      unit: tandem
+      depends_on: [matmul_QK]
+      label: "S_tile /= sqrt(d_k)"
+      params:
+        source: "shared_obuf.S_tile"
+        destination: "shared_obuf.S_tile"
+        memory_range: "S_tile rows 0:Br, cols 0:Bc"
+        rows: "Br"
+        cols: "Bc"
+        scale: "1/sqrt(d_k)"
+
+    - id: rowmax_S
+      op: delay
+      unit: vector_core
+      depends_on: [scale_S]
+      label: "rowmax_tmp = rowmax(S_tile)"
+      params:
+        source: "shared_obuf.S_tile"
+        destination: "private_tandem_memory.rowmax_tmp"
+        memory_range: "S_tile rows 0:Br, cols 0:Bc -> rowmax_tmp rows 0:Br"
+        rows: "Br"
+        cols: "Bc"
+        output_length: "Br"
+
+    - id: update_m_correction
+      op: delay
+      unit: vector_core
+      depends_on: [rowmax_S]
+      depends_on_prev_iter: [update_m_correction]
+      label: "m=max(m,rowmax); correction=exp(m_old-m)"
+      params:
+        source_m_old: "shared_obuf.m"
+        source_rowmax: "private_tandem_memory.rowmax_tmp"
+        destination_m: "shared_obuf.m"
+        destination_correction: "shared_obuf.correction"
+        memory_range: "m, correction rows 0:Br"
+        length: "Br"
+        semantic: "updates running max and emits correction for prior l/O_acc"
+
+    - id: compute_P
+      op: delay
+      unit: tandem
+      depends_on: [update_m_correction]
+      label: "P_tile = exp(S_tile - m)"
+      params:
+        source_s: "shared_obuf.S_tile"
+        source_m: "shared_obuf.m"
+        destination: "shared_ibuf.P_tile"
+        memory_range: "P_tile rows 0:Br, cols 0:Bc"
+        rows: "Br"
+        cols: "Bc"
+        broadcast_vector: "m rows 0:Br"
+
+    - id: update_l
+      op: delay
+      unit: vector_core
+      depends_on: [compute_P, update_m_correction]
+      depends_on_prev_iter: [update_l]
+      label: "l = correction * l + rowsum(P_tile)"
+      params:
+        source_p: "shared_ibuf.P_tile"
+        source_correction: "shared_obuf.correction"
+        source_l_old: "shared_obuf.l"
+        destination: "shared_obuf.l"
+        memory_range: "l rows 0:Br; P_tile rows 0:Br, cols 0:Bc"
+        rows: "Br"
+        cols: "Bc"
+        semantic: "updates running sum"
+
+    - id: rescale_O
+      op: delay
+      unit: tandem
+      depends_on: [update_m_correction]
+      depends_on_prev_iter: [accumulate_O]
+      label: "O_acc *= correction"
+      params:
+        source_o: "shared_obuf.O_acc"
+        source_correction: "shared_obuf.correction"
+        destination: "shared_obuf.O_acc"
+        memory_range: "O_acc rows 0:Br, cols 0:d_head"
+        rows: "Br"
+        cols: "d_head"
+        broadcast_vector: "correction rows 0:Br"
+
+    - id: load_P_systolic_array
+      op: delay
+      unit: dma
+      depends_on: [compute_P, load_V]
+      label: "DMA issue P_tile to systolic array"
+      params:
+        source: "shared_ibuf.P_tile"
+        destination: "systolic_array.P_operand"
+        memory_range: "P_tile rows 0:Br, cols 0:Bc"
+        rows: "Br"
+        cols: "Bc"
+
+    - id: matmul_PV
+      op: delay
+      unit: systolic
+      depends_on: [load_P_systolic_array, load_V]
+      label: "Temp = P_tile @ V_tile"
+      params:
+        source_a: "systolic_array.P_operand"
+        source_b: "shared_ibuf.V_tile"
+        destination: "shared_obuf.Temp"
+        memory_range: "Temp rows 0:Br, cols 0:d_head"
+        m: "Br"
+        n: "d_head"
+        k: "Bc"
+
+    - id: accumulate_O
+      op: delay
+      unit: tandem
+      depends_on: [rescale_O, matmul_PV]
+      label: "O_acc += Temp"
+      params:
+        source_o: "shared_obuf.O_acc"
+        source_temp: "shared_obuf.Temp"
+        destination: "shared_obuf.O_acc"
+        memory_range: "O_acc rows 0:Br, cols 0:d_head"
+        rows: "Br"
+        cols: "d_head"
+
+  # ----------------------------------------------------------------------
+  # Phase 3: per-outer-iter finalization: normalize and store O/L
+  # ----------------------------------------------------------------------
+  post_inner:
+
+    - id: finalize_O
+      op: delay
+      unit: tandem
+      depends_on_last_inner: [accumulate_O, update_l]
+      label: "O = O_acc / l"
+      params:
+        source_o: "shared_obuf.O_acc"
+        source_l: "shared_obuf.l"
+        destination: "shared_obuf.O_tile"
+        memory_range: "O_tile rows 0:Br, cols 0:d_head; l rows 0:Br"
+        rows: "Br"
+        cols: "d_head"
+        broadcast_vector: "l rows 0:Br"
+        diagonalization_abstracted: true
+
+    - id: finalize_L
+      op: delay
+      unit: vector_core
+      depends_on_last_inner: [update_m_correction, update_l]
+      depends_on: [finalize_O]
+      label: "L_tile = m + log(l)"
+      params:
+        source_m: "shared_obuf.m"
+        source_l: "shared_obuf.l"
+        destination: "shared_obuf.L_tile"
+        memory_range: "L_tile rows 0:Br"
+        length: "Br"
+
+    - id: store_O
+      op: delay
+      unit: dma
+      depends_on: [finalize_O]
+      label: "DMA store O[i*Br : (i+1)*Br]"
+      params:
+        source: "shared_obuf.O_tile"
+        destination: "HBM.O[i*Br:(i+1)*Br, 0:d_head]"
+        memory_range: "O rows i*Br:(i+1)*Br, cols 0:d_head"
+        rows: "Br"
+        cols: "d_head"
+
+    - id: store_L
+      op: delay
+      unit: dma
+      depends_on: [finalize_L, store_O]
+      label: "DMA store L[i*Br : (i+1)*Br]"
+      params:
+        source: "shared_obuf.L_tile"
+        destination: "HBM.L[i*Br:(i+1)*Br]"
+        memory_range: "L rows i*Br:(i+1)*Br"
+        length: "Br"

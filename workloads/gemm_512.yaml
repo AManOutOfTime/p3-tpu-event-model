@@ -1,0 +1,13 @@
+# workloads/gemm_512.yaml
+# Q_tile [512 x 512] x KT_tile [512 x 512]
+# On 128x128 array: 4 Q sub-tiles x 4 KT sub-tiles = 16 GEMMs
+# Q is staged once per row sub-tile, reused for all 4 KT col sub-tiles
+
+workload:
+  M: 512
+  K: 512
+  N: 512
+  src_a: "shared_ibuf.Q_tile"
+  src_b: "shared_ibuf.KT_tile"
+  dst_c: "shared_obuf.S_tile"
+  fill: random

@@ -1,0 +1,48 @@
+# gemm_tiled.yaml
+#
+# Target 2 demo: large GEMM that tiles across a 128×128 array.
+# Three successive GEMMs of increasing size to show scaling.
+#
+# Array: 128×128 (configs/default.yaml)
+#
+# Instruction 0: 256×256×256 on 128×128 array
+#   tiles = 2×2 = 4,  per_tile = 256+127+127 = 510,  total = 2040 cycles
+#
+# Instruction 1: 512×512×512 on 128×128 array  (depends on 0)
+#   tiles = 4×4 = 16, per_tile = 512+127+127 = 766,  total = 12256 cycles
+#
+# Instruction 2: 1024×1024×1024 on 128×128 array  (depends on 1)
+#   tiles = 8×8 = 64, per_tile = 1024+127+127=1278,  total = 81792 cycles
+#
+# To run:
+#   ./build/apps/sim_main --schedule schedules/gemm_tiled.yaml
+
+schedule:
+  - id: 0
+    op: gemm
+    unit: systolic
+    params:
+      M: 256
+      K: 256
+      N: 256
+    label: "GEMM 256x256x256 (4 tiles on 128x128 array)"
+
+  - id: 1
+    op: gemm
+    unit: systolic
+    params:
+      M: 512
+      K: 512
+      N: 512
+    depends_on: [0]
+    label: "GEMM 512x512x512 (16 tiles on 128x128 array)"
+
+  - id: 2
+    op: gemm
+    unit: systolic
+    params:
+      M: 1024
+      K: 1024
+      N: 1024
+    depends_on: [1]
+    label: "GEMM 1024x1024x1024 (64 tiles on 128x128 array)"

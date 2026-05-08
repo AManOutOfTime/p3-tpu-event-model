@@ -1,0 +1,43 @@
+# schedules/gemm_bidir_compare.yaml
+#
+# Shows two regimes where bidirectional matters very differently:
+#
+#  Small K (fill-dominated): fill penalty is a large fraction of total cycles
+#    → bidirectional gives close to 2× speedup per tile
+#
+#  Large K (compute-dominated): K >> fill_latency
+#    → bidirectional gives diminishing returns
+#
+# Run both modes with:
+#   ./build/apps/sim_main --config configs/default.yaml              --schedule schedules/gemm_bidir_compare.yaml   # unidir
+#   ./build/apps/sim_main --config configs/systolic_128_bidir.yaml  --schedule schedules/gemm_bidir_compare.yaml   # bidir
+
+schedule:
+  # ── Fill-dominated: K=16 << fill_latency(254) ─────────────────────────
+  # Unidir:  per_tile = 16 + 254 = 270,  tiles=4  → total = 1080
+  # Bidir:   per_tile = 16 + 128 = 144,  tiles=4  → total = 576   (≈1.88×)
+  - id: 0
+    op: gemm
+    unit: systolic
+    params: { M: 256, K: 16, N: 256 }
+    label: "fill-dominated: K=16 (near-2x bidir speedup)"
+
+  # ── Balanced: K ≈ fill_latency ─────────────────────────────────────────
+  # Unidir:  per_tile = 256 + 254 = 510,  tiles=4  → total = 2040
+  # Bidir:   per_tile = 256 + 128 = 384,  tiles=4  → total = 1536  (≈1.33×)
+  - id: 1
+    op: gemm
+    unit: systolic
+    params: { M: 256, K: 256, N: 256 }
+    depends_on: [0]
+    label: "balanced: K=256 (~1.33x bidir speedup)"
+
+  # ── Compute-dominated: K=4096 >> fill_latency(254) ─────────────────────
+  # Unidir:  per_tile = 4096 + 254 = 4350,  tiles=4  → total = 17400
+  # Bidir:   per_tile = 4096 + 128 = 4224,  tiles=4  → total = 16896  (≈1.03×)
+  - id: 2
+    op: gemm
+    unit: systolic
+    params: { M: 256, K: 4096, N: 256 }
+    depends_on: [1]
+    label: "compute-dominated: K=4096 (~1.03x bidir speedup)"

@@ -1,0 +1,34 @@
+# schedules/gemm_compute.yaml
+#
+# Single GEMM with real buffer names — exercises the SystolicUnit's actual
+# float computation path.
+#
+# source_a    "systolic_array.Q_operand"  ← pre-staged weight/activation
+#             Already in the array's input register (pre-loaded by DMA).
+#             Zero extra latency — the K term in compute_latency covers it.
+#
+# source_b    "shared_ibuf.K_tile_T"      ← transposed K tile in IBUF
+#             Streamed into the array during the K accumulation cycles.
+#             Retrieval latency is the K term in per_tile = K + fill.
+#
+# destination "shared_obuf.S_tile"        ← result S = Q @ K^T in OBUF
+#             Written tile-by-tile as outputs accumulate.
+#
+# Array: 128×128 (configs/default.yaml)
+# Shape: 128×128×128  →  per_tile = 128 + 254 = 382 cycles
+#
+# Run:
+#   ./build/apps/sim_main --schedule schedules/gemm_compute.yaml
+
+schedule:
+  - id: 0
+    op: gemm
+    unit: systolic
+    params:
+      M: 128
+      K: 128
+      N: 128
+      source_a:    "systolic_array.Q_operand"
+      source_b:    "shared_ibuf.K_tile_T"
+      destination: "shared_obuf.S_tile"
+    label: "S[128x128] = Q_operand[128x128] @ K_tile_T[128x128]"

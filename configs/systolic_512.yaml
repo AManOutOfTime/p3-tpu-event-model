@@ -1,0 +1,26 @@
+# configs/systolic_512.yaml
+# 512×512 systolic array.
+# Run: ./build/apps/sim_main --config configs/systolic_512.yaml --schedule schedules/gemm_tiled.yaml
+
+clock_ghz: 1.0
+
+systolic:
+  rows: 512
+  cols: 512
+  precision: BF16
+
+vector_cores: 3
+access_cores: 2
+
+sram:
+  ibuf_kb:           65536
+  obuf_kb:           65536
+  banking_factor:    8
+  private_tandem_kb: 512
+
+hbm:
+  bandwidth_tb_s: 2.0
+  latency_cycles: 200
+
+dma:
+  channels: 1

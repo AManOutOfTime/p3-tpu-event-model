@@ -1,0 +1,33 @@
+# Default architecture config. All fields are optional -- missing fields keep
+# the ArchConfig defaults. Tweak any value and re-run; the simulator picks up
+# the new parameters without a rebuild.
+
+clock_ghz: 1.0
+
+systolic:
+  rows: 128
+  cols: 128
+  precision: BF16          # FP8 | FP16 | BF16 | FP32
+
+vector_cores: 3
+access_cores: 1
+
+sram:
+  ibuf_kb:           4096   # shared input buffer
+  obuf_kb:           4096   # shared output buffer
+  banking_factor:    8      # concurrent r/w ports per cycle
+  private_vector_kb: 512    # per-vector-core private SRAM
+
+hbm:
+  bandwidth_tb_s: 2.0       # H100 ~3.35 TB/s; TPUv4 ~1.2 TB/s
+  latency_cycles: 200
+
+dma:
+  channels: 1
+
+vector_core:
+  simd_width:  64
+  exp_latency: 4
+
+access_core:
+  bandwidth: 64

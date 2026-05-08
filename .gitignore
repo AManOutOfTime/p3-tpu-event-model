@@ -1,0 +1,30 @@
+
+.claude/worktrees/
+
+references/
+
+# Build artifacts
+build/
+build-*/
+out/
+.cache/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CMakeUserPresets.json
+Makefile
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Editor / IDE
+.vscode/
+.vs/
+.idea/
+*.swp
+
+.claude/

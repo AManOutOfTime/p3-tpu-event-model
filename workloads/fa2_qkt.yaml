@@ -1,0 +1,17 @@
+# workloads/fa2_qkt.yaml
+# FA2 S = Q @ K^T for one attention head tile
+#
+# Q_tile  [Br x d_head] already in shared_ibuf (loaded by prior DMA)
+# KT_tile [d_head x Bc] already in shared_ibuf (loaded + transposed)
+#
+# For LLaMA-3-8B: Br=128, d_head=128, Bc=128 → fits 128x128 array exactly
+# For larger:     Br=256, d_head=128, Bc=256  → 2x2 = 4 executions
+
+workload:
+  Br: 256
+  d_head: 128
+  Bc: 256
+  src_a: "shared_ibuf.Q_tile"
+  src_b: "shared_ibuf.KT_tile"
+  dst_c: "shared_obuf.S_tile"
+  fill: random

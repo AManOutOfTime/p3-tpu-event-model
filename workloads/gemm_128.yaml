@@ -1,0 +1,12 @@
+# workloads/gemm_128.yaml
+# Q_tile [128 x 128] x KT_tile [128 x 128] on 128x128 array
+# Fits in one execution — no sub-tiling, one STAGE + one GEMM
+
+workload:
+  M: 128
+  K: 128
+  N: 128
+  src_a: "shared_ibuf.Q_tile"
+  src_b: "shared_ibuf.KT_tile"
+  dst_c: "shared_obuf.S_tile"
+  fill: random

@@ -1,0 +1,22 @@
+# workloads/gemm_nonsquare.yaml
+#
+# Non-square matrix: M=300, K=256, N=200
+# On a 128×128 array:
+#   tiles_m = ceil(300/128) = 3   (tile 2 is partial: 300-256=44 rows)
+#   tiles_n = ceil(200/128) = 2   (tile 1 is partial: 200-128=72 cols)
+#   total   = 3×2 = 6 tiles
+#
+# Demonstrates partial-tile handling — last row/col tile is smaller than
+# the array, so the array runs with unused PEs (still correct, just wasteful).
+#
+# Run:
+#   ./build/apps/sim_main --config configs/default.yaml --workload workloads/gemm_nonquare.yaml
+
+workload:
+  M: 300
+  K: 256
+  N: 200
+  source_a:    "A"
+  source_b:    "B"
+  destination: "C"
+  fill: random

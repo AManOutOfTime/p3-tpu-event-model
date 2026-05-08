@@ -1,0 +1,27 @@
+# configs/systolic_256_bidir.yaml
+# 256×256 bidirectional systolic array.
+# fill_latency = ceil(255/2) + ceil(255/2) = 128 + 128 = 256 cycles (vs 510 unidir)
+
+clock_ghz: 1.0
+
+systolic:
+  rows: 256
+  cols: 256
+  precision: BF16
+  bidirectional: true
+
+vector_cores: 3
+access_cores: 2
+
+sram:
+  ibuf_kb:           16384
+  obuf_kb:           16384
+  banking_factor:    8
+  private_tandem_kb: 512
+
+hbm:
+  bandwidth_tb_s: 2.0
+  latency_cycles: 200
+
+dma:
+  channels: 1

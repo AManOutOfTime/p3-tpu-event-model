@@ -1,0 +1,36 @@
+# Dummy schedule exercising the infrastructure end-to-end.
+# Linear chain: DMA load -> transpose -> GEMM -> softmax
+# Total serial latency: 50 + 30 + 200 + 40 = 320 cycles.
+#
+# To try a coarser granularity, replace all four instructions with:
+#   - id: 0
+#     op: flash_attn2          # register this handler in your OpRegistry
+#     params: { seq_len: 2048, head_dim: 128 }
+
+schedule:
+  - id: 0
+    op: delay
+    unit: dma
+    params: { latency_cycles: 50 }
+    label: "DMA load K_tile from HBM"
+
+  - id: 1
+    op: delay
+    unit: access_core
+    params: { latency_cycles: 30 }
+    depends_on: [0]
+    label: "transpose K_tile -> K_tile_T"
+
+  - id: 2
+    op: delay
+    unit: systolic
+    params: { latency_cycles: 200 }
+    depends_on: [1]
+    label: "S_tile = Q_tile x K_tile_T  (GEMM)"
+
+  - id: 3
+    op: delay
+    unit: vector_core
+    params: { latency_cycles: 40 }
+    depends_on: [2]
+    label: "softmax: row_max + exp + normalize"

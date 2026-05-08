@@ -1,0 +1,183 @@
+# FlashAttention-2 sub-event template
+# -----------------------------------
+# This file describes one iteration of the algorithm symbolically.
+# The flash_attn2 expander reads it, then for each (i, j) pair:
+#   1. clones every sub-op
+#   2. assigns each clone a unique InstructionId
+#   3. resolves `depends_on` (intra-iter) and `depends_on_prev_iter` (loop-carried)
+#      from symbolic names to concrete InstructionIds
+#   4. issues all clones to the engine in one batch
+#
+# Conventions:
+#   - `id` here is a symbolic name (string), not an integer. The expander
+#     maps (sub_id, i, j) -> unique InstructionId.
+#   - `loop: outer`         => instantiated Tr times (one per outer index i).
+#   - `loop: inner`         => instantiated Tr * Tc times (per (i, j)).
+#   - `phase: pre_inner`    => issued before the inner loop body for this i.
+#   - `phase: inner_body`   => issued for every (i, j).
+#   - `phase: post_inner`   => issued after the inner loop completes for this i.
+#   - `depends_on`          => same-iteration dependencies (symbolic ids in this file).
+#   - `depends_on_prev_iter`=> loop-carried: the named op from iteration j-1 (or i-1
+#                              for outer-loop carries). Empty / omitted if none.
+#   - `params` are pass-through to the underlying op handler. Keep them flat:
+#     int / double / string / bool only (matches ParamMap = variant<...>).
+
+sub_schedule:
+
+  loops:
+    outer: { var: i, range_param: Tr }   # Tr is computed by the expander as ceil(seq_len/Br)
+    inner: { var: j, range_param: Tc }   # Tc = ceil(seq_len/Bc), nested in outer
+
+  # ----------------------------------------------------------------------
+  # Phase 1: per-outer-iter setup (load Q tile + zero accumulators)
+  # ----------------------------------------------------------------------
+  pre_inner:
+
+    - id: load_Q
+      op: delay
+      unit: dma # include param section. load Q into shared-ibuf. send to systolic array
+      label: "DMA load Q_tile [i*Br : (i+1)*Br]"
+
+    - id: init_O_acc
+      op: delay 
+      unit: access_core_1
+      label: "init O_acc = 0" # include params section. Add init within obuff : dims is Br x dhead
+
+    - id: init_m
+      op: delay
+      unit: access_core_1
+      depends_on: [init_O_acc] # include params section. lives within shared-obuf: size Br vector. add in comment that m is the running max. 
+      label: "init m = -inf"
+
+    - id: init_l
+      op: delay
+      unit: access_core_1 #include params section. lives within shared-obuf: size Br Vector. add in comment that l is running sum. also include memory range any time we reuquire source/destination. This will not be said in later comments but is implied. 
+      depends_on: [init_m] 
+      label: "init l = 0"
+
+  # ----------------------------------------------------------------------
+  # Phase 2: inner loop body (executed Tc times per outer iter)
+  # ----------------------------------------------------------------------
+  inner_body:
+
+    - id: load_Q_systolic_array
+      op: delay
+      unit: dma # include param section. in params add source: shared-ibuf/destination: systolic array. Q dim is Br x d_k.
+      label: "DMA load Q_tile [i*Br : (i+1)*Br]"
+
+    - id: load_K
+      op: delay
+      unit: dma #include source/destination. move matrix size into param section. dim is Bc x dk
+      label: "DMA load K_tile [j*Bc : (j+1)*Bc]"
+
+    - id: load_V
+      op: delay
+      unit: dma 
+      depends_on: [load_K]   # serialize on the single DMA channel
+      label: "DMA load V_tile [j*Bc : (j+1)*Bc]" #include source hbm/destination ibuff. move matrix size into param section. dim is Bc x dhead
+
+    - id: transpose_K
+      op: delay
+      unit: access_core_2 #this is an access core op so don't be specific about which one to use. provide dims of transpose K in params. include source: ibuff/destination: ibuff
+      depends_on: [load_K]
+      label: "K_tile_T = transpose(K_tile)"
+
+    - id: matmul_QK
+      op: delay
+      unit: systolic #create params section. include source/destination. 
+      depends_on: [load_Q, transpose_K]   # load_Q is from pre_inner of same i
+      label: "S_tile = Q_tile @ K_tile_T"
+
+    - id: scale_S
+      op: delay
+      unit: tandem_1 #create params section. Source: obuff/destination: obuff. Include matrix size in params. 
+      depends_on: [matmul_QK]
+      label: "S_tile /= sqrt(d_k)"
+
+    - id: rowmax_S
+      op: delay #
+      unit: access_core_1 # Should not use access core. should use vector/tandem core. don't assign a number to it. Include params section. Here, source: shared-obuf/destination: priv tandem memory. include dims
+      depends_on: [scale_S]
+      label: "rowmax_tmp = rowmax(S_tile)"
+
+    - id: update_m_correction
+      op: delay
+      unit: access_core_1
+      depends_on: [rowmax_S] # include params section. source: m from shared-obuf, rowmax_tmp from priv tandem memory/ destination shared-obuf. Send correction to shared-obuf
+      depends_on_prev_iter: [advance_m]    # reads m from previous j (loop-carried)
+      label: "m_new=max(m,rowmax); correction=exp(m-m_new)"
+
+    - id: compute_P
+      op: delay 
+      unit: tandem_3 # include params section. source: S from shared-obuf, m from shared-obuf/ destination shared-ibuf. for unit, do not include a specific value. 
+      depends_on: [update_m_correction]
+      label: "P_tile = exp(S_tile - m_new)" 
+
+    - id: update_l
+      op: delay
+      unit: access_core_1 # include params section. source: P from shared-ibuf, correction from shared-obuf, l from shared-obuf/ destination l's own shared-obuf. for unit, do not include a specific core, just acess core. 
+      depends_on: [compute_P, update_m_correction] 
+      depends_on_prev_iter: [update_l]     # reads l from previous j
+      label: "l = correction * l + rowsum(P_tile)"
+
+    - id: rescale_O
+      op: delay
+      unit: tandem_2 # include params section. source: O from shared-obuf, correction from shared obuf/destination:shared obuf
+      depends_on: [update_m_correction]
+      depends_on_prev_iter: [accumulate_O] # reads O_acc from previous j
+      label: "O_acc *= correction"
+
+    - id: load_P_systolic_array
+      op: delay
+      unit: dma # include param section. in params add source: shared-ibuf/destination: systolic array
+      label: "DMA load P_tile" #edit label if needed
+
+    - id: matmul_PV 
+      op: delay
+      unit: systolic # include params section. source: V from shared-ibuf/destination: shared-obuf
+      depends_on: [compute_P, load_V]
+      label: "Temp = P_tile @ V_tile"
+
+    - id: accumulate_O
+      op: delay
+      unit: tandem_2 # include params section. source: V from shared-ibuf/destination: shared-obuf
+      depends_on: [rescale_O, matmul_PV]
+      label: "O_acc += Temp"
+
+    - id: advance_m
+      op: delay
+      unit: access_core_1
+      depends_on: [compute_P, update_l, rescale_O] #check if this needs to exist. Maybe we can just edit m instead of calling it m_new and updating it here. If keeping it, add params such as source/destinaiton and dims
+      label: "m = m_new (commit)"
+
+  # ----------------------------------------------------------------------
+  # Phase 3: per-outer-iter finalization (after inner loop completes)
+  # ----------------------------------------------------------------------
+  post_inner:
+
+    - id: finalize_O
+      op: delay
+      unit: tandem_2
+      # Depends on the LAST inner iteration's accumulate_O. Expander resolves
+      # `last_inner` to (id="accumulate_O", i=this_i, j=Tc-1).
+      depends_on_last_inner: [accumulate_O] #include params. ignore diagonalziatoon as this will be abstracted away. Just include the source of l and source of O, and destination of
+      label: "O = diag(l)^-1 O_acc   (final normalize)"
+
+    - id: finalize_L
+      op: delay 
+      unit: access_core_1 #include params: dims , source/destination for m and l, destination can be obuf. 
+      depends_on_last_inner: [advance_m, update_l]
+      depends_on: [finalize_O]
+      label: "L_tile = m + log(l)"
+
+    - id: store_O
+      op: delay
+      unit: dma
+      depends_on: [finalize_O] #include params: dims , source/destination
+      label: "DMA store O[i*Br : (i+1)*Br]"
+
+    - id: store_L
+      op: delay
+      unit: dma #include params: dims , source: obuf /destination: HBM
+      depends_on: [finalize_L, store_O]   # store_O serializes DMA channel
+      label: "DMA store L[i*Br : (i+1)*Br]"
