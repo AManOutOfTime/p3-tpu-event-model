@@ -27,7 +27,7 @@
 #   1. Flattened sub_schedule/loops/pre_inner/inner_body/post_inner into a
 #      flat 'schedule:' list (required by our YAML parser).
 #   2. vector_core added as a registered unit in sim_main.
-#   3. Added latency_cycles to every op (required by DelayUnit / 'delay' op).
+#   3. Added latency_cycles to every op (required by [placeholder]Unit / '[placeholder]' op).
 #   4. Added explicit pre_inner→inner_body deps for first-iteration state:
 #        update_m_correction depends on init_m   (reads m_old)
 #        update_l            depends on init_l   (reads l_old)
@@ -48,7 +48,7 @@ schedule:
   # Load Q tile from HBM into shared IBUF
   # Data: Q_i ← HBM  (FA2 Alg.1 line 3)
   - id: 0
-    op: delay
+    op: [placeholder]
     unit: dma
     label: "[PRE] DMA load Q_tile [i*Br:(i+1)*Br, 0:d_k]"
     params:
@@ -61,7 +61,7 @@ schedule:
   # Initialize O accumulator tile to zero
   # Data: O_i ← 0  (FA2 Alg.1 line 4)
   - id: 1
-    op: delay
+    op: [placeholder]
     unit: access_core
     label: "[PRE] Init O_acc = 0  [Br x d_head]"
     params:
@@ -74,7 +74,7 @@ schedule:
   # Initialize running row-max to -inf (independent of O_acc init)
   # Data: m_i ← -inf  (FA2 Alg.1 line 4)
   - id: 2
-    op: delay
+    op: [placeholder]
     unit: access_core
     label: "[PRE] Init m = -inf  [Br]"
     params:
@@ -86,7 +86,7 @@ schedule:
   # Initialize running row-sum to zero
   # Data: l_i ← 0  (FA2 Alg.1 line 4)
   - id: 3
-    op: delay
+    op: [placeholder]
     unit: access_core
     label: "[PRE] Init l = 0  [Br]"
     params:
@@ -103,7 +103,7 @@ schedule:
   # Issue Q_tile from IBUF to systolic array input register
   # Must wait for Q to be loaded (0) and DMA to be free.
   # - id: 4
-  #   op: delay
+  #   op: [placeholder]
   #   unit: dma
   #   depends_on: [0]
   #   label: "[INNER j=0] DMA issue Q_tile -> systolic_array.Q_operand"
@@ -117,7 +117,7 @@ schedule:
   # Load K tile from HBM (serialized after Q issue on single DMA channel)
   # Data: K_j ← HBM  (FA2 Alg.1 line 6)
   - id: 4
-    op: delay
+    op: [placeholder]
     unit: dma
     depends_on: [0]
     label: "[INNER j=0] DMA load K_tile [j*Bc:(j+1)*Bc, 0:d_k]"
@@ -131,7 +131,7 @@ schedule:
   # Load V tile from HBM (serialized after K load on single DMA channel)
   # Data: V_j ← HBM  (FA2 Alg.1 line 6)
   - id: 5
-    op: delay
+    op: [placeholder]
     unit: dma
     depends_on: [4]
     label: "[INNER j=0] DMA load V_tile [j*Bc:(j+1)*Bc, 0:d_head]"
@@ -146,7 +146,7 @@ schedule:
   # Source: Q K^T requires K transposed (Vaswani 2017 Eq. 1)
   # Runs on access_core; starts when K is in IBUF (4) and AC is free.
   - id: 6
-    op: delay
+    op: [placeholder]
     unit: access_core
     depends_on: [4]
     label: "[INNER j=0] Transpose K_tile -> K_tile_T  [d_k x Bc]"
@@ -179,7 +179,7 @@ schedule:
   # Scale S by 1/sqrt(d_k) — temperature scaling
   # Source: Vaswani 2017 Eq. 1: Attention = softmax(QK^T / sqrt(d_k)) V
   - id: 8
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [7]
     label: "[INNER j=0] Scale S_tile /= sqrt(d_k)"
@@ -194,7 +194,7 @@ schedule:
   # Row-max reduction: rowmax_tmp[Br] = max over cols of S_tile
   # Data: m_ij = rowmax(S_ij)  (FA2 Alg.1 line 8)
   - id: 9
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [8]
     label: "[INNER j=0] rowmax(S_tile) -> rowmax_tmp  [Br]"
@@ -210,7 +210,7 @@ schedule:
   # correction = exp(m_old - m_new)           (FA2 Alg.1 lines 9, 10)
   # Reads m_old from shared_obuf.m (written by init_m id=2, first iter).
   - id: 10
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [9, 2]
     label: "[INNER j=0] Update m: m=max(m,rowmax); correction=exp(m_old-m_new)  [Br]"
@@ -226,7 +226,7 @@ schedule:
   # Data: P_ij = exp(S_ij - m_i^new)  (FA2 Alg.1 line 11)
   # Uses updated m from (11); broadcasts m over columns.
   - id: 11
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [10]
     label: "[INNER j=0] Compute P_tile = exp(S_tile - m_new)  [Br x Bc]"
@@ -242,7 +242,7 @@ schedule:
   # Data: l_i^new = exp(m_i-m_i^new)*l_i + rowsum(P_ij)  (FA2 Alg.1 line 12)
   # Reads l_old from shared_obuf.l (written by init_l id=3, first iter).
   - id: 12
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [11, 10, 3]
     label: "[INNER j=0] Update l: l = correction*l_old + rowsum(P_tile)  [Br]"
@@ -260,7 +260,7 @@ schedule:
   # Reads O_acc from shared_obuf.O_acc (written by init_O_acc id=1, first iter).
   # Can run in parallel with compute_P (12) and update_l (13) — different unit.
   - id: 13
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [10, 1]
     label: "[INNER j=0] Rescale O_acc *= correction  [Br x d_head]"
@@ -276,7 +276,7 @@ schedule:
   # Data dependency: P_tile must be computed by id=11.
   # DMA availability is handled by the hardware table, not by depends_on.
   - id: 14
-    op: delay
+    op: [placeholder]
     unit: dma
     depends_on: [11]
     label: "[INNER j=0] DMA issue P_tile -> systolic_array.P_operand"
@@ -291,7 +291,7 @@ schedule:
   # Data: P_ij @ V_j  (FA2 Alg.1 line 13, second term)
   # Needs P in systolic operand (14) and V_tile in IBUF (5).
   - id: 15
-    op: delay
+    op: [placeholder]
     unit: systolic
     depends_on: [14, 5]
     label: "[INNER j=0] GEMM: Temp = P_tile @ V_tile  [Br x d_head]"
@@ -307,7 +307,7 @@ schedule:
   # Accumulate: O_acc += Temp  (add rescaled old O and new P@V contribution)
   # Data: O_i = diag(exp(m_i-m_i^new))*O_i + P_ij@V_j  (FA2 Alg.1 line 13)
   - id: 16
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [13, 15]
     label: "[INNER j=0] Accumulate O_acc += Temp  [Br x d_head]"
@@ -327,7 +327,7 @@ schedule:
   # Normalize: O_tile = O_acc / l  (diag(1/l) applied row-wise)
   # Data: O_i = diag(l_i^{-1}) * O_i  (FA2 Alg.1 line 15)
   - id: 17
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [16, 12]
     label: "[POST] Finalize O_tile = O_acc / l  [Br x d_head]"
@@ -343,7 +343,7 @@ schedule:
   # Data: L_i = m_i + log(l_i)  (FA2 Alg.1 line 16)
   # Depends on finalize_O (17) so post-inner outputs are finalized in order.
   - id: 18
-    op: delay
+    op: [placeholder]
     unit: vector_core
     depends_on: [10, 12, 17]
     label: "[POST] Finalize L_tile = m + log(l)  [Br]"
@@ -357,7 +357,7 @@ schedule:
   # Store O tile to HBM
   # Data: write O_i to HBM  (FA2 Alg.1 line 17)
   - id: 19
-    op: delay
+    op: [placeholder]
     unit: dma
     depends_on: [17]
     label: "[POST] DMA store O[i*Br:(i+1)*Br, 0:d_head] -> HBM"
@@ -371,7 +371,7 @@ schedule:
   # Store L tile to HBM (serialized after store_O on single DMA channel)
   # Data: write L_i to HBM  (FA2 Alg.1 line 18)
   - id: 20
-    op: delay
+    op: [placeholder]
     unit: dma
     depends_on: [18, 19]
     label: "[POST] DMA store L[i*Br:(i+1)*Br] -> HBM"
