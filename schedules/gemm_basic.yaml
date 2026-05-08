@@ -1,0 +1,22 @@
+# gemm_basic.yaml
+#
+# Target 1: basic matrix multiplication with dummy weights.
+# A single GEMM instruction on the systolic array; no DMA, no vector ops.
+#
+# Array: 128×128 (configs/default.yaml)
+# Shape: 128×128×128  → fits in 1 tile
+#   per_tile = K + (rows-1) + (cols-1) = 128 + 127 + 127 = 382 cycles
+#   total    = 1 × 1 × 382 = 382 cycles
+#
+# To run:
+#   ./build/apps/sim_main --schedule schedules/gemm_basic.yaml
+
+schedule:
+  - id: 0
+    op: gemm
+    unit: systolic
+    params:
+      M: 128
+      K: 128
+      N: 128
+    label: "C[128x128] = A[128x128] x B[128x128]  (1 tile, dummy weights)"
