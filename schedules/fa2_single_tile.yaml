@@ -10,7 +10,7 @@
 #   dma          — HBM <-> SRAM transfers (single channel; ops are serialized)
 #   access_core_1 — transpose, init-fill, scatter/gather  [Jouppi et al. 2017]
 #   systolic     — GEMM on systolic array (Q@K^T, P@V)   [Jouppi et al. 2017]
-#   tandem_1     — elementwise vector ops: scale, exp, accumulate
+#   vector_core     — elementwise vector ops: scale, exp, accumulate
 #   vector_core  — reduction ops: rowmax, rowsum, log
 #
 # Dependency notes:
@@ -25,8 +25,7 @@
 # Changes from fa2-edited-schedule.yaml:
 #   1. Flattened sub_schedule/loops/pre_inner/inner_body/post_inner into a
 #      flat 'schedule:' list (required by our YAML parser).
-#   2. Unit names fixed: tandem→tandem_1, access_core→access_core_1;
-#      vector_core added as a registered unit in sim_main.
+#   2. vector_core added as a registered unit in sim_main.
 #   3. Added latency_cycles to every op (required by DelayUnit / 'delay' op).
 #   4. Added explicit pre_inner→inner_body deps for first-iteration state:
 #        update_m_correction depends on init_m   (reads m_old)
@@ -183,7 +182,7 @@ schedule:
   # Source: Vaswani 2017 Eq. 1: Attention = softmax(QK^T / sqrt(d_k)) V
   - id: 9
     op: delay
-    unit: tandem_1
+    unit: vector_core
     depends_on: [8]
     label: "[INNER j=0] Scale S_tile /= sqrt(d_head)"
     params:
@@ -204,7 +203,7 @@ schedule:
     params:
       latency_cycles: 10
       source:      "shared_obuf.S_tile"
-      destination: "private_tandem_memory.rowmax_tmp"
+      destination: "vector_scratch.rowmax_tmp"
       rows: "Br"
       cols: "Bc"
 
@@ -230,7 +229,7 @@ schedule:
   # Uses updated m from (11); broadcasts m over columns.
   - id: 12
     op: delay
-    unit: tandem_1
+    unit: vector_core
     depends_on: [11]
     label: "[INNER j=0] Compute P_tile = exp(S_tile - m_new)  [Br x Bc]"
     params:
@@ -264,7 +263,7 @@ schedule:
   # Can run in parallel with compute_P (12) and update_l (13) — different unit.
   - id: 14
     op: delay
-    unit: tandem_1
+    unit: vector_core
     depends_on: [11, 1]
     label: "[INNER j=0] Rescale O_acc *= correction  [Br x d_head]"
     params:
@@ -310,7 +309,7 @@ schedule:
   # Data: O_i = diag(exp(m_i-m_i^new))*O_i + P_ij@V_j  (FA2 Alg.1 line 13)
   - id: 17
     op: delay
-    unit: tandem_1
+    unit: vector_core
     depends_on: [14, 16]
     label: "[INNER j=0] Accumulate O_acc += Temp  [Br x d_head]"
     params:
@@ -330,7 +329,7 @@ schedule:
   # Data: O_i = diag(l_i^{-1}) * O_i  (FA2 Alg.1 line 15)
   - id: 18
     op: delay
-    unit: tandem_1
+    unit: vector_core
     depends_on: [17, 13]
     label: "[POST] Finalize O_tile = O_acc / l  [Br x d_head]"
     params:
