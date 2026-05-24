@@ -8,35 +8,35 @@
 #
 # Hardware unit mapping (Google TPU v4 style):
 #   dma          — HBM <-> SRAM transfers (single channel; ops are serialized)
-#   access_core — transpose, init-fill, scatter/gather  [Jouppi et al. 2017]
+#   access_core_1 — transpose, init-fill, scatter/gather  [Jouppi et al. 2017]
 #   systolic     — GEMM on systolic array (Q@K^T, P@V)   [Jouppi et al. 2017]
-#   vector_core     — elementwise vector ops: scale, exp, accumulate
+#   tandem_1     — elementwise vector ops: scale, exp, accumulate
 #   vector_core  — reduction ops: rowmax, rowsum, log
 #
 # Dependency notes:
 #   - All DMA ops are serialized (single channel): 0→4→5→6→15→20→21
 #   - Pre-inner state (m, l, O_acc) explicitly wired into inner-body consumers
 #     because the flat schedule has no implicit phase ordering.
-#   - Resource contention is handled by the scheduler: same-unit work starts
-#     when that unit's previous task has completed.
+#   - Resource contention on access_core_1 is modeled via explicit deps
+#     between sequential ops on the same unit.
 #   - latency_cycles values are placeholder estimates; real units will derive
 #     them from arch params (systolic dims, HBM bandwidth, etc.).
 #
 # Changes from fa2-edited-schedule.yaml:
 #   1. Flattened sub_schedule/loops/pre_inner/inner_body/post_inner into a
 #      flat 'schedule:' list (required by our YAML parser).
-#   2. vector_core added as a registered unit in sim_main.
+#   2. Unit names fixed: tandem→tandem_1, access_core→access_core_1;
+#      vector_core added as a registered unit in sim_main.
 #   3. Added latency_cycles to every op (required by DelayUnit / 'delay' op).
 #   4. Added explicit pre_inner→inner_body deps for first-iteration state:
 #        update_m_correction depends on init_m   (reads m_old)
 #        update_l            depends on init_l   (reads l_old)
 #        rescale_O           depends on init_O_acc (reads O_acc)
-#   5. Removed init_m/init_l resource-only deps; scheduler now serializes
-#      access_core resource use automatically.
+#   5. Removed init_m→init_O_acc data dependency (no data flow between them;
+#      kept serialization via access_core_1 resource dep chain 1→2→3).
 #   6. Removed unnecessary load_V dep from load_P_systolic_array; matmul_PV
 #      retains the explicit load_V dep for operand-readiness documentation.
 
-# yaml needs buffer_bytes field for buffer pressure to affect placement. 
 schedule:
 
   # ════════════════════════════════════════════════════════════════════════
@@ -49,19 +49,19 @@ schedule:
   - id: 0
     op: delay
     unit: dma
-    label: "[PRE] DMA load Q_tile [i*Br:(i+1)*Br, 0:d_k]"
+    label: "[PRE] DMA load Q_tile [i*Br:(i+1)*Br, 0:d_head]"
     params:
       latency_cycles: 50
-      source:      "HBM.Q[i*Br:(i+1)*Br, 0:d_k]"
+      source:      "HBM.Q[i*Br:(i+1)*Br, 0:d_head]"
       destination: "shared_ibuf.Q_tile"
       rows: "Br"
-      cols: "d_k"
+      cols: "d_head"
 
   # Initialize O accumulator tile to zero
   # Data: O_i ← 0  (FA2 Alg.1 line 4)
   - id: 1
     op: delay
-    unit: access_core
+    unit: access_core_1
     label: "[PRE] Init O_acc = 0  [Br x d_head]"
     params:
       latency_cycles: 10
@@ -72,9 +72,11 @@ schedule:
 
   # Initialize running row-max to -inf (independent of O_acc init)
   # Data: m_i ← -inf  (FA2 Alg.1 line 4)
+  # Note: depends on [1] to serialize on access_core_1, not for data flow.
   - id: 2
     op: delay
-    unit: access_core
+    unit: access_core_1
+    depends_on: [1]
     label: "[PRE] Init m = -inf  [Br]"
     params:
       latency_cycles: 5
@@ -84,9 +86,11 @@ schedule:
 
   # Initialize running row-sum to zero
   # Data: l_i ← 0  (FA2 Alg.1 line 4)
+  # Note: depends on [2] to serialize on access_core_1.
   - id: 3
     op: delay
-    unit: access_core
+    unit: access_core_1
+    depends_on: [2]
     label: "[PRE] Init l = 0  [Br]"
     params:
       latency_cycles: 5
@@ -111,7 +115,7 @@ schedule:
       source:      "shared_ibuf.Q_tile"
       destination: "systolic_array.Q_operand"
       rows: "Br"
-      cols: "d_k"
+      cols: "d_head"
 
   # Load K tile from HBM (serialized after Q issue on single DMA channel)
   # Data: K_j ← HBM  (FA2 Alg.1 line 6)
@@ -119,13 +123,13 @@ schedule:
     op: delay
     unit: dma
     depends_on: [4]
-    label: "[INNER j=0] DMA load K_tile [j*Bc:(j+1)*Bc, 0:d_k]"
+    label: "[INNER j=0] DMA load K_tile [j*Bc:(j+1)*Bc, 0:d_head]"
     params:
       latency_cycles: 50
-      source:      "HBM.K[j*Bc:(j+1)*Bc, 0:d_k]"
+      source:      "HBM.K[j*Bc:(j+1)*Bc, 0:d_head]"
       destination: "shared_ibuf.K_tile"
       rows: "Bc"
-      cols: "d_k"
+      cols: "d_head"
 
   # Load V tile from HBM (serialized after K load on single DMA channel)
   # Data: V_j ← HBM  (FA2 Alg.1 line 6)
@@ -141,28 +145,28 @@ schedule:
       rows: "Bc"
       cols: "d_head"
 
-  # Transpose K_tile: [Bc x d_k] -> [d_k x Bc] for Q @ K^T
+  # Transpose K_tile: [Bc x d_head] -> [d_head x Bc] for Q @ K^T
   # Source: Q K^T requires K transposed (Vaswani 2017 Eq. 1)
-  # Runs on access_core; starts when K is in IBUF (5) and AC is free (after 3).
+  # Runs on access_core_1; starts when K is in IBUF (5) and AC is free (after 3).
   - id: 7
     op: delay
-    unit: access_core
+    unit: access_core_1
     depends_on: [5]
-    label: "[INNER j=0] Transpose K_tile -> K_tile_T  [d_k x Bc]"
+    label: "[INNER j=0] Transpose K_tile -> K_tile_T  [d_head x Bc]"
     params:
       latency_cycles: 20
       source:      "shared_ibuf.K_tile"
       destination: "shared_ibuf.K_tile_T"
       input_rows:  "Bc"
-      input_cols:  "d_k"
-      output_rows: "d_k"
+      input_cols:  "d_head"
+      output_rows: "d_head"
       output_cols: "Bc"
 
   # GEMM: S_tile = Q_tile @ K_tile_T  [Br x Bc]
   # Data: S_ij = Q_i K_j^T  (FA2 Alg.1 line 7)
   # Needs Q in systolic operand register (4) and K^T in IBUF (7).
   - id: 8
-    op: gemm
+    op: delay
     unit: systolic
     depends_on: [4, 7]
     label: "[INNER j=0] GEMM: S_tile = Q_tile @ K_tile_T  [Br x Bc]"
@@ -173,22 +177,22 @@ schedule:
       destination: "shared_obuf.S_tile"
       M: "Br"
       N: "Bc"
-      K: "d_k"
+      K: "d_head"
 
-  # Scale S by 1/sqrt(d_k) — temperature scaling
+  # Scale S by 1/sqrt(d_head) — temperature scaling
   # Source: Vaswani 2017 Eq. 1: Attention = softmax(QK^T / sqrt(d_k)) V
   - id: 9
     op: delay
-    unit: vector_core
+    unit: tandem_1
     depends_on: [8]
-    label: "[INNER j=0] Scale S_tile /= sqrt(d_k)"
+    label: "[INNER j=0] Scale S_tile /= sqrt(d_head)"
     params:
       latency_cycles: 15
       source:      "shared_obuf.S_tile"
       destination: "shared_obuf.S_tile"
       rows: "Br"
       cols: "Bc"
-      scale: "1/sqrt(d_k)"
+      scale: "1/sqrt(d_head)"
 
   # Row-max reduction: rowmax_tmp[Br] = max over cols of S_tile
   # Data: m_ij = rowmax(S_ij)  (FA2 Alg.1 line 8)
@@ -200,7 +204,7 @@ schedule:
     params:
       latency_cycles: 10
       source:      "shared_obuf.S_tile"
-      destination: "vector_scratch.rowmax_tmp"
+      destination: "private_tandem_memory.rowmax_tmp"
       rows: "Br"
       cols: "Bc"
 
@@ -216,7 +220,7 @@ schedule:
     params:
       latency_cycles: 15
       source_m_old:            "shared_obuf.m"
-      source_rowmax:           "vector_scratch.rowmax_tmp"
+      source_rowmax:           "private_tandem_memory.rowmax_tmp"
       destination_m:           "shared_obuf.m"
       destination_correction:  "shared_obuf.correction"
       length: "Br"
@@ -226,7 +230,7 @@ schedule:
   # Uses updated m from (11); broadcasts m over columns.
   - id: 12
     op: delay
-    unit: vector_core
+    unit: tandem_1
     depends_on: [11]
     label: "[INNER j=0] Compute P_tile = exp(S_tile - m_new)  [Br x Bc]"
     params:
@@ -260,7 +264,7 @@ schedule:
   # Can run in parallel with compute_P (12) and update_l (13) — different unit.
   - id: 14
     op: delay
-    unit: vector_core
+    unit: tandem_1
     depends_on: [11, 1]
     label: "[INNER j=0] Rescale O_acc *= correction  [Br x d_head]"
     params:
@@ -306,7 +310,7 @@ schedule:
   # Data: O_i = diag(exp(m_i-m_i^new))*O_i + P_ij@V_j  (FA2 Alg.1 line 13)
   - id: 17
     op: delay
-    unit: vector_core
+    unit: tandem_1
     depends_on: [14, 16]
     label: "[INNER j=0] Accumulate O_acc += Temp  [Br x d_head]"
     params:
@@ -326,7 +330,7 @@ schedule:
   # Data: O_i = diag(l_i^{-1}) * O_i  (FA2 Alg.1 line 15)
   - id: 18
     op: delay
-    unit: vector_core
+    unit: tandem_1
     depends_on: [17, 13]
     label: "[POST] Finalize O_tile = O_acc / l  [Br x d_head]"
     params:
