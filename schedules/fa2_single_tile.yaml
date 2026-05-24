@@ -1,0 +1,332 @@
+# FlashAttention-2 forward pass — single tile simulation
+# One outer iteration (i=0) × one inner iteration (j=0).
+#
+# Algorithm source: Dao, T. "FlashAttention-2" ICLR 2024, Algorithm 1.
+# Attention(Q,K,V) = softmax(Q K^T / sqrt(d_k)) V  [Vaswani 2017]
+#
+# Op → unit mapping:
+#   dma_load    dma          HBM → IBUF  (hbm_latency + bytes/bw)
+#   dma_store   dma          IBUF/OBUF → HBM
+#   dma_stage   dma          IBUF → systolic array register  (on-chip, fast)
+#   init_fill   access_core  zero/neg-inf fill of SRAM buffer
+#   transpose   access_core  in-place transpose of IBUF tile
+#   gemm        systolic     tiled float GEMM (K + fill_latency per tile)
+#   scale       vector_core  element-wise multiply by scalar
+#   rowmax      vector_core  row-wise max reduction → length-Br vector
+#   update_rowmax vector_core m=max(m_old,rowmax); correction=exp(m_old-m_new)
+#   exp_shift   vector_core  P = exp(S - m_new)  element-wise
+#   update_rowsum vector_core l = correction*l_old + rowsum(P)
+#   accumulate  vector_core  O_acc += Temp  element-wise
+#   normalize   vector_core  O_tile = O_acc / l  (row-wise divide)
+#   logsumexp   vector_core  L = m + log(l)
+
+schedule:
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Phase 1 — pre-inner
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Load Q tile: HBM → shared_ibuf.Q_tile
+  # FA2 Alg.1 line 3: Q_i ← HBM
+  - id: 0
+    op: dma_load
+    unit: dma
+    label: "[PRE] DMA load Q_tile [i*Br:(i+1)*Br, 0:d_k]"
+    params:
+      source:      "HBM.Q[i*Br:(i+1)*Br, 0:d_k]"
+      destination: "shared_ibuf.Q_tile"
+      rows: "Br"
+      cols: "d_k"
+
+  # Init O_acc = 0 in OBUF   (FA2 Alg.1 line 4)
+  - id: 1
+    op: init_fill
+    unit: access_core
+    label: "[PRE] Init O_acc = 0  [Br x d_head]"
+    params:
+      destination: "shared_obuf.O_acc"
+      rows:        "Br"
+      cols:        "d_head"
+      init_value:  0
+
+  # Init m = -inf in OBUF   (FA2 Alg.1 line 4)
+  - id: 2
+    op: init_fill
+    unit: access_core
+    label: "[PRE] Init m = -inf  [Br]"
+    params:
+      destination: "shared_obuf.m"
+      length:      "Br"
+      init_value:  "-inf"
+
+  # Init l = 0 in OBUF   (FA2 Alg.1 line 4)
+  - id: 3
+    op: init_fill
+    unit: access_core
+    label: "[PRE] Init l = 0  [Br]"
+    params:
+      destination: "shared_obuf.l"
+      length:      "Br"
+      init_value:  0
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Phase 2 — inner body  (j=0)
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Stage Q tile: shared_ibuf.Q_tile → systolic_array.Q_operand
+  # On-chip SRAM read into PE input registers.
+  # Serialized on DMA after Q load (single DMA channel).
+  - id: 4
+    op: dma_stage
+    unit: dma
+    depends_on: [0]
+    label: "[INNER j=0] Stage Q_tile -> systolic_array.Q_operand"
+    params:
+      source:      "shared_ibuf.Q_tile"
+      destination: "systolic_array.Q_operand"
+      rows: "Br"
+      cols: "d_k"
+
+  # Load K tile: HBM → shared_ibuf.K_tile
+  # Serialized after Q stage on single DMA channel.
+  # FA2 Alg.1 line 6: K_j ← HBM
+  - id: 5
+    op: dma_load
+    unit: dma
+    depends_on: [4]
+    label: "[INNER j=0] DMA load K_tile [j*Bc:(j+1)*Bc, 0:d_k]"
+    params:
+      source:      "HBM.K[j*Bc:(j+1)*Bc, 0:d_k]"
+      destination: "shared_ibuf.K_tile"
+      rows: "Bc"
+      cols: "d_k"
+
+  # Load V tile: HBM → shared_ibuf.V_tile
+  # Serialized after K load on single DMA channel.
+  # FA2 Alg.1 line 6: V_j ← HBM
+  - id: 6
+    op: dma_load
+    unit: dma
+    depends_on: [5]
+    label: "[INNER j=0] DMA load V_tile [j*Bc:(j+1)*Bc, 0:d_head]"
+    params:
+      source:      "HBM.V[j*Bc:(j+1)*Bc, 0:d_head]"
+      destination: "shared_ibuf.V_tile"
+      rows: "Bc"
+      cols: "d_head"
+
+  # Transpose K tile: [Bc x d_k] → [d_k x Bc]
+  # Required so systolic array can stream K^T columns.
+  # Starts when K is in IBUF (5); access_core serialization handled by unit pool.
+  - id: 7
+    op: transpose
+    unit: access_core
+    depends_on: [5]
+    label: "[INNER j=0] Transpose K_tile -> K_tile_T  [d_k x Bc]"
+    params:
+      source:      "shared_ibuf.K_tile"
+      destination: "shared_ibuf.K_tile_T"
+      input_rows:  "Bc"
+      input_cols:  "d_k"
+      output_rows: "d_k"
+      output_cols: "Bc"
+
+  # GEMM: S_tile = Q_operand @ K_tile_T  [Br x Bc]
+  # FA2 Alg.1 line 7: S_ij = Q_i K_j^T
+  # Waits for Q staged in array register (4) and K^T in IBUF (7).
+  - id: 8
+    op: gemm
+    unit: systolic
+    depends_on: [4, 7]
+    label: "[INNER j=0] GEMM: S_tile = Q_operand @ K_tile_T  [Br x Bc]"
+    params:
+      source_a:    "systolic_array.Q_operand"
+      source_b:    "shared_ibuf.K_tile_T"
+      destination: "shared_obuf.S_tile"
+      M: "Br"
+      K: "d_k"
+      N: "Bc"
+
+  # Scale S /= sqrt(d_k)  [Br x Bc]
+  # Vaswani 2017 Eq. 1: temperature scaling before softmax.
+  - id: 9
+    op: scale
+    unit: vector_core
+    depends_on: [8]
+    label: "[INNER j=0] Scale S_tile /= sqrt(d_k)"
+    params:
+      source:      "shared_obuf.S_tile"
+      destination: "shared_obuf.S_tile"
+      rows: "Br"
+      cols: "Bc"
+      scalar: "1/sqrt(d_k)"
+
+  # rowmax(S) → rowmax_tmp  [Br]
+  # FA2 Alg.1 line 8: m_ij = rowmax(S_ij)
+  - id: 10
+    op: rowmax
+    unit: vector_core
+    depends_on: [9]
+    label: "[INNER j=0] rowmax(S_tile) -> rowmax_tmp  [Br]"
+    params:
+      source:      "shared_obuf.S_tile"
+      destination: "vector_scratch.rowmax_tmp"
+      rows: "Br"
+      cols: "Bc"
+
+  # m = max(m_old, rowmax_tmp);  correction = exp(m_old - m_new)  [Br]
+  # FA2 Alg.1 lines 9-10.
+  # Reads m_old (id=2) and rowmax_tmp (id=10).
+  - id: 11
+    op: update_rowmax
+    unit: vector_core
+    depends_on: [10, 2]
+    label: "[INNER j=0] update_rowmax: m=max(m,rowmax); correction=exp(m_old-m_new)"
+    params:
+      source_m_old:           "shared_obuf.m"
+      source_rowmax:          "vector_scratch.rowmax_tmp"
+      destination_m:          "shared_obuf.m"
+      destination_correction: "shared_obuf.correction"
+      length: "Br"
+
+  # P_tile = exp(S_tile - m_new)  [Br x Bc]
+  # FA2 Alg.1 line 11: P_ij = exp(S_ij - m_i^new)
+  - id: 12
+    op: exp_shift
+    unit: vector_core
+    depends_on: [11]
+    label: "[INNER j=0] exp_shift: P_tile = exp(S_tile - m_new)  [Br x Bc]"
+    params:
+      source_matrix: "shared_obuf.S_tile"
+      source_shift:  "shared_obuf.m"
+      destination:   "shared_ibuf.P_tile"
+      rows: "Br"
+      cols: "Bc"
+
+  # l = correction * l_old + rowsum(P_tile)  [Br]
+  # FA2 Alg.1 line 12.
+  # Reads l_old (id=3), correction (id=11), P_tile (id=12).
+  - id: 13
+    op: update_rowsum
+    unit: vector_core
+    depends_on: [12, 11, 3]
+    label: "[INNER j=0] update_rowsum: l = correction*l_old + rowsum(P_tile)"
+    params:
+      source_p:           "shared_ibuf.P_tile"
+      source_correction:  "shared_obuf.correction"
+      source_l_old:       "shared_obuf.l"
+      destination:        "shared_obuf.l"
+      rows: "Br"
+      cols: "Bc"
+
+  # O_acc *= correction  (row-wise broadcast)  [Br x d_head]
+  # FA2 Alg.1 line 13 first term: diag(exp(m_old - m_new)) * O_i
+  # Can overlap with id=12,13 on a different vector_core lane.
+  - id: 14
+    op: scale
+    unit: vector_core
+    depends_on: [11, 1]
+    label: "[INNER j=0] Scale O_acc *= correction  [Br x d_head]"
+    params:
+      source:      "shared_obuf.O_acc"
+      source_scale: "shared_obuf.correction"
+      destination: "shared_obuf.O_acc"
+      rows: "Br"
+      cols: "d_head"
+
+  # Stage P tile: shared_ibuf.P_tile → systolic_array.P_operand
+  # On-chip SRAM read into PE input registers.
+  - id: 15
+    op: dma_stage
+    unit: dma
+    depends_on: [12, 6]
+    label: "[INNER j=0] Stage P_tile -> systolic_array.P_operand"
+    params:
+      source:      "shared_ibuf.P_tile"
+      destination: "systolic_array.P_operand"
+      rows: "Br"
+      cols: "Bc"
+
+  # GEMM: Temp = P_operand @ V_tile  [Br x d_head]
+  # FA2 Alg.1 line 13 second term: P_ij @ V_j
+  - id: 16
+    op: gemm
+    unit: systolic
+    depends_on: [15, 6]
+    label: "[INNER j=0] GEMM: Temp = P_operand @ V_tile  [Br x d_head]"
+    params:
+      source_a:    "systolic_array.P_operand"
+      source_b:    "shared_ibuf.V_tile"
+      destination: "shared_obuf.Temp"
+      M: "Br"
+      K: "Bc"
+      N: "d_head"
+
+  # O_acc += Temp  [Br x d_head]
+  # FA2 Alg.1 line 13: O_i = diag(exp(...))*O_i + P_ij@V_j
+  - id: 17
+    op: accumulate
+    unit: vector_core
+    depends_on: [14, 16]
+    label: "[INNER j=0] Accumulate O_acc += Temp  [Br x d_head]"
+    params:
+      source_a:    "shared_obuf.O_acc"
+      source_b:    "shared_obuf.Temp"
+      destination: "shared_obuf.O_acc"
+      rows: "Br"
+      cols: "d_head"
+
+  # ════════════════════════════════════════════════════════════════════════
+  # Phase 3 — post-inner
+  # ════════════════════════════════════════════════════════════════════════
+
+  # O_tile = O_acc / l  (row-wise divide by l)  [Br x d_head]
+  # FA2 Alg.1 line 15: O_i = diag(l_i^{-1}) * O_i
+  - id: 18
+    op: normalize
+    unit: vector_core
+    depends_on: [17, 13]
+    label: "[POST] Normalize O_tile = O_acc / l  [Br x d_head]"
+    params:
+      source_matrix: "shared_obuf.O_acc"
+      source_denom:  "shared_obuf.l"
+      destination:   "shared_obuf.O_tile"
+      rows: "Br"
+      cols: "d_head"
+
+  # L_tile = m + log(l)  [Br]
+  # FA2 Alg.1 line 16: L_i = m_i + log(l_i)
+  - id: 19
+    op: logsumexp
+    unit: vector_core
+    depends_on: [11, 13, 18]
+    label: "[POST] Logsumexp L_tile = m + log(l)  [Br]"
+    params:
+      source_m:    "shared_obuf.m"
+      source_l:    "shared_obuf.l"
+      destination: "shared_obuf.L_tile"
+      length: "Br"
+
+  # Store O_tile: OBUF → HBM   (FA2 Alg.1 line 17)
+  - id: 20
+    op: dma_store
+    unit: dma
+    depends_on: [18]
+    label: "[POST] DMA store O[i*Br:(i+1)*Br, 0:d_head] -> HBM"
+    params:
+      source:      "shared_obuf.O_tile"
+      destination: "HBM.O[i*Br:(i+1)*Br, 0:d_head]"
+      rows: "Br"
+      cols: "d_head"
+
+  # Store L_tile: OBUF → HBM  (serialized after store_O)
+  # FA2 Alg.1 line 18
+  - id: 21
+    op: dma_store
+    unit: dma
+    depends_on: [19, 20]
+    label: "[POST] DMA store L[i*Br:(i+1)*Br] -> HBM"
+    params:
+      source:      "shared_obuf.L_tile"
+      destination: "HBM.L[i*Br:(i+1)*Br]"
+      length: "Br"
