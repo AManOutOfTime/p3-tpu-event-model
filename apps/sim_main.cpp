@@ -9,6 +9,7 @@
 #include "units/delay_unit.h"
 #include "units/systolic_unit.h"
 #include "units/dma_unit.h"
+#include "units/buffer_unit.h"
 #include "units/vector_unit.h"
 #include "units/access_unit.h"
 #include <iostream>
@@ -56,7 +57,55 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         ctx.engine.schedule(std::move(e));
     });
 
-    // ── DMA ops ──────────────────────────────────────────────────────────
+    // ── sram_read / sram_write (go through BufferUnit with banking contention)
+    auto sram_op = [arch](bool is_write) {
+        return [arch, is_write](const IssueCtx& ctx) {
+            const std::string pool = is_write ? "shared_obuf" : "shared_ibuf";
+            auto targets = ctx.engine.find_unit_pool(pool);
+            if (targets.empty()) targets = ctx.engine.find_unit_pool("shared_ibuf");
+            if (targets.empty()) throw std::runtime_error("sram_op: no buffer unit");
+            const auto& p = ctx.inst.params;
+            SramAccess a;
+            a.is_write = is_write;
+            a.bytes    = (uint64_t)pget_int(p, "bytes", 0);
+            if (!a.bytes) {
+                uint64_t r = (uint64_t)pget_int(p,"rows",0);
+                uint64_t c = (uint64_t)pget_int(p,"cols",0);
+                a.bytes = r * c * (arch.systolic.precision=="FP8"?1:
+                                   arch.systolic.precision=="FP32"?4:2);
+            }
+            a.src_buf = pget_str(p, "source");
+            a.dst_buf = pget_str(p, "destination");
+            // Latency from banking_factor
+            Cycle lat = (Cycle)std::ceil((double)a.bytes / arch.sram.banking_factor);
+            auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+            Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
+            e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=a;
+            ctx.engine.schedule(std::move(e));
+        };
+    };
+    reg.register_op("sram_read",  sram_op(false));
+    reg.register_op("sram_write", sram_op(true));
+
+    // ── weight_load — distribute weight tile into PE registers
+    // Cost = ceil(SA_rows × SA_cols × dtype_bytes / banking_factor)
+    reg.register_op("weight_load", [arch](const IssueCtx& ctx) {
+        UnitId t = ctx.engine.find_unit("systolic");
+        if (t == INVALID_UNIT) throw std::runtime_error("weight_load: systolic not found");
+        const auto& p = ctx.inst.params;
+        WeightLoad wl;
+        wl.sa_rows       = arch.systolic.rows;
+        wl.sa_cols       = arch.systolic.cols;
+        wl.dtype_bytes   = arch.systolic.precision=="FP8"?1:
+                           arch.systolic.precision=="FP32"?4:2;
+        wl.banking_factor= arch.sram.banking_factor;
+        wl.src_buf       = pget_str(p, "source");
+        wl.dst_buf       = pget_str(p, "destination");
+        // No reserve_unit_pool — systolic serializes through available_at
+        Event e; e.type=EventType::OP_START; e.target=t;
+        e.cycle=ctx.engine.current_cycle(); e.instr=ctx.inst.id; e.label=ctx.inst.label;
+        e.payload=wl; ctx.engine.schedule(std::move(e));
+    });
 
     auto hbm_op = [arch](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
@@ -341,6 +390,8 @@ static void wire_units(EventEngine& engine, Scheduler& sched, TensorStore& ts) {
         Unit* u = engine.get_unit(uid);
         if (auto* x = dynamic_cast<DelayUnit*>   (u)) { x->set_scheduler(&sched); continue; }
         if (auto* x = dynamic_cast<SystolicUnit*>(u)) { x->set_scheduler(&sched); continue; }
+        if (auto* x = dynamic_cast<BufferUnit*>  (u)) { x->set_scheduler(&sched);
+                                                         x->set_tensor_store(&ts); continue; }
         if (auto* x = dynamic_cast<DmaUnit*>     (u)) { x->set_scheduler(&sched);
                                                          x->set_tensor_store(&ts); continue; }
         if (auto* x = dynamic_cast<VectorUnit*>  (u)) { x->set_scheduler(&sched);
@@ -427,6 +478,12 @@ int main(int argc, char** argv) {
     // Single systolic array
     engine.register_unit(std::make_unique<SystolicUnit>("systolic",
                           arch.systolic, nullptr, &ts));
+
+    // Double-buffered SRAM (banking contention modeled)
+    engine.register_unit(std::make_unique<BufferUnit>("shared_ibuf",
+                          arch.sram, nullptr, &ts));
+    engine.register_unit(std::make_unique<BufferUnit>("shared_obuf",
+                          arch.sram, nullptr, &ts));
 
     // DMA channel pool
     for (uint32_t i = 0; i < arch.dma.channels; i++)

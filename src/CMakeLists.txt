@@ -11,6 +11,7 @@ set(SIM_CORE_SOURCES
     units/printing_unit.cpp
     units/delay_unit.cpp
     units/systolic_unit.cpp
+    units/buffer_unit.cpp
     units/dma_unit.cpp
     units/vector_unit.cpp
     units/access_unit.cpp

@@ -10,6 +10,23 @@ SystolicUnit::SystolicUnit(std::string name, const SystolicConfig& cfg,
                            Scheduler* sched, TensorStore* ts, std::ostream& os)
     : Unit(std::move(name)), cfg_(cfg), sched_(sched), ts_(ts), os_(os) {}
 
+// ---------------------------------------------------------------------------
+// weight_load_latency
+//   Broadcasting one weight tile into all SA_rows × SA_cols PE registers.
+//   Each PE needs dtype_bytes written via the SRAM bus.
+//   banking_factor parallel ports service all PEs.
+//   latency = ceil(SA_rows × SA_cols × dtype_bytes / banking_factor)
+// ---------------------------------------------------------------------------
+Cycle SystolicUnit::weight_load_latency(uint32_t sa_rows, uint32_t sa_cols,
+                                        uint32_t dtype_bytes,
+                                        uint32_t banking_factor) {
+    if (!sa_rows || !sa_cols || !banking_factor) return 0;
+    const uint64_t total_bytes = static_cast<uint64_t>(sa_rows)
+                               * sa_cols * dtype_bytes;
+    return static_cast<Cycle>(
+        std::ceil(static_cast<double>(total_bytes) / banking_factor));
+}
+
 Cycle SystolicUnit::fill_latency() const {
     if (cfg_.bidirectional)
         return (cfg_.rows-1+1)/2 + (cfg_.cols-1+1)/2;
@@ -55,6 +72,23 @@ void SystolicUnit::do_gemm(const GemmShape& s) {
 
 void SystolicUnit::handle(const Event& e, EventEngine& engine) {
     if (e.type == EventType::OP_START) {
+
+        // ── weight_load ─────────────────────────────────────────────────
+        if (const auto* wl = std::any_cast<WeightLoad>(&e.payload)) {
+            Cycle lat = weight_load_latency(wl->sa_rows, wl->sa_cols,
+                                            wl->dtype_bytes, wl->banking_factor);
+            os_ << "  [" << name() << "]  WEIGHT_LOAD_START"
+                << "  instr=" << e.instr << "  @cycle=" << e.cycle
+                << "  PEs=" << wl->sa_rows << "x" << wl->sa_cols
+                << "  lat=" << lat
+                << (e.label.empty() ? "" : "  \""+e.label+"\"") << "\n";
+            Event done=e; done.type=EventType::OP_DONE;
+            done.cycle=e.cycle+lat; done.seq=engine.next_seq();
+            engine.schedule(done);
+            return;
+        }
+
+        // ── gemm ───────────────────────────────────────────────────────
         uint32_t M=cfg_.rows, K=cfg_.d_head, N=cfg_.cols;
         if (const auto* s=std::any_cast<GemmShape>(&e.payload)) {
             M=s->M; K=s->K; N=s->N;
@@ -74,6 +108,18 @@ void SystolicUnit::handle(const Event& e, EventEngine& engine) {
         engine.schedule(done);
 
     } else if (e.type == EventType::OP_DONE) {
+
+        // ── weight_load done ────────────────────────────────────────────
+        if (const auto* wl = std::any_cast<WeightLoad>(&e.payload)) {
+            if (ts_) do_weight_load(*wl);
+            os_ << "  [" << name() << "]  WEIGHT_LOAD_DONE"
+                << "  instr=" << e.instr << "  @cycle=" << e.cycle
+                << (e.label.empty() ? "" : "  \""+e.label+"\"") << "\n";
+            if (sched_) sched_->notify_done(e.instr);
+            return;
+        }
+
+        // ── gemm done ───────────────────────────────────────────────────
         if (ts_)
             if (const auto* s=std::any_cast<GemmShape>(&e.payload))
                 if (!s->src_a.empty()&&!s->src_b.empty()&&!s->dst_c.empty())
@@ -84,6 +130,19 @@ void SystolicUnit::handle(const Event& e, EventEngine& engine) {
            <<(e.label.empty()?"":" \""+e.label+"\"")<<"\n";
         if (sched_) sched_->notify_done(e.instr);
     }
+}
+
+void SystolicUnit::do_weight_load(const WeightLoad& wl) {
+    if (wl.src_buf.empty() || wl.dst_buf.empty()) return;
+    if (!ts_->has(wl.src_buf)) {
+        os_ << "  [" << name() << "]  WEIGHT_LOAD SKIPPED ('"
+            << wl.src_buf << "' not found)\n";
+        return;
+    }
+    ts_->copy(wl.src_buf, wl.dst_buf);
+    os_ << "  [" << name() << "]  WEIGHT_LOADED  \""
+        << wl.src_buf << "\" → \"" << wl.dst_buf << "\""
+        << "  PEs=" << wl.sa_rows << "x" << wl.sa_cols << "\n";
 }
 
 }  // namespace sim

@@ -16,6 +16,29 @@ struct GemmShape {
 };
 
 // ---------------------------------------------------------------------------
+// WeightLoad — payload for weight_load op.
+//
+// In weight-stationary mode, K_tile_T must be distributed into every PE's
+// weight register BEFORE the GEMM streaming begins.  This is a broadcast
+// write from IBUF to all SA_rows × SA_cols PEs.
+//
+// Latency = ceil(SA_rows × SA_cols × dtype_bytes / sram.banking_factor)
+//
+// Example: 128×128 array, BF16 (2 bytes), banking_factor=8:
+//   = ceil(128 × 128 × 2 / 8) = ceil(4096) = 4096 cycles
+//
+// This is the pre-loading cost that was previously assumed to be zero.
+// ---------------------------------------------------------------------------
+struct WeightLoad {
+    uint32_t    sa_rows    = 0;
+    uint32_t    sa_cols    = 0;
+    uint32_t    dtype_bytes= 2;
+    uint32_t    banking_factor = 8;
+    std::string src_buf;   // TensorStore key for the weight tile
+    std::string dst_buf;   // destination key (e.g. "systolic_array.weight_reg")
+};
+
+// ---------------------------------------------------------------------------
 // SystolicUnit — weight-stationary systolic array (unidir or bidir).
 //
 // TIMING:  per_tile = K + fill_latency
@@ -40,10 +63,18 @@ public:
     void  handle(const Event& e, EventEngine& engine) override;
     Cycle fill_latency() const;
     Cycle compute_latency(uint32_t M, uint32_t K, uint32_t N) const;
+
+    // Weight-stationary pre-load: distribute weight tile into PE registers.
+    // Cost = ceil(SA_rows × SA_cols × dtype_bytes / banking_factor)
+    static Cycle weight_load_latency(uint32_t sa_rows, uint32_t sa_cols,
+                                     uint32_t dtype_bytes, uint32_t banking_factor);
+
     const SystolicConfig& config() const { return cfg_; }
 
 private:
     void do_gemm(const GemmShape& shape);
+    void do_weight_load(const WeightLoad& wl);
+
     SystolicConfig cfg_;
     Scheduler*     sched_;
     TensorStore*   ts_;

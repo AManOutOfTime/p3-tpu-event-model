@@ -131,13 +131,26 @@ schedule:
       output_rows: "d_k"
       output_cols: "Bc"
 
+  # Weight-stationary pre-load: distribute K_tile_T into PE weight registers
+  # Cost = ceil(SA_rows × SA_cols × dtype_bytes / banking_factor)
+  # = ceil(128 × 128 × 2 / 8) = 4096 cycles
+  # Must complete before GEMM starts. Runs on systolic (uses its available_at).
+  - id: 8
+    op: weight_load
+    unit: systolic
+    depends_on: [7]
+    label: "[INNER j=0] weight_load K_tile_T into PE registers"
+    params:
+      source:      "shared_ibuf.K_tile_T"
+      destination: "systolic_array.weight_reg"
+
   # GEMM: S_tile = Q_operand @ K_tile_T  [Br x Bc]
   # FA2 Alg.1 line 7: S_ij = Q_i K_j^T
-  # Waits for Q staged in array register (4) and K^T in IBUF (7).
-  - id: 8
+  # Waits for Q staged in array register (4) and weights loaded (8).
+  - id: 9
     op: gemm
     unit: systolic
-    depends_on: [4, 7]
+    depends_on: [4, 8]
     label: "[INNER j=0] GEMM: S_tile = Q_operand @ K_tile_T  [Br x Bc]"
     params:
       source_a:    "systolic_array.Q_operand"
@@ -148,11 +161,10 @@ schedule:
       N: "Bc"
 
   # Scale S /= sqrt(d_k)  [Br x Bc]
-  # Vaswani 2017 Eq. 1: temperature scaling before softmax.
-  - id: 9
+  - id: 10
     op: scale
     unit: vector_core
-    depends_on: [8]
+    depends_on: [9]
     label: "[INNER j=0] Scale S_tile /= sqrt(d_k)"
     params:
       source:      "shared_obuf.S_tile"
@@ -162,11 +174,10 @@ schedule:
       scalar: "1/sqrt(d_k)"
 
   # rowmax(S) → rowmax_tmp  [Br]
-  # FA2 Alg.1 line 8: m_ij = rowmax(S_ij)
-  - id: 10
+  - id: 11
     op: rowmax
     unit: vector_core
-    depends_on: [9]
+    depends_on: [10]
     label: "[INNER j=0] rowmax(S_tile) -> rowmax_tmp  [Br]"
     params:
       source:      "shared_obuf.S_tile"
@@ -175,12 +186,10 @@ schedule:
       cols: "Bc"
 
   # m = max(m_old, rowmax_tmp);  correction = exp(m_old - m_new)  [Br]
-  # FA2 Alg.1 lines 9-10.
-  # Reads m_old (id=2) and rowmax_tmp (id=10).
-  - id: 11
+  - id: 12
     op: update_rowmax
     unit: vector_core
-    depends_on: [10, 2]
+    depends_on: [11, 2]
     label: "[INNER j=0] update_rowmax: m=max(m,rowmax); correction=exp(m_old-m_new)"
     params:
       source_m_old:           "shared_obuf.m"
@@ -190,11 +199,10 @@ schedule:
       length: "Br"
 
   # P_tile = exp(S_tile - m_new)  [Br x Bc]
-  # FA2 Alg.1 line 11: P_ij = exp(S_ij - m_i^new)
-  - id: 12
+  - id: 13
     op: exp_shift
     unit: vector_core
-    depends_on: [11]
+    depends_on: [12]
     label: "[INNER j=0] exp_shift: P_tile = exp(S_tile - m_new)  [Br x Bc]"
     params:
       source_matrix: "shared_obuf.S_tile"
@@ -204,12 +212,10 @@ schedule:
       cols: "Bc"
 
   # l = correction * l_old + rowsum(P_tile)  [Br]
-  # FA2 Alg.1 line 12.
-  # Reads l_old (id=3), correction (id=11), P_tile (id=12).
-  - id: 13
+  - id: 14
     op: update_rowsum
     unit: vector_core
-    depends_on: [12, 11, 3]
+    depends_on: [13, 12, 3]
     label: "[INNER j=0] update_rowsum: l = correction*l_old + rowsum(P_tile)"
     params:
       source_p:           "shared_ibuf.P_tile"
@@ -219,13 +225,11 @@ schedule:
       rows: "Br"
       cols: "Bc"
 
-  # O_acc *= correction  (row-wise broadcast)  [Br x d_head]
-  # FA2 Alg.1 line 13 first term: diag(exp(m_old - m_new)) * O_i
-  # Can overlap with id=12,13 on a different vector_core lane.
-  - id: 14
+  # O_acc *= correction  [Br x d_head]
+  - id: 15
     op: scale
     unit: vector_core
-    depends_on: [11, 1]
+    depends_on: [12, 1]
     label: "[INNER j=0] Scale O_acc *= correction  [Br x d_head]"
     params:
       source:      "shared_obuf.O_acc"
@@ -235,11 +239,10 @@ schedule:
       cols: "d_head"
 
   # Stage P tile: shared_ibuf.P_tile → systolic_array.P_operand
-  # On-chip SRAM read into PE input registers.
-  - id: 15
+  - id: 16
     op: dma_stage
     unit: dma
-    depends_on: [12, 6]
+    depends_on: [13, 6]
     label: "[INNER j=0] Stage P_tile -> systolic_array.P_operand"
     params:
       source:      "shared_ibuf.P_tile"
@@ -247,12 +250,21 @@ schedule:
       rows: "Br"
       cols: "Bc"
 
+  # Weight-stationary pre-load: distribute V_tile into PE weight registers
+  - id: 17
+    op: weight_load
+    unit: systolic
+    depends_on: [9, 6]
+    label: "[INNER j=0] weight_load V_tile into PE registers"
+    params:
+      source:      "shared_ibuf.V_tile"
+      destination: "systolic_array.weight_reg"
+
   # GEMM: Temp = P_operand @ V_tile  [Br x d_head]
-  # FA2 Alg.1 line 13 second term: P_ij @ V_j
-  - id: 16
+  - id: 18
     op: gemm
     unit: systolic
-    depends_on: [15, 6]
+    depends_on: [16, 17]
     label: "[INNER j=0] GEMM: Temp = P_operand @ V_tile  [Br x d_head]"
     params:
       source_a:    "systolic_array.P_operand"
@@ -263,11 +275,10 @@ schedule:
       N: "d_head"
 
   # O_acc += Temp  [Br x d_head]
-  # FA2 Alg.1 line 13: O_i = diag(exp(...))*O_i + P_ij@V_j
-  - id: 17
+  - id: 19
     op: accumulate
     unit: vector_core
-    depends_on: [14, 16]
+    depends_on: [15, 18]
     label: "[INNER j=0] Accumulate O_acc += Temp  [Br x d_head]"
     params:
       source_a:    "shared_obuf.O_acc"
@@ -276,16 +287,11 @@ schedule:
       rows: "Br"
       cols: "d_head"
 
-  # ════════════════════════════════════════════════════════════════════════
-  # Phase 3 — post-inner
-  # ════════════════════════════════════════════════════════════════════════
-
-  # O_tile = O_acc / l  (row-wise divide by l)  [Br x d_head]
-  # FA2 Alg.1 line 15: O_i = diag(l_i^{-1}) * O_i
-  - id: 18
+  # O_tile = O_acc / l  [Br x d_head]
+  - id: 20
     op: normalize
     unit: vector_core
-    depends_on: [17, 13]
+    depends_on: [19, 14]
     label: "[POST] Normalize O_tile = O_acc / l  [Br x d_head]"
     params:
       source_matrix: "shared_obuf.O_acc"
@@ -295,11 +301,10 @@ schedule:
       cols: "d_head"
 
   # L_tile = m + log(l)  [Br]
-  # FA2 Alg.1 line 16: L_i = m_i + log(l_i)
-  - id: 19
+  - id: 21
     op: logsumexp
     unit: vector_core
-    depends_on: [11, 13, 18]
+    depends_on: [12, 14, 20]
     label: "[POST] Logsumexp L_tile = m + log(l)  [Br]"
     params:
       source_m:    "shared_obuf.m"
@@ -307,11 +312,11 @@ schedule:
       destination: "shared_obuf.L_tile"
       length: "Br"
 
-  # Store O_tile: OBUF → HBM   (FA2 Alg.1 line 17)
-  - id: 20
+  # Store O_tile: OBUF → HBM
+  - id: 22
     op: dma_store
     unit: dma
-    depends_on: [18]
+    depends_on: [20]
     label: "[POST] DMA store O[i*Br:(i+1)*Br, 0:d_head] -> HBM"
     params:
       source:      "shared_obuf.O_tile"
@@ -319,12 +324,11 @@ schedule:
       rows: "Br"
       cols: "d_head"
 
-  # Store L_tile: OBUF → HBM  (serialized after store_O)
-  # FA2 Alg.1 line 18
-  - id: 21
+  # Store L_tile: OBUF → HBM
+  - id: 23
     op: dma_store
     unit: dma
-    depends_on: [19, 20]
+    depends_on: [21, 22]
     label: "[POST] DMA store L[i*Br:(i+1)*Br] -> HBM"
     params:
       source:      "shared_obuf.L_tile"

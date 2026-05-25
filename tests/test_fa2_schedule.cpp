@@ -45,7 +45,8 @@ void add_delay_op(OpRegistry& reg) {
     for (const char* op : {"delay","gemm","dma_load","dma_store","dma_stage",
                            "init_fill","transpose","scale","rowmax",
                            "update_rowmax","exp_shift","update_rowsum",
-                           "accumulate","normalize","logsumexp"})
+                           "accumulate","normalize","logsumexp",
+                           "weight_load","sram_read","sram_write"})
         reg.register_op(op, fixed_latency_op);
 }
 
@@ -74,7 +75,7 @@ bool has_dep(const Instruction& inst, InstructionId dep) {
 TEST_CASE("fa2 file: parses 22 instructions with correct ids and units") {
     Schedule s = Schedule::from_yaml_file(FA2_PATH);
 
-    REQUIRE(s.instructions.size() == 22);
+    REQUIRE(s.instructions.size() == 24);
 
     // id=0: dma_load Q tile from HBM
     REQUIRE(s.instructions[0].id   == 0);
@@ -96,60 +97,74 @@ TEST_CASE("fa2 file: parses 22 instructions with correct ids and units") {
     REQUIRE(s.instructions[7].op   == "transpose");
     REQUIRE(s.instructions[7].unit == "access_core");
 
-    // id=8: gemm Q @ K^T on systolic
+    // id=8: weight_load K tile into PE registers (NEW)
     REQUIRE(s.instructions[8].id   == 8);
-    REQUIRE(s.instructions[8].op   == "gemm");
+    REQUIRE(s.instructions[8].op   == "weight_load");
     REQUIRE(s.instructions[8].unit == "systolic");
 
-    // id=10: rowmax on vector_core
-    REQUIRE(s.instructions[10].id   == 10);
-    REQUIRE(s.instructions[10].op   == "rowmax");
-    REQUIRE(s.instructions[10].unit == "vector_core");
+    // id=9: gemm Q @ K^T on systolic
+    REQUIRE(s.instructions[9].id   == 9);
+    REQUIRE(s.instructions[9].op   == "gemm");
+    REQUIRE(s.instructions[9].unit == "systolic");
 
-    // id=11: update_rowmax on vector_core
-    REQUIRE(s.instructions[11].op == "update_rowmax");
+    // id=11: rowmax on vector_core
+    REQUIRE(s.instructions[11].id   == 11);
+    REQUIRE(s.instructions[11].op   == "rowmax");
+    REQUIRE(s.instructions[11].unit == "vector_core");
 
-    // id=12: exp_shift on vector_core
-    REQUIRE(s.instructions[12].op == "exp_shift");
+    // id=12: update_rowmax on vector_core
+    REQUIRE(s.instructions[12].op == "update_rowmax");
 
-    // id=13: update_rowsum on vector_core
-    REQUIRE(s.instructions[13].op == "update_rowsum");
+    // id=13: exp_shift on vector_core
+    REQUIRE(s.instructions[13].op == "exp_shift");
 
-    // id=16: gemm P @ V on systolic
-    REQUIRE(s.instructions[16].id   == 16);
-    REQUIRE(s.instructions[16].op   == "gemm");
-    REQUIRE(s.instructions[16].unit == "systolic");
+    // id=14: update_rowsum on vector_core
+    REQUIRE(s.instructions[14].op == "update_rowsum");
 
-    // id=18: normalize on vector_core
-    REQUIRE(s.instructions[18].op == "normalize");
+    // id=17: weight_load V tile into PE registers (NEW)
+    REQUIRE(s.instructions[17].op   == "weight_load");
+    REQUIRE(s.instructions[17].unit == "systolic");
 
-    // id=19: logsumexp on vector_core
-    REQUIRE(s.instructions[19].op == "logsumexp");
+    // id=18: gemm P @ V on systolic
+    REQUIRE(s.instructions[18].id   == 18);
+    REQUIRE(s.instructions[18].op   == "gemm");
+    REQUIRE(s.instructions[18].unit == "systolic");
 
-    // id=20: dma_store O tile
-    REQUIRE(s.instructions[20].op   == "dma_store");
-    REQUIRE(s.instructions[20].unit == "dma");
+    // id=20: normalize on vector_core
+    REQUIRE(s.instructions[20].op == "normalize");
 
-    // id=21: dma_store L tile
-    REQUIRE(s.instructions[21].id   == 21);
-    REQUIRE(s.instructions[21].op   == "dma_store");
-    REQUIRE(s.instructions[21].unit == "dma");
+    // id=21: logsumexp on vector_core
+    REQUIRE(s.instructions[21].op == "logsumexp");
+
+    // id=22: dma_store O tile
+    REQUIRE(s.instructions[22].op   == "dma_store");
+    REQUIRE(s.instructions[22].unit == "dma");
+
+    // id=23: dma_store L tile
+    REQUIRE(s.instructions[23].id   == 23);
+    REQUIRE(s.instructions[23].op   == "dma_store");
+    REQUIRE(s.instructions[23].unit == "dma");
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: Params decoded correctly from the real YAML (not a hardcoded copy)
+// Test 2: Params decoded correctly from the real YAML
 // ---------------------------------------------------------------------------
 TEST_CASE("fa2 file: params are parsed correctly from YAML") {
     Schedule s = Schedule::from_yaml_file(FA2_PATH);
 
-    // GEMM params use M/K/N keys with symbolic values
-    const auto& qk = s.instructions[8];
+    // GEMM params use M/K/N keys with symbolic values (id=9)
+    const auto& qk = s.instructions[9];
     REQUIRE(qk.params.count("M") == 1);
     REQUIRE(qk.params.count("K") == 1);
     REQUIRE(qk.params.count("N") == 1);
     REQUIRE(pget_str(qk.params, "source_a") == "systolic_array.Q_operand");
     REQUIRE(pget_str(qk.params, "source_b") == "shared_ibuf.K_tile_T");
     REQUIRE(pget_str(qk.params, "destination") == "shared_obuf.S_tile");
+
+    // weight_load has source/destination params (id=8)
+    REQUIRE(s.instructions[8].params.count("source") == 1);
+    REQUIRE(s.instructions[8].params.count("destination") == 1);
+    REQUIRE(pget_str(s.instructions[8].params,"source") == "shared_ibuf.K_tile_T");
 
     // DMA ops have source / destination strings
     REQUIRE(pget_str(s.instructions[0].params, "source").find("HBM") != std::string::npos);
@@ -164,9 +179,9 @@ TEST_CASE("fa2 file: params are parsed correctly from YAML") {
     REQUIRE(s.instructions[2].params.count("init_value") == 1);  // -inf
 
     // vector ops have rows/cols or length params
-    REQUIRE(s.instructions[9].params.count("rows") == 1);   // scale has rows/cols
-    REQUIRE(s.instructions[10].params.count("rows") == 1);  // rowmax has rows/cols
-    REQUIRE(s.instructions[11].params.count("length") == 1); // update_rowmax has length
+    REQUIRE(s.instructions[10].params.count("rows") == 1);  // scale has rows/cols
+    REQUIRE(s.instructions[11].params.count("rows") == 1);  // rowmax has rows/cols
+    REQUIRE(s.instructions[12].params.count("length") == 1); // update_rowmax has length
 }
 
 // ---------------------------------------------------------------------------
@@ -175,36 +190,43 @@ TEST_CASE("fa2 file: params are parsed correctly from YAML") {
 TEST_CASE("fa2 file: dependency edges are algorithmically correct") {
     Schedule s = Schedule::from_yaml_file(FA2_PATH);
 
-    // GEMM QK (8) needs Q issued to systolic (4) AND K transposed (7)
-    REQUIRE(s.instructions[8].depends_on.size() == 2);
-    REQUIRE(has_dep(s.instructions[8], 4));
+    // weight_load K (8) needs K transposed (7)
     REQUIRE(has_dep(s.instructions[8], 7));
 
-    // update_m_correction (11): needs rowmax (10) AND m_old written by init_m (2)
-    REQUIRE(has_dep(s.instructions[11], 10));
-    REQUIRE(has_dep(s.instructions[11], 2));
+    // GEMM QK (9) needs Q staged (4) AND weight_load K done (8)
+    REQUIRE(s.instructions[9].depends_on.size() == 2);
+    REQUIRE(has_dep(s.instructions[9], 4));
+    REQUIRE(has_dep(s.instructions[9], 8));
 
-    // update_l (13): needs l_old written by init_l (3) — pre-inner → inner link
-    REQUIRE(has_dep(s.instructions[13], 3));
+    // update_rowmax (12): needs rowmax (11) AND m_old from init_m (2)
+    REQUIRE(has_dep(s.instructions[12], 11));
+    REQUIRE(has_dep(s.instructions[12], 2));
 
-    // rescale_O (14): needs O_acc written by init_O_acc (1) — pre-inner → inner link
-    REQUIRE(has_dep(s.instructions[14], 1));
+    // update_rowsum (14): needs l_old from init_l (3)
+    REQUIRE(has_dep(s.instructions[14], 3));
 
-    // load_P_systolic (15): waits for compute_P (12) AND load_V done (6)
-    REQUIRE(has_dep(s.instructions[15], 12));
-    REQUIRE(has_dep(s.instructions[15], 6));
+    // scale_O (15): needs O_acc from init_O (1)
+    REQUIRE(has_dep(s.instructions[15], 1));
 
-    // matmul_PV (16): needs P in systolic (15) and V tile in IBUF (6)
-    REQUIRE(has_dep(s.instructions[16], 15));
+    // dma_stage P (16): waits for exp_shift (13) AND V loaded (6)
+    REQUIRE(has_dep(s.instructions[16], 13));
     REQUIRE(has_dep(s.instructions[16], 6));
 
-    // finalize_O (18): needs accumulate_O (17) AND final l (13)
-    REQUIRE(has_dep(s.instructions[18], 17));
-    REQUIRE(has_dep(s.instructions[18], 13));
+    // weight_load V (17): needs GEMM S done (9) AND V loaded (6)
+    REQUIRE(has_dep(s.instructions[17], 9));
+    REQUIRE(has_dep(s.instructions[17], 6));
 
-    // store_L (21): waits for finalize_L (19) AND store_O (20)
-    REQUIRE(has_dep(s.instructions[21], 19));
-    REQUIRE(has_dep(s.instructions[21], 20));
+    // GEMM PV (18): needs P staged (16) AND weight_load V done (17)
+    REQUIRE(has_dep(s.instructions[18], 16));
+    REQUIRE(has_dep(s.instructions[18], 17));
+
+    // normalize (20): needs accumulate (19) AND final l (14)
+    REQUIRE(has_dep(s.instructions[20], 19));
+    REQUIRE(has_dep(s.instructions[20], 14));
+
+    // store_L (23): waits for logsumexp (21) AND store_O (22)
+    REQUIRE(has_dep(s.instructions[23], 21));
+    REQUIRE(has_dep(s.instructions[23], 22));
 }
 
 // ---------------------------------------------------------------------------
