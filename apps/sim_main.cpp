@@ -42,7 +42,7 @@ static uint32_t dtype_bytes(const std::string& p) {
 // ---------------------------------------------------------------------------
 static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
 
-    // ── delay (legacy backward-compat) ───────────────────────────────────
+    // delay — backward compat
     reg.register_op("delay", [](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
         if (targets.empty())
@@ -55,14 +55,9 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         ctx.engine.schedule(std::move(e));
     });
 
-    // ─────────────────────────────────────────────────────────────────────
-    // DMA ops
-    // ─────────────────────────────────────────────────────────────────────
+    // ── DMA ops ──────────────────────────────────────────────────────────
 
-    // dma_load  HBM → IBUF
-    // dma_store OBUF → HBM
-    // Both use HBM bandwidth model: hbm_latency + ceil(bytes / bw)
-    auto hbm_op = [&arch](const IssueCtx& ctx) {
+    auto hbm_op = [arch](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
         if (targets.empty()) throw std::runtime_error(ctx.inst.op+": unknown unit");
         const auto& p = ctx.inst.params;
@@ -76,7 +71,6 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         xfer.bytes = (rows && cols)
             ? (uint64_t)rows * cols * dtype_bytes(arch.systolic.precision)
             : (uint64_t)len  * dtype_bytes(arch.systolic.precision);
-        // Latency
         double bw = arch.hbm_bytes_per_cycle() * arch.dma.channels;
         Cycle lat = (Cycle)arch.hbm.latency_cycles +
                     (Cycle)std::ceil((double)xfer.bytes / bw);
@@ -88,9 +82,7 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
     reg.register_op("dma_load",  hbm_op);
     reg.register_op("dma_store", hbm_op);
 
-    // dma_stage  IBUF → systolic_array register  (on-chip SRAM read)
-    // Latency = ceil(bytes / banking_factor)   — no HBM penalty
-    reg.register_op("dma_stage", [&arch](const IssueCtx& ctx) {
+    reg.register_op("dma_stage", [arch](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
         if (targets.empty()) throw std::runtime_error("dma_stage: unknown unit");
         const auto& p = ctx.inst.params;
@@ -98,8 +90,8 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         xfer.on_chip = true;
         xfer.src_buf = pget_str(p, "source");
         xfer.dst_buf = pget_str(p, "destination");
-        uint32_t rows = resolve(p, "rows",   arch);
-        uint32_t cols = resolve(p, "cols",   arch);
+        uint32_t rows = resolve(p, "rows", arch);
+        uint32_t cols = resolve(p, "cols", arch);
         xfer.bytes = (uint64_t)rows * cols * dtype_bytes(arch.systolic.precision);
         Cycle lat = (Cycle)std::ceil((double)xfer.bytes / arch.sram.banking_factor);
         auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
@@ -108,13 +100,9 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         ctx.engine.schedule(std::move(e));
     });
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Access core ops
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Access core ops ───────────────────────────────────────────────────
 
-    // init_fill  Fill buffer with constant value
-    // Latency = ceil(elements / access_core.bandwidth)
-    reg.register_op("init_fill", [&arch](const IssueCtx& ctx) {
+    reg.register_op("init_fill", [arch](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
         if (targets.empty()) throw std::runtime_error("init_fill: unknown unit");
         const auto& p = ctx.inst.params;
@@ -124,6 +112,11 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         AccessOp op;
         op.kind     = "init_fill";
         op.elements = (rows && cols) ? (uint64_t)rows*cols : (uint64_t)len;
+        op.dst      = pget_str(p, "destination");
+        std::string iv = pget_str(p, "init_value");
+        op.fill_value = (iv == "-inf")
+            ? -std::numeric_limits<float>::infinity()
+            : static_cast<float>(pget_dbl(p, "init_value", 0.0));
         Cycle lat = (Cycle)std::ceil((double)op.elements / arch.access_core.bandwidth);
         auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
         Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
@@ -131,17 +124,19 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         ctx.engine.schedule(std::move(e));
     });
 
-    // transpose  In-place transpose of a matrix tile
-    // Latency = ceil(input_rows × input_cols / access_core.bandwidth)
-    reg.register_op("transpose", [&arch](const IssueCtx& ctx) {
+    reg.register_op("transpose", [arch](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
         if (targets.empty()) throw std::runtime_error("transpose: unknown unit");
         const auto& p = ctx.inst.params;
         uint32_t rows = resolve(p, "input_rows", arch);
         uint32_t cols = resolve(p, "input_cols", arch);
         AccessOp op;
-        op.kind     = "transpose";
-        op.elements = (uint64_t)rows * cols;
+        op.kind       = "transpose";
+        op.elements   = (uint64_t)rows * cols;
+        op.src        = pget_str(p, "source");
+        op.dst        = pget_str(p, "destination");
+        op.input_rows = rows;
+        op.input_cols = cols;
         Cycle lat = (Cycle)std::ceil((double)op.elements / arch.access_core.bandwidth);
         auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
         Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
@@ -149,13 +144,9 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         ctx.engine.schedule(std::move(e));
     });
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Systolic array op
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Systolic GEMM ─────────────────────────────────────────────────────
 
-    // gemm  C[M×N] = A[M×K] × B[K×N]
-    // Latency = tiles_m × tiles_n × (K + fill_latency)
-    reg.register_op("gemm", [&arch](const IssueCtx& ctx) {
+    reg.register_op("gemm", [arch](const IssueCtx& ctx) {
         UnitId t = ctx.engine.find_unit("systolic");
         if (t == INVALID_UNIT) throw std::runtime_error("gemm: systolic not found");
         const auto& p = ctx.inst.params;
@@ -171,54 +162,175 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         e.payload=s; ctx.engine.schedule(std::move(e));
     });
 
-    // ─────────────────────────────────────────────────────────────────────
-    // Vector core ops
-    // All use: latency = passes × groups + exp_ops × exp_latency × groups
-    //          where groups = ceil(elements / simd_width)
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Vector core ops ───────────────────────────────────────────────────
+    // Each handler builds a fully-populated VectorOp so the unit has all
+    // buffer names it needs to compute the result at OP_DONE.
 
-    // Helper: build and schedule a VectorOp event
-    auto vec_op = [&arch](const std::string& kind,
-                          uint32_t passes, uint32_t exp_ops,
-                          const IssueCtx& ctx) {
+    // scale: dst = src element-wise (optionally *= row-vector src_scale)
+    reg.register_op("scale", [arch](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
-        if (targets.empty()) throw std::runtime_error(kind+": unknown unit");
+        if (targets.empty()) throw std::runtime_error("scale: unknown unit");
         const auto& p = ctx.inst.params;
-
-        VectorOp op;
-        op.kind    = kind;
-        op.passes  = passes;
-        op.exp_ops = exp_ops;
-
-        // Element count from rows×cols or length param
         uint32_t rows = resolve(p, "rows",   arch);
         uint32_t cols = resolve(p, "cols",   arch);
-        uint32_t len  = resolve(p, "length", arch);
-        op.elements = (rows && cols) ? (uint64_t)rows*cols : (uint64_t)len;
-        if (!op.elements) op.elements = arch.systolic.rows; // safe fallback
-
-        // Compute latency
-        double groups = std::ceil((double)op.elements / arch.vector_core.simd_width);
-        Cycle lat = (Cycle)(passes * groups)
-                  + (Cycle)(exp_ops * arch.vector_core.exp_latency * groups);
-
+        VectorOp op; op.kind="scale"; op.passes=1; op.exp_ops=0;
+        op.rows=rows; op.cols=cols;
+        op.elements = (uint64_t)rows * cols;
+        op.src       = pget_str(p, "source");
+        op.dst       = pget_str(p, "destination");
+        op.src_scale = pget_str(p, "source_scale");
+        double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
+        Cycle lat = (Cycle)g;
         auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
         Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
         e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=op;
         ctx.engine.schedule(std::move(e));
-    };
+    });
 
-    // scale — element-wise multiply by scalar or row vector
-    // Br×d_head matrix: passes=1, exp_ops=0
-    reg.register_op("scale",         [vec_op](const IssueCtx& ctx){ vec_op("scale",         1, 0, ctx); });
-    reg.register_op("rowmax",        [vec_op](const IssueCtx& ctx){ vec_op("rowmax",        1, 0, ctx); });
-    reg.register_op("update_rowmax", [vec_op](const IssueCtx& ctx){ vec_op("update_rowmax", 1, 1, ctx); });
-    reg.register_op("exp_shift",     [vec_op](const IssueCtx& ctx){ vec_op("exp_shift",     1, 1, ctx); });
-    reg.register_op("update_rowsum", [vec_op](const IssueCtx& ctx){ vec_op("update_rowsum", 1, 0, ctx); });
-    reg.register_op("accumulate",    [vec_op](const IssueCtx& ctx){ vec_op("accumulate",    1, 0, ctx); });
-    reg.register_op("normalize",     [vec_op](const IssueCtx& ctx){ vec_op("normalize",     1, 0, ctx); });
-    reg.register_op("logsumexp",     [vec_op](const IssueCtx& ctx){ vec_op("logsumexp",     1, 1, ctx); });
+    // rowmax: dst[r] = max(src[r,:])
+    reg.register_op("rowmax", [arch](const IssueCtx& ctx) {
+        auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty()) throw std::runtime_error("rowmax: unknown unit");
+        const auto& p = ctx.inst.params;
+        uint32_t rows = resolve(p, "rows", arch);
+        uint32_t cols = resolve(p, "cols", arch);
+        VectorOp op; op.kind="rowmax"; op.passes=1; op.exp_ops=0;
+        op.rows=rows; op.cols=cols;
+        op.elements = (uint64_t)rows * cols;
+        op.src = pget_str(p, "source");
+        op.dst = pget_str(p, "destination");
+        double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
+        Cycle lat = (Cycle)g;
+        auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+        Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
+        e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=op;
+        ctx.engine.schedule(std::move(e));
+    });
+
+    // update_rowmax: m=max(m,r); correction=exp(m_old-m_new)
+    reg.register_op("update_rowmax", [arch](const IssueCtx& ctx) {
+        auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty()) throw std::runtime_error("update_rowmax: unknown unit");
+        const auto& p = ctx.inst.params;
+        uint32_t len = resolve(p, "length", arch);
+        VectorOp op; op.kind="update_rowmax"; op.passes=1; op.exp_ops=1;
+        op.elements      = (uint64_t)len;
+        op.src_m         = pget_str(p, "source_m_old");
+        op.src_rowmax    = pget_str(p, "source_rowmax");
+        op.dst_m         = pget_str(p, "destination_m");
+        op.dst_correction= pget_str(p, "destination_correction");
+        double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
+        Cycle lat = (Cycle)g + (Cycle)(arch.vector_core.exp_latency * g);
+        auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+        Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
+        e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=op;
+        ctx.engine.schedule(std::move(e));
+    });
+
+    // exp_shift: P = exp(S - m_broadcast)
+    reg.register_op("exp_shift", [arch](const IssueCtx& ctx) {
+        auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty()) throw std::runtime_error("exp_shift: unknown unit");
+        const auto& p = ctx.inst.params;
+        uint32_t rows = resolve(p, "rows", arch);
+        uint32_t cols = resolve(p, "cols", arch);
+        VectorOp op; op.kind="exp_shift"; op.passes=1; op.exp_ops=1;
+        op.rows=rows; op.cols=cols;
+        op.elements   = (uint64_t)rows * cols;
+        op.src_matrix = pget_str(p, "source_matrix");
+        op.src_shift  = pget_str(p, "source_shift");
+        op.dst        = pget_str(p, "destination");
+        double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
+        Cycle lat = (Cycle)g + (Cycle)(arch.vector_core.exp_latency * g);
+        auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+        Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
+        e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=op;
+        ctx.engine.schedule(std::move(e));
+    });
+
+    // update_rowsum: l = correction*l_old + rowsum(P)
+    reg.register_op("update_rowsum", [arch](const IssueCtx& ctx) {
+        auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty()) throw std::runtime_error("update_rowsum: unknown unit");
+        const auto& p = ctx.inst.params;
+        uint32_t rows = resolve(p, "rows", arch);
+        uint32_t cols = resolve(p, "cols", arch);
+        VectorOp op; op.kind="update_rowsum"; op.passes=1; op.exp_ops=0;
+        op.rows=rows; op.cols=cols;
+        op.elements       = (uint64_t)rows * cols;
+        op.src_p          = pget_str(p, "source_p");
+        op.src_correction = pget_str(p, "source_correction");
+        op.src_l          = pget_str(p, "source_l_old");
+        op.dst_l          = pget_str(p, "destination");
+        double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
+        Cycle lat = (Cycle)g;
+        auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+        Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
+        e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=op;
+        ctx.engine.schedule(std::move(e));
+    });
+
+    // accumulate: dst = src_a + src_b element-wise
+    reg.register_op("accumulate", [arch](const IssueCtx& ctx) {
+        auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty()) throw std::runtime_error("accumulate: unknown unit");
+        const auto& p = ctx.inst.params;
+        uint32_t rows = resolve(p, "rows", arch);
+        uint32_t cols = resolve(p, "cols", arch);
+        VectorOp op; op.kind="accumulate"; op.passes=1; op.exp_ops=0;
+        op.elements = (uint64_t)rows * cols;
+        op.src_a    = pget_str(p, "source_a");
+        op.src_b    = pget_str(p, "source_b");
+        op.dst      = pget_str(p, "destination");
+        double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
+        Cycle lat = (Cycle)g;
+        auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+        Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
+        e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=op;
+        ctx.engine.schedule(std::move(e));
+    });
+
+    // normalize: dst[r,c] = src_matrix[r,c] / src_denom[r]
+    reg.register_op("normalize", [arch](const IssueCtx& ctx) {
+        auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty()) throw std::runtime_error("normalize: unknown unit");
+        const auto& p = ctx.inst.params;
+        uint32_t rows = resolve(p, "rows", arch);
+        uint32_t cols = resolve(p, "cols", arch);
+        VectorOp op; op.kind="normalize"; op.passes=1; op.exp_ops=0;
+        op.rows=rows; op.cols=cols;
+        op.elements   = (uint64_t)rows * cols;
+        op.src_matrix = pget_str(p, "source_matrix");
+        op.src_denom  = pget_str(p, "source_denom");
+        op.dst        = pget_str(p, "destination");
+        double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
+        Cycle lat = (Cycle)g;
+        auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+        Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
+        e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=op;
+        ctx.engine.schedule(std::move(e));
+    });
+
+    // logsumexp: L[r] = m[r] + log(l[r])
+    reg.register_op("logsumexp", [arch](const IssueCtx& ctx) {
+        auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty()) throw std::runtime_error("logsumexp: unknown unit");
+        const auto& p = ctx.inst.params;
+        uint32_t len = resolve(p, "length", arch);
+        VectorOp op; op.kind="logsumexp"; op.passes=1; op.exp_ops=1;
+        op.elements = (uint64_t)len;
+        op.src_m    = pget_str(p, "source_m");
+        op.src_l    = pget_str(p, "source_l");
+        op.dst      = pget_str(p, "destination");
+        double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
+        Cycle lat = (Cycle)g + (Cycle)(arch.vector_core.exp_latency * g);
+        auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+        Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
+        e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=op;
+        ctx.engine.schedule(std::move(e));
+    });
 }
+
 
 // ---------------------------------------------------------------------------
 // Wire scheduler + tensor store into every unit
@@ -230,8 +342,10 @@ static void wire_units(EventEngine& engine, Scheduler& sched, TensorStore& ts) {
         if (auto* x = dynamic_cast<SystolicUnit*>(u)) { x->set_scheduler(&sched); continue; }
         if (auto* x = dynamic_cast<DmaUnit*>     (u)) { x->set_scheduler(&sched);
                                                          x->set_tensor_store(&ts); continue; }
-        if (auto* x = dynamic_cast<VectorUnit*>  (u)) { x->set_scheduler(&sched); continue; }
-        if (auto* x = dynamic_cast<AccessUnit*>  (u)) { x->set_scheduler(&sched); continue; }
+        if (auto* x = dynamic_cast<VectorUnit*>  (u)) { x->set_scheduler(&sched);
+                                                         x->set_tensor_store(&ts); continue; }
+        if (auto* x = dynamic_cast<AccessUnit*>  (u)) { x->set_scheduler(&sched);
+                                                         x->set_tensor_store(&ts); continue; }
     }
 }
 
@@ -311,12 +425,12 @@ int main(int argc, char** argv) {
     // Vector core pool
     for (uint32_t i = 0; i < arch.vector_cores; i++)
         engine.register_unit(std::make_unique<VectorUnit>(
-            "vector_core_" + std::to_string(i), arch.vector_core));
+            "vector_core_" + std::to_string(i), arch.vector_core, nullptr, &ts));
 
     // Access core pool
     for (uint32_t i = 0; i < arch.access_cores; i++)
         engine.register_unit(std::make_unique<AccessUnit>(
-            "access_core_" + std::to_string(i), arch.access_core));
+            "access_core_" + std::to_string(i), arch.access_core, nullptr, &ts));
 
     // ── Ops + scheduler ───────────────────────────────────────────────────
     OpRegistry reg;
