@@ -1,0 +1,21 @@
+# workloads/fa2_qkt.yaml
+#
+# FA2 Q @ K^T workload — one attention tile.
+# Describes the full matrix sizes. The tiler decomposes into
+# per-array-execution STAGE + GEMM instructions automatically.
+#
+# shared_ibuf.Q_tile  [Br × d_head]  — already loaded from HBM
+# shared_ibuf.KT_tile [d_head × Bc]  — already loaded + transposed
+#
+# Run:
+#   ./build/apps/sim_main --config configs/default.yaml \
+#                         --workload workloads/fa2_qkt.yaml
+
+workload:
+  Br:     256          # query tile rows  (> array rows → triggers tiling)
+  d_head: 128          # head dim = K streaming axis (never tiled)
+  Bc:     256          # key tile cols
+  src_a:  "shared_ibuf.Q_tile"
+  src_b:  "shared_ibuf.KT_tile"
+  dst_c:  "shared_obuf.S_tile"
+  fill:   random

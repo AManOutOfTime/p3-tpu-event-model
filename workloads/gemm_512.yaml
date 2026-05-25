@@ -1,0 +1,9 @@
+# workloads/gemm_512.yaml  — plain 512x512x512 GEMM
+workload:
+  M:     512
+  K:     512
+  N:     512
+  src_a: "A"
+  src_b: "B"
+  dst_c: "C"
+  fill:  random

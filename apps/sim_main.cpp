@@ -5,6 +5,7 @@
 #include "schedule/schedule.h"
 #include "schedule/op_registry.h"
 #include "schedule/scheduler.h"
+#include "schedule/tiler.h"
 #include "units/delay_unit.h"
 #include "units/systolic_unit.h"
 #include "units/dma_unit.h"
@@ -353,23 +354,27 @@ static void wire_units(EventEngine& engine, Scheduler& sched, TensorStore& ts) {
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
-    std::string config_path = "configs/default.yaml";
-    std::string sched_path  = "schedules/dummy_example.yaml";
-    bool        trace       = true;
+    std::string config_path   = "configs/default.yaml";
+    std::string sched_path    = "";
+    std::string workload_path = "";
+    bool        trace         = true;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if      (a == "--config"   && i+1 < argc) config_path = argv[++i];
-        else if (a == "--schedule" && i+1 < argc) sched_path  = argv[++i];
+        if      (a == "--config"   && i+1 < argc) config_path   = argv[++i];
+        else if (a == "--schedule" && i+1 < argc) sched_path    = argv[++i];
+        else if (a == "--workload" && i+1 < argc) workload_path = argv[++i];
         else if (a == "--no-trace")               trace = false;
         else {
-            std::cerr << "Usage: sim_main [--config FILE] [--schedule FILE] [--no-trace]\n";
+            std::cerr << "Usage: sim_main [--config FILE]"
+                         " [--schedule FILE | --workload FILE] [--no-trace]\n";
             return 1;
         }
     }
+    if (sched_path.empty() && workload_path.empty())
+        sched_path = "schedules/dummy_example.yaml";
 
-    ArchConfig arch     = ArchConfig::from_yaml_file(config_path);
-    Schedule   schedule = Schedule::from_yaml_file(sched_path);
+    ArchConfig arch = ArchConfig::from_yaml_file(config_path);
 
     std::cout << "clock=" << arch.clock_ghz << " GHz"
               << "  systolic=" << arch.systolic.rows << "x" << arch.systolic.cols
@@ -382,33 +387,39 @@ int main(int argc, char** argv) {
               << "  exp_lat=" << arch.vector_core.exp_latency
               << "  access_bw=" << arch.access_core.bandwidth << "\n\n";
 
-    // ── TensorStore — pre-seed FA2 buffers ─────────────────────────────
-    TensorStore ts;
     const uint32_t Br = arch.systolic.rows;
     const uint32_t Bc = arch.systolic.cols;
     const uint32_t DH = arch.systolic.d_head;
 
-    // IBUF: Q/K/V/K^T tiles (represent post-DMA state)
-    ts.init_random("shared_ibuf.Q_tile",   (size_t)Br*DH, -1.f, 1.f, 1);
-    ts.init_random("shared_ibuf.K_tile",   (size_t)Bc*DH, -1.f, 1.f, 2);
-    ts.init_random("shared_ibuf.K_tile_T", (size_t)DH*Bc, -1.f, 1.f, 3);
-    ts.init_random("shared_ibuf.V_tile",   (size_t)Bc*DH, -1.f, 1.f, 4);
-    ts.init_zeros ("shared_ibuf.P_tile",   (size_t)Br*Bc);
+    // ── TensorStore + Schedule ─────────────────────────────────────────
+    TensorStore       ts;
+    Schedule          schedule;
+    TileDecomposition tile_decomp;
+    bool              used_tiler = false;
 
-    // OBUF: accumulators and running statistics
-    ts.init_zeros  ("shared_obuf.O_acc",     (size_t)Br*DH);
-    ts.init_neg_inf("shared_obuf.m",         (size_t)Br);
-    ts.init_zeros  ("shared_obuf.l",         (size_t)Br);
-    ts.init_zeros  ("shared_obuf.correction",(size_t)Br);
-
-    // Systolic array registers — Q_operand pre-seeded from Q_tile so
-    // the GEMM at id=8 has real values. (id=4 dma_stage will update it
-    // at OP_DONE when the DMA fires, but GEMM depends_on [4,7] correctly.)
-    ts.init_random("systolic_array.Q_operand", (size_t)Br*DH, -1.f, 1.f, 1);
-    ts.init_zeros ("systolic_array.P_operand", (size_t)Br*Bc);
-
-    // Vector scratch space
-    ts.init_zeros("vector_scratch.rowmax_tmp", (size_t)Br);
+    if (!workload_path.empty()) {
+        // --workload: tiler generates STAGE+GEMM instructions automatically
+        WorkloadGemm wl = Tiler::from_yaml_file(workload_path);
+        tile_decomp     = Tiler::decompose(wl, arch, ts);
+        Tiler::print_decomposition(tile_decomp);
+        schedule.instructions = tile_decomp.instructions;
+        used_tiler = true;
+    } else {
+        // --schedule: hand-written YAML, pre-seed FA2 buffers
+        schedule = Schedule::from_yaml_file(sched_path);
+        ts.init_random("shared_ibuf.Q_tile",   (size_t)Br*DH, -1.f, 1.f, 1);
+        ts.init_random("shared_ibuf.K_tile",   (size_t)Bc*DH, -1.f, 1.f, 2);
+        ts.init_random("shared_ibuf.K_tile_T", (size_t)DH*Bc, -1.f, 1.f, 3);
+        ts.init_random("shared_ibuf.V_tile",   (size_t)Bc*DH, -1.f, 1.f, 4);
+        ts.init_zeros ("shared_ibuf.P_tile",   (size_t)Br*Bc);
+        ts.init_zeros  ("shared_obuf.O_acc",      (size_t)Br*DH);
+        ts.init_neg_inf("shared_obuf.m",          (size_t)Br);
+        ts.init_zeros  ("shared_obuf.l",          (size_t)Br);
+        ts.init_zeros  ("shared_obuf.correction", (size_t)Br);
+        ts.init_random ("systolic_array.Q_operand", (size_t)Br*DH, -1.f, 1.f, 1);
+        ts.init_zeros  ("systolic_array.P_operand", (size_t)Br*Bc);
+        ts.init_zeros  ("vector_scratch.rowmax_tmp", (size_t)Br);
+    }
 
     // ── Build engine ─────────────────────────────────────────────────────
     EventEngine engine(arch.clock_ghz);
@@ -453,11 +464,20 @@ int main(int argc, char** argv) {
               << "  (" << cycles_to_ns(final_cycle, arch.clock_ghz) << " ns)"
               << "  outstanding=" << scheduler.outstanding() << " ==\n";
 
-    // Print key output buffers
-    if (ts.has("shared_obuf.S_tile"))
-        ts.print("shared_obuf.S_tile", Br, Bc, 4);
-    if (ts.has("shared_obuf.O_tile"))
-        ts.print("shared_obuf.O_tile", Br, DH, 4);
+    // ── Output ────────────────────────────────────────────────────────
+    if (used_tiler) {
+        Tiler::assemble_output(tile_decomp, ts);
+        const auto& wl = tile_decomp.workload;
+        std::cout << "\nAssembled \"" << wl.dst_c << "\" ["
+                  << wl.M << "x" << wl.N << "] from "
+                  << tile_decomp.tiles.size() << " tile(s):\n";
+        ts.print(wl.dst_c, wl.M, wl.N, 4);
+    } else {
+        if (ts.has("shared_obuf.S_tile"))
+            ts.print("shared_obuf.S_tile", Br, Bc, 4);
+        if (ts.has("shared_obuf.O_tile"))
+            ts.print("shared_obuf.O_tile", Br, DH, 4);
+    }
 
     return scheduler.all_done() ? 0 : 1;
 }
