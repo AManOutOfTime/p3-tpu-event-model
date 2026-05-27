@@ -8,6 +8,7 @@ set(SIM_TEST_SOURCES
     test_dummy_units.cpp
     test_fa2_schedule.cpp
     test_fa2_correctness.cpp
+    test_fa2_full.cpp
 )
 
 add_executable(unit_tests ${SIM_TEST_SOURCES})

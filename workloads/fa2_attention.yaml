@@ -1,0 +1,21 @@
+# Flash Attention 2 — full single-head workload for LLaMA-3-8B.
+#
+# Model parameters (one GQA head):
+#   seq_len = 4096      (token sequence length)
+#   d_head  = 128       (per-head dimension = hidden_size / num_heads = 4096/32)
+#   Q tiles = seq_len / Br = 4096 / 128 = 32
+#   KV tiles= seq_len / Bc = 4096 / 128 = 32
+#
+# This workload is dispatched by sim_main when type == "attention".
+# The FA2Tiler generates the full pipelined instruction DAG (1024 GEMM pairs).
+#
+# Run:
+#   ./build/apps/sim_main --workload workloads/fa2_attention.yaml --no-trace
+
+workload:
+  type:    attention
+  seq_len: 4096       # full sequence length (rows of Q / K / V)
+  d_head:  128        # attention head dimension
+  Br:      128        # Q-tile rows  (must match systolic array rows)
+  Bc:      128        # KV-tile cols (must match systolic array cols)
+  fill:    random     # data initialisation: random | zeros | ones
