@@ -458,6 +458,8 @@ int main(int argc, char** argv) {
     } else {
         // --schedule: hand-written YAML, pre-seed FA2 buffers
         schedule = Schedule::from_yaml_file(sched_path);
+
+        // Single-tile schedule buffers (fa2_single_tile.yaml)
         ts.init_random("shared_ibuf.Q_tile",   (size_t)Br*DH, -1.f, 1.f, 1);
         ts.init_random("shared_ibuf.K_tile",   (size_t)Bc*DH, -1.f, 1.f, 2);
         ts.init_random("shared_ibuf.K_tile_T", (size_t)DH*Bc, -1.f, 1.f, 3);
@@ -470,6 +472,13 @@ int main(int argc, char** argv) {
         ts.init_random ("systolic_array.Q_operand", (size_t)Br*DH, -1.f, 1.f, 1);
         ts.init_zeros  ("systolic_array.P_operand", (size_t)Br*Bc);
         ts.init_zeros  ("vector_scratch.rowmax_tmp", (size_t)Br);
+
+        // Multi-tile schedule HBM source buffers (fa2_full_*.yaml).
+        // All K/V/Q tiles source from the same representative tile so
+        // timing is correct (latency is based on byte count, not actual data).
+        ts.init_random("HBM.Q_full", (size_t)Br*DH, -1.f, 1.f, 10);
+        ts.init_random("HBM.K_full", (size_t)Bc*DH, -1.f, 1.f, 11);
+        ts.init_random("HBM.V_full", (size_t)Bc*DH, -1.f, 1.f, 12);
     }
 
     // ── Build engine ─────────────────────────────────────────────────────
@@ -530,10 +539,14 @@ int main(int argc, char** argv) {
                   << tile_decomp.tiles.size() << " tile(s):\n";
         ts.print(wl.dst_c, wl.M, wl.N, 4);
     } else {
+        // Single-tile outputs
         if (ts.has("shared_obuf.S_tile"))
             ts.print("shared_obuf.S_tile", Br, Bc, 4);
         if (ts.has("shared_obuf.O_tile"))
             ts.print("shared_obuf.O_tile", Br, DH, 4);
+        // Multi-tile outputs: show first Q tile
+        if (ts.has("shared_obuf.O_tile_i0"))
+            ts.print("shared_obuf.O_tile_i0", Br, DH, 4);
     }
 
     return scheduler.all_done() ? 0 : 1;
