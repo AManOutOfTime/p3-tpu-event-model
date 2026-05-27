@@ -6,18 +6,18 @@ using namespace sim;
 
 TEST_CASE("ArchConfig has correct defaults") {
     ArchConfig c;
-    REQUIRE(c.clock_ghz              == doctest::Approx(1.0));
+    REQUIRE(c.clock_ghz              == doctest::Approx(0.7));
     REQUIRE(c.systolic.rows          == 128);
     REQUIRE(c.systolic.cols          == 128);
     REQUIRE(c.systolic.precision     == "BF16");
     REQUIRE(c.vector_cores           == 3);
-    REQUIRE(c.access_cores           == 1);
+    REQUIRE(c.access_cores           == 2);
     REQUIRE(c.sram.ibuf_kb           == 4096);
     REQUIRE(c.sram.obuf_kb           == 4096);
-    REQUIRE(c.sram.banking_factor    == 8);
+    REQUIRE(c.sram.banking_factor    == 256);
     REQUIRE(c.sram.private_vector_kb == 512);
-    REQUIRE(c.hbm.bandwidth_tb_s     == doctest::Approx(2.0));
-    REQUIRE(c.hbm.latency_cycles     == 200);
+    REQUIRE(c.hbm.bandwidth_tb_s     == doctest::Approx(0.35));
+    REQUIRE(c.hbm.latency_cycles     == 300);
     REQUIRE(c.dma.channels           == 1);
 }
 

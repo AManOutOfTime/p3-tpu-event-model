@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code when working with this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project overview
 
@@ -12,10 +12,10 @@ It is parametric and cycle-accurate. The architecture is defined in a YAML confi
 schedules (`schedules/`) or as matrix-size workload files (`workloads/`) that the
 Tiler automatically decomposes into per-tile instructions.
 
-The main reference workload is a single-head FA2 forward pass implemented in
-`schedules/fa2_single_tile.yaml`. Every instruction uses a real named op — no
-`delay` stubs. Every hardware unit performs actual float computation at `OP_DONE`
-in addition to modelling cycle-accurate latency.
+The main reference workload is a single-head FA2 forward pass in
+`schedules/fa2_single_tile.yaml` (24 instructions). Every instruction uses a real
+named op — no `delay` stubs. Every hardware unit performs actual float computation
+at `OP_DONE` in addition to modelling cycle-accurate latency.
 
 ---
 
@@ -43,7 +43,8 @@ cmake --build build --parallel
 ```
 
 Flags: `--config FILE`, `--schedule FILE`, `--workload FILE`, `--no-trace`.
-`--schedule` and `--workload` are mutually exclusive.
+`--schedule` and `--workload` are mutually exclusive. Default schedule when neither is
+given: `schedules/dummy_example.yaml`.
 
 On Windows (PowerShell):
 ```powershell
@@ -66,7 +67,7 @@ configs/
 
 schedules/
   fa2_single_tile.yaml    FA2 forward pass, single head, one Q tile × one KV tile
-  dummy_example.yaml      Minimal smoke-test schedule
+  dummy_example.yaml      Minimal smoke-test schedule (uses `op: delay`)
 
 workloads/
   fa2_qkt.yaml            FA2 Q@K^T workload (Br=256, d_head=128, Bc=256)
@@ -81,7 +82,7 @@ src/
     event.h               Event struct (cycle, type, target, payload, label)
     unit.h                Base Unit class — virtual handle(Event, EventEngine)
     event_engine.h/.cpp   Discrete-event loop — min-heap, unit registry,
-                          unit-pool reservation (available_at per unit)
+                          unit-pool reservation (available_at + buffer tracking per unit)
     logger.h/.cpp         ConsoleLogger — formats events to stdout
     tensor_store.h        Named float buffer store — shared across all units,
                           slice_rows / slice_cols / place_tile / init helpers
@@ -95,8 +96,10 @@ src/
                           STAGE + GEMM instructions (Q-stationary loop order)
 
   units/
-    delay_unit.h/.cpp     Generic fixed-latency stub (backward compat)
-    systolic_unit.h/.cpp  Systolic array — timing + tiled float GEMM at OP_DONE
+    delay_unit.h/.cpp     Generic fixed-latency stub (backward compat / tests)
+    systolic_unit.h/.cpp  Systolic array — weight_load + gemm; tiled float GEMM at OP_DONE
+    buffer_unit.h/.cpp    Double-buffered banked SRAM — sram_read / sram_write;
+                          banking-contention model with two-half double-buffer
     dma_unit.h/.cpp       DMA — dma_load / dma_store / dma_stage latency models,
                           buffer copy in TensorStore at OP_DONE
     vector_unit.h/.cpp    Vector/tandem core — scale, rowmax, update_rowmax,
@@ -108,7 +111,7 @@ tests/
   test_config.cpp         ArchConfig YAML round-trip tests
   test_schedule.cpp       Schedule parser tests
   test_dummy_units.cpp    DelayUnit / PrintingUnit tests
-  test_fa2_schedule.cpp   FA2 schedule parse + DAG + simulation tests
+  test_fa2_schedule.cpp   FA2 schedule parse + DAG + simulation tests (24 instructions)
 ```
 
 ---
@@ -118,22 +121,29 @@ tests/
 ### 1. Event engine (`src/core/event_engine.h`)
 
 Discrete-event simulation. The engine holds a min-heap of `Event` structs ordered
-by `cycle`. `engine.run()` pops events one at a time and dispatches each to its
+by `(cycle, seq)`. `engine.run()` pops events one at a time and dispatches each to its
 target unit via `unit.handle(event, engine)`. Time jumps directly to the next
 event — there is no per-cycle loop.
 
 Units are registered by name. `find_unit(name)` returns a `UnitId`.
-`find_unit_pool(prefix)` returns all units whose name starts with `prefix`
-(e.g. `"vector_core"` matches `"vector_core_0"`, `"vector_core_1"`, `"vector_core_2"`).
+`find_unit_pool(prefix)` returns all units whose name starts with `prefix + "_"`
+(e.g. `"vector_core"` matches `"vector_core_0"`, `"vector_core_1"`).
 
-`reserve_unit_pool(targets, duration)` picks the first available unit from a pool
-and books it:
-```cpp
-Cycle start = max(now, available_at[uid]);
-available_at[uid] = start + duration;
-return {uid, start};
+`reserve_unit_pool(targets, duration, buffer_bytes)` picks the best available unit
+from a pool:
+1. Skips units whose buffer capacity would be exceeded by `buffer_bytes`.
+2. Among remaining, prefers the unit with the **lowest current buffer utilization**.
+3. Ties are broken by earliest `available_at`, then lowest `UnitId`.
+
+After selection:
 ```
-This is the entire "reservation station" — one integer per unit. No queue.
+available_at[uid] = max(now, available_at[uid]) + duration
+buffer_used_bytes[uid] += buffer_bytes
+```
+
+`release_unit_buffer(uid, bytes)` decrements `buffer_used_bytes` (called by unit at
+`OP_DONE` to free scratch space). `buffer_capacity_bytes` is supplied at
+`register_unit()` time — 0 means unlimited.
 
 ### 2. Scheduler (`src/schedule/scheduler.h`)
 
@@ -160,22 +170,32 @@ Unit latency models:
 
 | Unit | Op | Latency |
 |---|---|---|
-| SystolicUnit | gemm | `tiles_m × tiles_n × (K + fill_latency)` |
-| SystolicUnit | — | `fill_latency = (rows-1)+(cols-1)` unidir, `÷2` bidir |
-| DmaUnit | dma_load / dma_store | `hbm_latency + ceil(bytes / hbm_bw)` |
-| DmaUnit | dma_stage | `ceil(bytes / banking_factor)` (on-chip only) |
-| VectorUnit | all ops | `passes × ceil(elems/simd_width) + exp_ops × exp_latency × groups` |
-| AccessUnit | init_fill / transpose | `ceil(elements / access_core.bandwidth)` |
+| SystolicUnit | `weight_load` | `ceil(SA_rows × SA_cols × dtype_bytes / banking_factor)` |
+| SystolicUnit | `gemm` | `tiles_m × tiles_n × (K + fill_latency)` |
+| SystolicUnit | — | `fill_latency = (rows-1)+(cols-1)` unidir; `ceil((rows-1)/2)+ceil((cols-1)/2)` bidir |
+| BufferUnit | `sram_read` / `sram_write` | `ceil(bytes / banking_factor)` with double-buffer bank stall |
+| DmaUnit | `dma_load` / `dma_store` | `hbm_latency + ceil(bytes / (hbm_bw × channels))` |
+| DmaUnit | `dma_stage` | `ceil(bytes / banking_factor)` (on-chip SRAM read, no HBM penalty) |
+| VectorUnit | all ops | `passes × ceil(elems/simd_width) + exp_ops × exp_latency × ceil(elems/simd_width)` |
+| AccessUnit | `init_fill` / `transpose` | `ceil(elements / access_core.bandwidth)` |
+
+**BufferUnit double-buffer model:**  
+IBUF/OBUF each have two logical halves (ping/pong). Writes (DMA producer) always
+go to `write_count % 2`; reads (systolic/vector consumer) go to the other half.
+`bank_free_at[0/1]` tracks each half independently — DMA and compute can proceed
+simultaneously as long as they target different halves. A stall only occurs if the
+consumer half is still being written (or vice versa).
 
 ### 4. TensorStore (`src/core/tensor_store.h`)
 
 Flat `string → vector<float>` map. Buffer keys follow a naming convention:
 ```
-"shared_ibuf.*"              on-chip SRAM input buffer
-"shared_obuf.*"              on-chip SRAM output buffer
-"systolic_array.Q_operand"   array PE input register (staged by dma_stage)
-"systolic_array.P_operand"   array PE input register
-"vector_scratch.*"           vector core scratch space
+"shared_ibuf.*"                on-chip SRAM input buffer
+"shared_obuf.*"                on-chip SRAM output buffer
+"systolic_array.Q_operand"     array PE input register (staged by dma_stage)
+"systolic_array.P_operand"     array PE input register
+"systolic_array.weight_reg"    PE weight registers (loaded by weight_load)
+"vector_scratch.*"             vector core scratch space
 ```
 
 DmaUnit copies `src_buf → dst_buf` at `OP_DONE`. SystolicUnit writes `dst_c`
@@ -186,16 +206,19 @@ output buffers at `OP_DONE`.
 
 ## FA2 ops and units
 
-The full op set used by `schedules/fa2_single_tile.yaml`:
+The full op set used by `schedules/fa2_single_tile.yaml` (24 instructions):
 
 | Op | Unit | What it computes |
 |---|---|---|
-| `dma_load` | dma | copies HBM key into `shared_ibuf`, charges HBM latency |
-| `dma_store` | dma | copies `shared_obuf` key to HBM, charges HBM latency |
-| `dma_stage` | dma | copies IBUF key → array register, charges SRAM read latency |
+| `dma_load` | dma | HBM → `shared_ibuf`; charges `hbm_latency + bandwidth` |
+| `dma_store` | dma | `shared_obuf` → HBM; same latency formula |
+| `dma_stage` | dma | IBUF key → array PE register; on-chip only, charges `ceil(bytes/banking_factor)` |
 | `init_fill` | access_core | fills buffer with 0 / −∞ in TensorStore |
 | `transpose` | access_core | row-major matrix transpose in TensorStore |
+| `weight_load` | systolic | distributes weight tile into all PE registers (pre-GEMM cost) |
 | `gemm` | systolic | C = A × B tiled float GEMM, writes result to TensorStore |
+| `sram_read` | shared_ibuf | explicit IBUF read with banking-contention model |
+| `sram_write` | shared_obuf | explicit OBUF write with banking-contention model |
 | `scale` | vector_core | element-wise multiply (scalar or row-vector broadcast) |
 | `rowmax` | vector_core | row-wise max reduction → length-Br vector |
 | `update_rowmax` | vector_core | m = max(m, r); correction = exp(m_old − m_new) |
@@ -204,6 +227,40 @@ The full op set used by `schedules/fa2_single_tile.yaml`:
 | `accumulate` | vector_core | O_acc += Temp element-wise |
 | `normalize` | vector_core | O_tile = O_acc / l row-wise |
 | `logsumexp` | vector_core | L = m + log(l) element-wise |
+
+**FA2 schedule instruction sequence (fa2_single_tile.yaml):**
+
+```
+Phase 1 — pre-inner (parallel init + Q load):
+  0  dma_load Q tile
+  1  init_fill O_acc=0
+  2  init_fill m=−∞
+  3  init_fill l=0
+
+Phase 2 — inner body (j=0):
+  4  dma_stage Q_tile → Q_operand              depends: 0
+  5  dma_load K_tile                            depends: 4
+  6  dma_load V_tile                            depends: 5
+  7  transpose K_tile → K_tile_T               depends: 5
+  8  weight_load K_tile_T → PE weight regs      depends: 7
+  9  gemm S = Q_operand @ K_tile_T              depends: 4, 8
+ 10  scale S /= sqrt(d_k)                       depends: 9
+ 11  rowmax(S) → rowmax_tmp                     depends: 10
+ 12  update_rowmax: m, correction               depends: 11, 2
+ 13  exp_shift: P = exp(S − m)                  depends: 12
+ 14  update_rowsum: l                            depends: 13, 12, 3
+ 15  scale O_acc *= correction                  depends: 12, 1
+ 16  dma_stage P_tile → P_operand               depends: 13, 6
+ 17  weight_load V_tile → PE weight regs         depends: 9, 6
+ 18  gemm Temp = P_operand @ V_tile             depends: 16, 17
+ 19  accumulate O_acc += Temp                   depends: 15, 18
+
+Phase 3 — post-inner:
+ 20  normalize O_tile = O_acc / l               depends: 19, 14
+ 21  logsumexp L = m + log(l)                   depends: 12, 14, 20
+ 22  dma_store O_tile → HBM                     depends: 20
+ 23  dma_store L_tile → HBM                     depends: 21, 22
+```
 
 ---
 
@@ -230,10 +287,10 @@ Activated via `--workload FILE` instead of `--schedule FILE`.
 
 ## Arch config (`configs/default.yaml`)
 
-All parameters editable without rebuild:
+Current defaults (TPUv2-approximate per-core parameters):
 
 ```yaml
-clock_ghz: 1.0
+clock_ghz: 0.7
 
 systolic:
   rows:          128
@@ -243,31 +300,32 @@ systolic:
   d_head:        128       # K streaming dimension
 
 vector_cores: 3
-access_cores: 1
+access_cores: 2
 
 sram:
-  ibuf_kb:        4096
-  obuf_kb:        4096
-  banking_factor: 8        # parallel SRAM ports (affects dma_stage latency)
+  ibuf_kb:           4096
+  obuf_kb:           4096
+  banking_factor:    256   # approximate on-chip datapath width in bytes/cycle
+  private_vector_kb: 512   # per-vector-core private SRAM
 
 hbm:
-  bandwidth_tb_s: 2.0
-  latency_cycles: 200
+  bandwidth_tb_s: 0.35     # ~TPUv2 per-core share of 700 GB/s
+  latency_cycles: 300
 
 dma:
   channels: 1
 
 vector_core:
-  simd_width:  64
+  simd_width:  1024
   exp_latency: 4
 
 access_core:
-  bandwidth: 64            # elements per cycle for transpose / init_fill
+  bandwidth: 128           # elements per cycle for transpose / init_fill
 ```
 
-Bidirectional fill latency: `ceil((rows-1)/2) + ceil((cols-1)/2)` instead of
-`(rows-1) + (cols-1)`. Benefits small-K workloads most (e.g. attention with
-d_head=64 on a large array).
+The `banking_factor` controls both `dma_stage` latency and SRAM banking-contention
+latency via `ceil(bytes / banking_factor)`. The `weight_load` op uses this same
+formula: `ceil(SA_rows × SA_cols × dtype_bytes / banking_factor)`.
 
 ---
 
@@ -320,7 +378,8 @@ Symbolic dimension values resolved in `sim_main.cpp::resolve()`:
    ```
 2. Add to `src/CMakeLists.txt` under `SIM_CORE_SOURCES`.
 3. Register new op handlers in `apps/sim_main.cpp::register_all_ops()`.
-4. Instantiate and register with the engine in `main()`.
+4. Instantiate and register with the engine in `main()` — pass `buffer_capacity_bytes`
+   to `register_unit()` if the unit has bounded scratch space.
 5. Add `dynamic_cast` wire-up in `wire_units()`.
 6. Add tests in `tests/`.
 
@@ -328,8 +387,10 @@ Symbolic dimension values resolved in `sim_main.cpp::resolve()`:
 
 1. Add a `reg.register_op("my_op", ...)` handler in `register_all_ops()`.
 2. The handler reads params from `ctx.inst.params` via `pget_int / pget_str / pget_bool / pget_dbl`.
-3. Build a typed payload struct, call `reserve_unit_pool` for the target pool, schedule `OP_START`.
-4. The unit's `handle(OP_DONE)` must call `sched_->notify_done(e.instr)`.
+3. Build a typed payload struct, call `reserve_unit_pool(targets, duration, buffer_bytes)`
+   for the target pool, schedule `OP_START`.
+4. The unit's `handle(OP_DONE)` must call `sched_->notify_done(e.instr)` and
+   `engine.release_unit_buffer(id, bytes)` if buffer space was reserved.
 
 ## Adding a new schedule
 
@@ -352,11 +413,6 @@ workload:
   fill:   random       # random | zeros | ones
 ```
 
-Run with:
-```bash
-./build/apps/sim_main --workload workloads/my_workload.yaml
-```
-
 ---
 
 ## What is and is not modeled
@@ -364,8 +420,12 @@ Run with:
 **Modeled (cycle-accurate):**
 - Systolic array GEMM latency with tiling and fill-pipeline delay
 - Bidirectional wavefront (halved fill cost)
+- Weight-stationary pre-load cost: distributing K/V tiles into PE registers before each GEMM
 - HBM load/store latency (fixed + bandwidth)
-- On-chip SRAM stage latency (banking factor)
+- On-chip SRAM staging latency (banking factor)
+- SRAM banking contention between concurrent accesses (via `BufferUnit`)
+- Double-buffer IBUF/OBUF: producer (DMA) and consumer (systolic/vector) on different halves,
+  no stall unless halves collide
 - Vector core SIMD latency + transcendental (exp/log) overhead
 - Access core transpose / init-fill latency
 - Unit structural hazards (one array — all GEMMs serialized)
@@ -373,10 +433,9 @@ Run with:
 - Actual float values for all operations end-to-end
 
 **Not yet modeled:**
-- SRAM banking contention between concurrent accesses
-- Double-buffer IBUF/OBUF (producer-consumer tile overlap)
 - Multi-head attention / GQA outer loops (single head only)
 - Multi-core / multi-chip parallelism
 - Sparse attention / paged KV cache / scatter-gather
 - K-split (tiling the K/d_head dimension across multiple array executions)
-- Weight-stationary pre-loading cost (weights assumed pre-staged)
+- HBM banking contention (multiple concurrent HBM transfers)
+- Prefetch buffer for the next KV tile while the current one is being computed

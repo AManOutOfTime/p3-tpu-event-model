@@ -2,7 +2,7 @@
 # the ArchConfig defaults. Tweak any value and re-run; the simulator picks up
 # the new parameters without a rebuild.
 
-clock_ghz: 1.0
+clock_ghz: 0.7
 
 systolic:
   rows: 128
@@ -12,24 +12,24 @@ systolic:
   d_head: 128              # attention head dimension (= K streaming axis)
 
 vector_cores: 3
-access_cores: 1
+access_cores: 2
 
 sram:
   ibuf_kb:           4096   # shared input buffer
   obuf_kb:           4096   # shared output buffer
-  banking_factor:    8      # concurrent r/w ports per cycle
+  banking_factor:    256    # approximate on-chip datapath width in bytes/cycle
   private_vector_kb: 512    # per-vector-core private SRAM
 
 hbm:
-  bandwidth_tb_s: 2.0       # H100 ~3.35 TB/s; TPUv4 ~1.2 TB/s
-  latency_cycles: 200
+  bandwidth_tb_s: 0.35      # TPUv2-like per-core share of 700 GB/s chip HBM
+  latency_cycles: 300
 
 dma:
   channels: 1
 
 vector_core:
-  simd_width:  64
+  simd_width:  1024
   exp_latency: 4
 
 access_core:
-  bandwidth: 64
+  bandwidth: 128

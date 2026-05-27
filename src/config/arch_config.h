@@ -15,13 +15,13 @@ struct SystolicConfig {
 struct SramConfig {
     uint32_t ibuf_kb           = 4096;
     uint32_t obuf_kb           = 4096;
-    uint32_t banking_factor    = 8;
+    uint32_t banking_factor    = 256;
     uint32_t private_vector_kb = 512;
 };
 
 struct HbmConfig {
-    double   bandwidth_tb_s = 2.0;
-    uint32_t latency_cycles = 200;
+    double   bandwidth_tb_s = 0.35;
+    uint32_t latency_cycles = 300;
 };
 
 struct DmaConfig {
@@ -29,19 +29,19 @@ struct DmaConfig {
 };
 
 struct VectorCoreConfig {
-    uint32_t simd_width  = 64;
+    uint32_t simd_width  = 1024;
     uint32_t exp_latency = 4;
 };
 
 struct AccessCoreConfig {
-    uint32_t bandwidth = 64;   // elements per cycle
+    uint32_t bandwidth = 128;  // elements per cycle
 };
 
 struct ArchConfig {
-    double           clock_ghz    = 1.0;
+    double           clock_ghz    = 0.7;
     SystolicConfig   systolic;
     uint32_t         vector_cores = 3;
-    uint32_t         access_cores = 1;
+    uint32_t         access_cores = 2;
     SramConfig       sram;
     HbmConfig        hbm;
     DmaConfig        dma;
