@@ -16,10 +16,15 @@ Cycle DmaUnit::load_store_latency(uint64_t bytes) const {
            static_cast<Cycle>(std::ceil(static_cast<double>(bytes) / bw));
 }
 
-Cycle DmaUnit::stage_latency(uint64_t bytes) const {
-    if (!bytes || !cfg_.sram.banking_factor) return 0;
-    return static_cast<Cycle>(std::ceil(
-        static_cast<double>(bytes) / cfg_.sram.banking_factor));
+// ---------------------------------------------------------------------------
+// stage_latency  —  IBUF → systolic array input register  (on-chip)
+//   TPUv1 paper (p.4): activation data streams into the array one row per
+//   cycle alongside the diagonal wavefront. The bottleneck is the array's
+//   input bus (SA_rows rows to feed), not the SRAM banking factor.
+//   latency = SA_rows cycles  (= 128 for a 128×128 array)
+// ---------------------------------------------------------------------------
+Cycle DmaUnit::stage_latency(uint64_t /*bytes*/) const {
+    return static_cast<Cycle>(cfg_.systolic.rows);
 }
 
 void DmaUnit::handle(const Event& e, EventEngine& engine) {

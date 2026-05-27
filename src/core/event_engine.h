@@ -28,6 +28,9 @@ public:
     // also be retrieved later via find_unit(name).
     UnitId  register_unit(std::unique_ptr<Unit> unit, uint64_t buffer_capacity_bytes = 0);
     Unit*   get_unit(UnitId id) const;
+    // Returns the cycle at which the unit finishes its last reserved work.
+    // Useful for utilisation reporting after engine.run() completes.
+    Cycle   unit_available_at(UnitId id) const;
     UnitId  find_unit(const std::string& name) const;
     std::vector<UnitId> find_unit_pool(const std::string& logical_name) const;
     size_t  num_units() const { return units_.size(); }

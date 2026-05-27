@@ -39,7 +39,7 @@ void VectorUnit::do_scale(const VectorOp& op) {
     // Copy src → dst if different buffers
     if (in != out) ts_->copy(in, out);
 
-    // Apply row-vector scale if provided (e.g. O_acc *= correction row-wise)
+    // Row-vector scale (e.g. O_acc *= correction row-wise)
     if (!op.src_scale.empty() && ts_->has(op.src_scale)) {
         auto& dst_buf      = ts_->get_mutable(out);
         const auto& scale  = ts_->get(op.src_scale);
@@ -53,8 +53,13 @@ void VectorUnit::do_scale(const VectorOp& op) {
         os_ << "  [" << name() << "]  SCALE  \"" << in
             << "\" *= \"" << op.src_scale << "\" (row-broadcast) → \""
             << out << "\"\n";
+    } else if (op.scalar_val != 1.f) {
+        // Uniform scalar multiply (e.g. S /= sqrt(d_k))
+        auto& dst_buf = ts_->get_mutable(out);
+        for (auto& v : dst_buf) v *= op.scalar_val;
+        os_ << "  [" << name() << "]  SCALE  \"" << out
+            << "\" *= " << op.scalar_val << "\n";
     }
-    // else: symbolic scalar (1/sqrt(d_k)) — timing only, values unchanged
 }
 
 // ---------------------------------------------------------------------------

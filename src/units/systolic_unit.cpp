@@ -12,19 +12,20 @@ SystolicUnit::SystolicUnit(std::string name, const SystolicConfig& cfg,
 
 // ---------------------------------------------------------------------------
 // weight_load_latency
-//   Broadcasting one weight tile into all SA_rows × SA_cols PE registers.
-//   Each PE needs dtype_bytes written via the SRAM bus.
-//   banking_factor parallel ports service all PEs.
-//   latency = ceil(SA_rows × SA_cols × dtype_bytes / banking_factor)
+//   TPUv1 paper (p.3): "the 256 cycles it takes to shift a tile in" for a
+//   256×256 array. That is exactly SA_rows cycles — one row of weights is
+//   shifted per cycle into the array's systolic input registers.
+//   For a 128×128 array: 128 cycles.
+//
+//   Previous formula ceil(rows×cols×bytes / banking_factor) = 4096 cycles
+//   was wrong — it measured SRAM byte throughput, not array shift cycles.
+//   The bottleneck is the array's weight-shift bus, not SRAM bandwidth.
 // ---------------------------------------------------------------------------
-Cycle SystolicUnit::weight_load_latency(uint32_t sa_rows, uint32_t sa_cols,
-                                        uint32_t dtype_bytes,
-                                        uint32_t banking_factor) {
-    if (!sa_rows || !sa_cols || !banking_factor) return 0;
-    const uint64_t total_bytes = static_cast<uint64_t>(sa_rows)
-                               * sa_cols * dtype_bytes;
-    return static_cast<Cycle>(
-        std::ceil(static_cast<double>(total_bytes) / banking_factor));
+Cycle SystolicUnit::weight_load_latency(uint32_t sa_rows, uint32_t /*sa_cols*/,
+                                        uint32_t /*dtype_bytes*/,
+                                        uint32_t /*banking_factor*/) {
+    // One row shifted per cycle → sa_rows cycles total
+    return static_cast<Cycle>(sa_rows);
 }
 
 Cycle SystolicUnit::fill_latency() const {

@@ -19,6 +19,11 @@ Unit* EventEngine::get_unit(UnitId id) const {
     return units_[id].get();
 }
 
+Cycle EventEngine::unit_available_at(UnitId id) const {
+    if (id == INVALID_UNIT || id >= static_cast<UnitId>(hardware_.size())) return 0;
+    return hardware_[id].available_at;
+}
+
 UnitId EventEngine::find_unit(const std::string& name) const {
     auto it = name_index_.find(name);
     return it == name_index_.end() ? INVALID_UNIT : it->second;

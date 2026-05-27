@@ -21,15 +21,27 @@ sram:
   private_vector_kb: 512    # per-vector-core private SRAM
 
 hbm:
-  bandwidth_tb_s: 2.0       # H100 ~3.35 TB/s; TPUv4 ~1.2 TB/s
-  latency_cycles: 200
+  # TPUv2: 700 GB/s per chip at 700 MHz = ~1000 B/cycle.
+  # TPUv3: ~900 GB/s. Using 0.9 TB/s as a TPUv3-like default.
+  # Previous value of 2.0 TB/s was 2× too high (more like H100 territory).
+  bandwidth_tb_s: 0.9
+  # Real HBM access latency ~100-200 ns. At 1 GHz, 100 cycles is mid-range.
+  latency_cycles: 100
 
 dma:
   channels: 1
 
 vector_core:
-  simd_width:  64
-  exp_latency: 4
+  # TPUv2 Norrie 2021 p.4: 128 vector lanes × 8 sublanes = 1024 ops/cycle.
+  # Using 128 (one lane dimension) as a conservative single-core SIMD width.
+  # Previous value of 64 made vector ops ~2-16× too slow.
+  simd_width:  128
+  # Real transcendental units (exp, log) pipeline depth ~10-20 cycles.
+  # Previous value of 4 was too optimistic.
+  exp_latency: 10
 
 access_core:
-  bandwidth: 64
+  # TPUv2 Norrie 2021 p.5: Transpose/Permute Unit runs at memory bandwidth.
+  # At ~1000 B/cycle HBM, BF16 = 500 elements/cycle. Using 256 conservatively.
+  # Previous value of 64 was ~8× too slow.
+  bandwidth: 256

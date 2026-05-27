@@ -13,6 +13,7 @@
 #include "units/vector_unit.h"
 #include "units/access_unit.h"
 #include <iostream>
+#include <iomanip>
 #include <string>
 #include <stdexcept>
 #include <cmath>
@@ -143,7 +144,28 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         uint32_t rows = resolve(p, "rows", arch);
         uint32_t cols = resolve(p, "cols", arch);
         xfer.bytes = (uint64_t)rows * cols * dtype_bytes(arch.systolic.precision);
-        Cycle lat = (Cycle)std::ceil((double)xfer.bytes / arch.sram.banking_factor);
+
+        // Latency = SA_rows (array ingestion rate, not SRAM bandwidth)
+        Cycle lat = static_cast<Cycle>(arch.systolic.rows);
+
+        // Also charge shared_ibuf bank — staging reads from IBUF SRAM.
+        // This makes banking contention in BufferUnit visible on staging ops.
+        auto ibuf_units = ctx.engine.find_unit_pool("shared_ibuf");
+        if (!ibuf_units.empty()) {
+            SramAccess sram_r;
+            sram_r.bytes    = xfer.bytes;
+            sram_r.is_write = false;
+            sram_r.src_buf  = xfer.src_buf;
+            sram_r.dst_buf  = "";
+            // Reserve the IBUF bank — effective start is max(DMA free, bank free)
+            auto ibuf_res = ctx.scheduler.reserve_unit_pool(ibuf_units,
+                static_cast<Cycle>(std::ceil(
+                    static_cast<double>(xfer.bytes) / arch.sram.banking_factor)));
+            // The DMA stage can't start before the IBUF bank is free
+            lat = std::max(lat, ibuf_res.start > ctx.engine.current_cycle()
+                ? ibuf_res.start - ctx.engine.current_cycle() + lat : lat);
+        }
+
         auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
         Event e; e.type=EventType::OP_START; e.target=res.id; e.cycle=res.start;
         e.instr=ctx.inst.id; e.label=ctx.inst.label; e.payload=xfer;
@@ -216,7 +238,7 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
     // Each handler builds a fully-populated VectorOp so the unit has all
     // buffer names it needs to compute the result at OP_DONE.
 
-    // scale: dst = src element-wise (optionally *= row-vector src_scale)
+    // scale: dst = src element-wise (optionally *= row-vector src_scale or scalar)
     reg.register_op("scale", [arch](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
         if (targets.empty()) throw std::runtime_error("scale: unknown unit");
@@ -229,6 +251,21 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         op.src       = pget_str(p, "source");
         op.dst       = pget_str(p, "destination");
         op.src_scale = pget_str(p, "source_scale");
+
+        // Parse scalar param: "1/sqrt(d_k)" → 1/sqrt(d_head)
+        // Also accept plain floats like "0.5"
+        std::string scalar_str = pget_str(p, "scalar");
+        if (!scalar_str.empty()) {
+            if (scalar_str.find("sqrt") != std::string::npos) {
+                // "1/sqrt(d_k)" style — extract d from arch
+                uint32_t dk = arch.systolic.d_head;
+                op.scalar_val = 1.f / std::sqrt(static_cast<float>(dk));
+            } else {
+                try { op.scalar_val = std::stof(scalar_str); }
+                catch (...) { op.scalar_val = 1.f; }
+            }
+        }
+
         double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
         Cycle lat = (Cycle)g;
         auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
@@ -311,6 +348,7 @@ static void register_all_ops(OpRegistry& reg, const ArchConfig arch) {
         op.src_p          = pget_str(p, "source_p");
         op.src_correction = pget_str(p, "source_correction");
         op.src_l          = pget_str(p, "source_l_old");
+        if (op.src_l.empty()) op.src_l = pget_str(p, "source_l");
         op.dst_l          = pget_str(p, "destination");
         double g = std::ceil((double)op.elements / arch.vector_core.simd_width);
         Cycle lat = (Cycle)g;
@@ -409,16 +447,19 @@ int main(int argc, char** argv) {
     std::string sched_path    = "";
     std::string workload_path = "";
     bool        trace         = true;
+    bool        verify        = false;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "--config"   && i+1 < argc) config_path   = argv[++i];
         else if (a == "--schedule" && i+1 < argc) sched_path    = argv[++i];
         else if (a == "--workload" && i+1 < argc) workload_path = argv[++i];
-        else if (a == "--no-trace")               trace = false;
+        else if (a == "--no-trace")               trace  = false;
+        else if (a == "--verify")                 verify = true;
         else {
             std::cerr << "Usage: sim_main [--config FILE]"
-                         " [--schedule FILE | --workload FILE] [--no-trace]\n";
+                         " [--schedule FILE | --workload FILE]"
+                         " [--no-trace] [--verify]\n";
             return 1;
         }
     }
@@ -508,8 +549,15 @@ int main(int argc, char** argv) {
     wire_units(engine, scheduler, ts);
 
     // ── Trace ─────────────────────────────────────────────────────────────
+    // Per-unit cycle accounting: track total occupied cycles per unit name.
+    std::unordered_map<std::string, Cycle> unit_busy;
     ConsoleLogger logger(engine);
-    if (trace) engine.set_trace([&](const Event& e) { logger(e); });
+    engine.set_trace([&](const Event& e) {
+        if (e.type == EventType::OP_START) {
+            // We don't know duration here — tracked at OP_DONE via available_at
+        }
+        if (trace) logger(e);
+    });
 
     // ── Run ───────────────────────────────────────────────────────────────
     std::cout << "== simulation start  instructions="
@@ -520,6 +568,25 @@ int main(int argc, char** argv) {
               << "  cycle=" << final_cycle
               << "  (" << cycles_to_ns(final_cycle, arch.clock_ghz) << " ns)"
               << "  outstanding=" << scheduler.outstanding() << " ==\n";
+
+    // ── Cycle breakdown (utilisation report) ─────────────────────────────
+    // Read available_at from each unit — it equals the last cycle the unit
+    // was busy, which is the total occupied cycles for single-use units.
+    std::cout << "\n── Unit utilisation ─────────────────────────────────────\n";
+    std::cout << std::left;
+    for (UnitId uid = 0; uid < (UnitId)engine.num_units(); uid++) {
+        const Unit* u = engine.get_unit(uid);
+        if (!u) continue;
+        Cycle busy = engine.unit_available_at(uid);   // last busy cycle
+        if (busy == 0) continue;
+        double pct = final_cycle > 0
+            ? 100.0 * static_cast<double>(busy) / final_cycle : 0.0;
+        std::cout << "  " << std::setw(28) << u->name()
+                  << " busy_until=" << std::setw(8) << busy
+                  << "  util=" << std::fixed << std::setprecision(1)
+                  << pct << "%\n";
+    }
+    std::cout << "─────────────────────────────────────────────────────────\n";
 
     // ── Output ────────────────────────────────────────────────────────
     if (used_tiler) {
@@ -534,6 +601,94 @@ int main(int argc, char** argv) {
             ts.print("shared_obuf.S_tile", Br, Bc, 4);
         if (ts.has("shared_obuf.O_tile"))
             ts.print("shared_obuf.O_tile", Br, DH, 4);
+    }
+
+    // ── CPU reference verification (--verify) ────────────────────────────
+    // Computes exact attention output on CPU and compares with simulator.
+    // Checks: O_tile = softmax(Q @ K^T / sqrt(d_k)) @ V
+    //         L_tile = m + log(l)    (logsumexp, for next-tile reuse)
+    if (verify) {
+        std::cout << "\n── Correctness verification ─────────────────────────────\n";
+
+        bool ok = true;
+
+        if (!ts.has("shared_ibuf.Q_tile") || !ts.has("shared_ibuf.K_tile_T")
+            || !ts.has("shared_ibuf.V_tile") || !ts.has("shared_obuf.O_tile")
+            || !ts.has("shared_obuf.L_tile")) {
+            std::cout << "  SKIP — required buffers not all present "
+                         "(need Q_tile, K_tile_T, V_tile, O_tile, L_tile)\n";
+        } else {
+            const auto& Q   = ts.get("shared_ibuf.Q_tile");    // [Br×DH]
+            const auto& KT  = ts.get("shared_ibuf.K_tile_T");  // [DH×Bc]
+            const auto& V   = ts.get("shared_ibuf.V_tile");    // [Bc×DH]
+            const auto& sim_O = ts.get("shared_obuf.O_tile");  // [Br×DH]
+            const auto& sim_L = ts.get("shared_obuf.L_tile");  // [Br]
+
+            const uint32_t br = Br, bc = Bc, dh = DH;
+            const float scale = 1.f / std::sqrt(static_cast<float>(dh));
+
+            // S[i,j] = sum_k Q[i,k] * KT[k,j]  * scale
+            std::vector<float> S(br * bc, 0.f);
+            for (uint32_t i=0;i<br;i++)
+                for (uint32_t k=0;k<dh;k++)
+                    for (uint32_t j=0;j<bc;j++)
+                        S[i*bc+j] += Q[i*dh+k] * KT[k*bc+j];
+            for (auto& v : S) v *= scale;
+
+            // row-max, exp, row-sum
+            std::vector<float> ref_m(br, -std::numeric_limits<float>::infinity());
+            for (uint32_t i=0;i<br;i++)
+                for (uint32_t j=0;j<bc;j++)
+                    ref_m[i] = std::max(ref_m[i], S[i*bc+j]);
+
+            std::vector<float> P(br*bc);
+            std::vector<float> ref_l(br, 0.f);
+            for (uint32_t i=0;i<br;i++) {
+                for (uint32_t j=0;j<bc;j++) {
+                    P[i*bc+j] = std::exp(S[i*bc+j] - ref_m[i]);
+                    ref_l[i] += P[i*bc+j];
+                }
+            }
+
+            // O_ref[i,:] = sum_j P[i,j] * V[j,:] / l[i]
+            std::vector<float> ref_O(br*dh, 0.f);
+            for (uint32_t i=0;i<br;i++)
+                for (uint32_t j=0;j<bc;j++)
+                    for (uint32_t d=0;d<dh;d++)
+                        ref_O[i*dh+d] += P[i*bc+j] * V[j*dh+d];
+            for (uint32_t i=0;i<br;i++)
+                for (uint32_t d=0;d<dh;d++)
+                    ref_O[i*dh+d] /= ref_l[i];
+
+            // L_ref[i] = m[i] + log(l[i])
+            std::vector<float> ref_L(br);
+            for (uint32_t i=0;i<br;i++)
+                ref_L[i] = ref_m[i] + std::log(ref_l[i]);
+
+            // Compare
+            float max_O_err = 0.f, max_L_err = 0.f;
+            for (size_t i=0;i<ref_O.size();i++)
+                max_O_err = std::max(max_O_err, std::abs(sim_O[i]-ref_O[i]));
+            for (size_t i=0;i<ref_L.size();i++)
+                max_L_err = std::max(max_L_err, std::abs(sim_L[i]-ref_L[i]));
+
+            const float tol = 1e-3f;
+            bool O_pass = max_O_err < tol;
+            bool L_pass = max_L_err < tol;
+            ok = O_pass && L_pass;
+
+            std::cout << "  O_tile  max_abs_err = " << max_O_err
+                      << (O_pass ? "  PASS ✓" : "  FAIL ✗") << "\n";
+            std::cout << "  L_tile  max_abs_err = " << max_L_err
+                      << (L_pass ? "  PASS ✓" : "  FAIL ✗") << "\n";
+            if (ok)
+                std::cout << "  All outputs match CPU reference within " << tol << "\n";
+            else
+                std::cout << "  MISMATCH — simulator output differs from reference\n";
+        }
+        std::cout << "─────────────────────────────────────────────────────────\n";
+
+        if (!ok) return 2;
     }
 
     return scheduler.all_done() ? 0 : 1;

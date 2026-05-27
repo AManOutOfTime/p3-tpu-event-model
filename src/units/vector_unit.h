@@ -39,6 +39,7 @@ struct VectorOp {
     std::string src_a;
     std::string src_b;
     std::string dst;
+    float       scalar_val = 1.f;   // numeric scalar for scale ops (default=1 = no-op)
 
     // scale: optional row-vector to broadcast (empty = use scalar 1.0)
     std::string src_scale;
