@@ -1,0 +1,17 @@
+llama:
+  mode: prefill_decode
+  seq_len: 4
+  prompt_len: 4
+  generation_steps: 2
+  num_layers: 1
+  num_q_heads: 4
+  num_kv_heads: 2
+  gqa_group_size: 2
+  head_dim: 128
+  hidden_dim: 512
+  intermediate_dim: 1024
+  vocab_size: 32000
+  tile_rows: 2
+  tile_cols: 2
+  kv_cache_enabled: true
+  kv_cache_location: hbm

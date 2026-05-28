@@ -14,15 +14,18 @@ class Scheduler;
 //
 // init_fill:
 //   Writes fill_value to every element of dst.
-//   dst must already exist in TensorStore (pre-allocated).
 //   elements = total element count.
 //
 // transpose:
 //   Reads src [input_rows × input_cols], writes dst [input_cols × input_rows].
 //   Row-major in/out.
+//
+// copy:
+//   Copies src to dst inside TensorStore. Used for SRAM-resident KV cache
+//   movement without charging HBM latency.
 // ---------------------------------------------------------------------------
 struct AccessOp {
-    std::string kind;           // "init_fill" | "transpose"
+    std::string kind;           // "init_fill" | "transpose" | "copy"
     uint64_t    elements = 0;
 
     // init_fill fields
@@ -58,6 +61,7 @@ public:
 private:
     void do_init_fill(const AccessOp& op);
     void do_transpose(const AccessOp& op);
+    void do_copy(const AccessOp& op);
 
     AccessCoreConfig cfg_;
     Scheduler*       sched_;

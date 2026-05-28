@@ -6,8 +6,10 @@ set(SIM_CORE_SOURCES
     config/arch_config.cpp
     schedule/schedule.cpp
     schedule/op_registry.cpp
+    schedule/op_handlers.cpp
     schedule/scheduler.cpp
     schedule/tiler.cpp
+    schedule/llama_schedule.cpp
     units/printing_unit.cpp
     units/delay_unit.cpp
     units/systolic_unit.cpp

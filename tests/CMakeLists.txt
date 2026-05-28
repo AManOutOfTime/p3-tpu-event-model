@@ -7,6 +7,7 @@ set(SIM_TEST_SOURCES
     test_schedule.cpp
     test_dummy_units.cpp
     test_fa2_schedule.cpp
+    test_llama_schedule.cpp
 )
 
 add_executable(unit_tests ${SIM_TEST_SOURCES})

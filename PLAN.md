@@ -1,0 +1,123 @@
+# LLaMA Pipeline Project Plan
+
+## Current Verified State
+
+- Build status: passes after rebuilding.
+- Test status: `ctest --test-dir build --output-on-failure` passes.
+- Runtime smoke status: `./build/apps/sim_main --config configs/default.yaml --llama-workload workloads/llama_prefill_decode.yaml --no-trace` completes.
+- Existing hand-written FA2 schedule remains available at `schedules/fa2_single_tile.yaml`.
+- Generated LLaMA schedules now model TPU-style dataflow explicitly: weights move HBM -> shared SRAM/input buffer -> systolic operands, MXU outputs land in shared output buffers, and KV cache movement is explicit HBM DMA or SRAM copy depending on config.
+- LLaMA schedule configs now derive `head_dim = hidden_dim / num_q_heads` and `gqa_group_size = num_q_heads / num_kv_heads` when omitted, and reject inconsistent attention dimensions.
+- Generated LLaMA schedules now default to detailed granularity. The sample prefill/decode workload emits 4312 instructions after expanding linear tiling, RMSNorm, RoPE, SwiGLU, logits softmax, and sampling phases.
+
+## Completed
+
+- [x] Stabilized typed op registration.
+  - Moved reusable typed handlers into `src/schedule/op_handlers.h/.cpp`.
+  - `sim_main` now uses `register_builtin_ops()` instead of private app-local handlers.
+  - GEMM now reserves the systolic unit through the scheduler, preserving single-array serialization.
+
+- [x] Added typed FA2 event-runtime coverage.
+  - Added test coverage that runs `schedules/fa2_single_tile.yaml` through real DMA/access/systolic/vector units as timing events.
+  - The test verifies schedule completion and cycle progression without requiring TensorStore value seeding or numerical outputs.
+
+- [x] Added programmatic LLaMA schedule generation.
+  - Added `src/schedule/llama_schedule.h/.cpp`.
+  - Supports `attention`, `layer`, `prefill`, `decode`, and combined `prefill_decode` dispatch.
+  - Generates tiled attention schedules instead of requiring handwritten YAML.
+  - Preserves the current single hardware tile/array behavior through scheduler reservations.
+
+- [x] Added GQA-aware schedule structure.
+  - Parameters: `num_q_heads`, `num_kv_heads`, `gqa_group_size`.
+  - Loop order is KV head group -> K/V tile movement -> Q heads in the group.
+  - K/V cache is keyed by KV head, so Q heads in a group reuse loaded K/V tiles.
+
+- [x] Added KV cache schedule options.
+  - Parameters: `kv_cache_enabled`, `kv_cache_location: sram|hbm`.
+  - HBM cache movement uses `dma_load`/`dma_store`.
+  - SRAM cache movement uses new `sram_copy` access-core op.
+
+- [x] Added transformer-layer schedule pieces.
+  - Attention block: Q/K/V projections, RoPE, causal mask, FA2-style softmax/PV, output projection.
+  - Layer block: attention RMSNorm, attention residual, MLP RMSNorm, gate/up projections, SwiGLU, down projection, MLP residual.
+  - Prefill/decode combined schedule writes KV during prefill and then runs repeated decode steps.
+  - These are schedule events with modeled cycle costs; generated LLaMA workloads are not intended to compute model values on CPU.
+
+- [x] Added full diagram-level pipeline events around the transformer stack.
+  - Token embedding lookup is modeled as a DMA/HBM event with `[tokens x hidden_dim]` dimensions.
+  - Generated schedules now support `num_layers > 1` by chaining an Nx layer stack.
+  - Attention tile outputs feed an explicit `attention_merge` vector event before output projection.
+  - Final RMSNorm, LM-head linear logits projection, logits softmax, sampled-token event, and sampled-token feedback into decode are explicit schedule events.
+  - New events target TPU-style resources: systolic/MXU for matrix multiplies, vector/VPU for elementwise/reduction/softmax/sample/merge, DMA for HBM movement, and access/scatter-gather for layout/select movement.
+
+- [x] Added CLI workload path for generated LLaMA schedules.
+  - New option: `--llama-workload FILE`.
+  - Added sample workload: `workloads/llama_prefill_decode.yaml`.
+
+- [x] Added TPU-style staged GEMM schedule events.
+  - Generated Q/K/V, attention output, MLP gate/up/down, and LM-head GEMMs no longer consume `HBM.*` operands directly.
+  - Each generated linear projection now emits weight DMA load, activation staging, weight staging, then systolic GEMM.
+  - This keeps generated LLaMA schedules event/cycle based; no LLaMA numerical execution is required.
+
+- [x] Tightened KV cache schedule addressing.
+  - K/V cache writes and reads now use consistent range-addressed names per layer, KV head, tensor kind, and token range.
+  - Prefill writes prompt K/V cache ranges; decode appends the generated token range and reads cached ranges back into shared input buffers.
+
+- [x] Modeled SRAM KV cache capacity checks.
+  - Added `max_seq_len`, `dtype_bytes`, and `sram_kv_capacity_kb` schedule config fields.
+  - SRAM KV cache checks use `num_layers * num_kv_heads * max_seq_len * head_dim * dtype_bytes * 2`.
+  - `sim_main` defaults `sram_kv_capacity_kb` from configured shared SRAM (`ibuf_kb + obuf_kb`) when a LLaMA workload does not set it.
+
+- [x] Added schedule-structure tests for TPU-style dataflow.
+  - Tests assert generated GEMMs do not consume direct `HBM.*` operands.
+  - Tests validate staged projection dimensions, cache range read/write naming, HBM vs SRAM cache movement, and SRAM cache over-capacity failure.
+
+- [x] Refined `attention_merge` latency semantics.
+  - Generated merge events now carry `q_tiles`, `kv_tiles`, `num_q_heads`, `head_dim`, `input_elements`, and `output_elements`.
+  - Runtime latency now charges for reading all per-K/V-tile attention contributions plus writing the final contiguous attention-head output.
+  - Added a handler-level cycle test for the new merge element accounting.
+
+- [x] Added automatic attention dimension derivation and validation.
+  - `head_dim` may be omitted or set to `0`; the builder derives it from `hidden_dim / num_q_heads`.
+  - `gqa_group_size` may be omitted or set to `0`; the builder derives it from `num_q_heads / num_kv_heads`.
+  - Schedule generation now rejects non-divisible `hidden_dim`, incorrect explicit `head_dim`, and incorrect explicit GQA group sizes.
+
+- [x] Added FA2-YAML-style granularity for generated LLaMA schedules.
+  - Added `schedule_granularity: detailed|coarse`, defaulting to `detailed`.
+  - Added separate `linear_tile_rows` and `linear_tile_cols` so linear GEMMs tile at MXU-style granularity independently of attention K/V tile shape.
+  - Detailed linear projections now emit activation tile load, weight tile DMA load, activation/weight staging, per-tile systolic GEMM, tile placement, and output assembly.
+  - Detailed RMSNorm now emits input tile load, square, row reduction, epsilon add, rsqrt, RMS weight load, scale/write, and output assembly phases.
+  - Detailed RoPE now emits sin/cos table load, input tile load, pair split, rotate/multiply-add, and write phases.
+  - Detailed MLP/SwiGLU now emits separate SiLU and elementwise multiply phases between tiled gate/up and down projections.
+  - Detailed logits now emit tiled LM-head projection, rowmax, exp, rowsum, normalize, and sample phases.
+  - Coarse mode remains available for quick schedule generation.
+
+## Changed Files
+
+- `apps/sim_main.cpp`
+- `src/CMakeLists.txt`
+- `src/schedule/op_handlers.h`
+- `src/schedule/op_handlers.cpp`
+- `src/schedule/llama_schedule.h`
+- `src/schedule/llama_schedule.cpp`
+- `src/units/access_unit.h`
+- `src/units/access_unit.cpp`
+- `src/units/vector_unit.h`
+- `src/units/vector_unit.cpp`
+- `tests/CMakeLists.txt`
+- `tests/test_llama_schedule.cpp`
+- `workloads/llama_prefill_decode.yaml`
+- `PLAN.md`
+
+## Tests Run
+
+- `cmake --build build --parallel`
+- `ctest --test-dir build --output-on-failure`
+- `./build/apps/sim_main --config configs/default.yaml --llama-workload workloads/llama_prefill_decode.yaml --no-trace`
+
+## Remaining Issues / Next Steps
+
+- [ ] Add exact cycle golden tests for generated attention, GQA attention, KV cache movement, and full layer event ordering.
+- [ ] Keep generated LLaMA workloads timing-only by default. TensorStore value computation may remain as a debug aid for small unit tests, but should not be required for generated LLaMA runs.
+- [ ] Reduce unit output verbosity for generated schedules when `--no-trace` is used; units still print their own operation logs today.
+- [ ] Add hardware-specific presets for full LLaMA3 model sizes and TPU MXU tile dimensions instead of relying on workload-local linear tile defaults.

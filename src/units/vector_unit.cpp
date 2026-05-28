@@ -216,6 +216,99 @@ void VectorUnit::do_logsumexp(const VectorOp& op) {
         << op.dst << "\"\n";
 }
 
+void VectorUnit::do_causal_mask(const VectorOp& op) {
+    const std::string& in = op.src.empty() ? op.src_matrix : op.src;
+    if (in.empty() || op.dst.empty() || !ts_->has(in)) return;
+    const auto& src = ts_->get(in);
+    std::vector<float> out = src;
+    const uint32_t rows = op.rows;
+    const uint32_t cols = op.cols;
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint32_t q_pos = op.row_start + r;
+        for (uint32_t c = 0; c < cols; c++) {
+            const uint32_t k_pos = op.col_start + c;
+            if (k_pos > q_pos)
+                out[r * cols + c] = -std::numeric_limits<float>::infinity();
+        }
+    }
+    ts_->set(op.dst, std::move(out));
+    os_ << "  [" << name() << "]  CAUSAL_MASK  \""
+        << in << "\" → \"" << op.dst << "\"\n";
+}
+
+void VectorUnit::do_rope(const VectorOp& op) {
+    const std::string& in = op.src.empty() ? op.src_matrix : op.src;
+    if (in.empty() || op.dst.empty() || !ts_->has(in)) return;
+    const auto& src = ts_->get(in);
+    std::vector<float> out = src;
+    const uint32_t rows = op.rows;
+    const uint32_t cols = op.cols;
+    for (uint32_t r = 0; r < rows; r++) {
+        const float pos = static_cast<float>(op.row_start + r);
+        for (uint32_t c = 0; c + 1 < cols; c += 2) {
+            const float theta = pos / std::pow(10000.0f, static_cast<float>(c) / cols);
+            const float cs = std::cos(theta);
+            const float sn = std::sin(theta);
+            const float x0 = src[r * cols + c];
+            const float x1 = src[r * cols + c + 1];
+            out[r * cols + c] = x0 * cs - x1 * sn;
+            out[r * cols + c + 1] = x0 * sn + x1 * cs;
+        }
+    }
+    ts_->set(op.dst, std::move(out));
+    os_ << "  [" << name() << "]  ROPE  \"" << in
+        << "\" → \"" << op.dst << "\"\n";
+}
+
+void VectorUnit::do_rmsnorm(const VectorOp& op) {
+    const std::string& in = op.src.empty() ? op.src_matrix : op.src;
+    if (in.empty() || op.dst.empty() || !ts_->has(in)) return;
+    const auto& src = ts_->get(in);
+    const uint32_t rows = op.rows;
+    const uint32_t cols = op.cols;
+    std::vector<float> out(src.size());
+    constexpr float eps = 1e-5f;
+    for (uint32_t r = 0; r < rows; r++) {
+        float ss = 0.f;
+        for (uint32_t c = 0; c < cols; c++) {
+            const float v = src[r * cols + c];
+            ss += v * v;
+        }
+        const float inv = 1.0f / std::sqrt(ss / static_cast<float>(cols) + eps);
+        for (uint32_t c = 0; c < cols; c++)
+            out[r * cols + c] = src[r * cols + c] * inv;
+    }
+    ts_->set(op.dst, std::move(out));
+    os_ << "  [" << name() << "]  RMSNORM  \"" << in
+        << "\" → \"" << op.dst << "\"\n";
+}
+
+void VectorUnit::do_silu_mul(const VectorOp& op) {
+    if (!ts_->has(op.src_a) || !ts_->has(op.src_b) || op.dst.empty()) return;
+    const auto& a = ts_->get(op.src_a);
+    const auto& b = ts_->get(op.src_b);
+    std::vector<float> out(a.size());
+    for (size_t i = 0; i < a.size(); i++) {
+        const float silu = a[i] / (1.0f + std::exp(-a[i]));
+        out[i] = silu * b[i];
+    }
+    ts_->set(op.dst, std::move(out));
+    os_ << "  [" << name() << "]  SILU_MUL  \""
+        << op.src_a << "\", \"" << op.src_b << "\" → \"" << op.dst << "\"\n";
+}
+
+void VectorUnit::do_residual_add(const VectorOp& op) {
+    if (!ts_->has(op.src_a) || !ts_->has(op.src_b) || op.dst.empty()) return;
+    const auto& a = ts_->get(op.src_a);
+    const auto& b = ts_->get(op.src_b);
+    std::vector<float> out(a.size());
+    for (size_t i = 0; i < a.size(); i++)
+        out[i] = a[i] + b[i];
+    ts_->set(op.dst, std::move(out));
+    os_ << "  [" << name() << "]  RESIDUAL_ADD  \""
+        << op.src_a << "\" + \"" << op.src_b << "\" → \"" << op.dst << "\"\n";
+}
+
 // ---------------------------------------------------------------------------
 // handle
 // ---------------------------------------------------------------------------
@@ -254,6 +347,11 @@ void VectorUnit::handle(const Event& e, EventEngine& engine) {
                 else if (op->kind == "accumulate")     do_accumulate(*op);
                 else if (op->kind == "normalize")      do_normalize(*op);
                 else if (op->kind == "logsumexp")      do_logsumexp(*op);
+                else if (op->kind == "causal_mask")    do_causal_mask(*op);
+                else if (op->kind == "rope")           do_rope(*op);
+                else if (op->kind == "rmsnorm")        do_rmsnorm(*op);
+                else if (op->kind == "silu_mul")       do_silu_mul(*op);
+                else if (op->kind == "residual_add")   do_residual_add(*op);
             }
         }
 

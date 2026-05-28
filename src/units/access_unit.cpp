@@ -60,6 +60,13 @@ void AccessUnit::do_transpose(const AccessOp& op) {
         << "\" [" << C << "x" << R << "]\n";
 }
 
+void AccessUnit::do_copy(const AccessOp& op) {
+    if (op.src.empty() || op.dst.empty() || !ts_->has(op.src)) return;
+    ts_->copy(op.src, op.dst);
+    os_ << "  [" << name() << "]  SRAM_COPY  \""
+        << op.src << "\" → \"" << op.dst << "\"\n";
+}
+
 void AccessUnit::handle(const Event& e, EventEngine& engine) {
     if (e.type == EventType::OP_START) {
         Cycle lat = 0;
@@ -89,6 +96,7 @@ void AccessUnit::handle(const Event& e, EventEngine& engine) {
             if (const auto* op = std::any_cast<AccessOp>(&e.payload)) {
                 if      (op->kind == "init_fill") do_init_fill(*op);
                 else if (op->kind == "transpose") do_transpose(*op);
+                else if (op->kind == "copy")      do_copy(*op);
             }
         }
 

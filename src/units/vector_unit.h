@@ -25,6 +25,11 @@ class Scheduler;
 //  accumulate    src_a, src_b, dst   element-wise dst = src_a + src_b
 //  normalize     src_matrix, src_denom, dst   row-wise divide
 //  logsumexp     src_m, src_l, dst   element-wise dst = m + log(l)
+//  causal_mask   src, dst with row/col absolute starts
+//  rope          src, dst   pairwise rotate by absolute position
+//  rmsnorm       src, dst   row-wise RMS normalization
+//  silu_mul      src_a, src_b, dst   SiLU(src_a) * src_b
+//  residual_add  src_a, src_b, dst   element-wise residual add
 // ---------------------------------------------------------------------------
 struct VectorOp {
     std::string kind;
@@ -61,6 +66,10 @@ struct VectorOp {
 
     // normalize / logsumexp share src_matrix / src_denom or src_m / src_l
     std::string src_denom;
+
+    // Optional positional metadata for masking/RoPE schedule builders.
+    uint32_t row_start = 0;
+    uint32_t col_start = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -88,6 +97,11 @@ private:
     void do_accumulate   (const VectorOp& op);
     void do_normalize    (const VectorOp& op);
     void do_logsumexp    (const VectorOp& op);
+    void do_causal_mask  (const VectorOp& op);
+    void do_rope         (const VectorOp& op);
+    void do_rmsnorm      (const VectorOp& op);
+    void do_silu_mul     (const VectorOp& op);
+    void do_residual_add (const VectorOp& op);
 
     VectorCoreConfig cfg_;
     Scheduler*       sched_;
