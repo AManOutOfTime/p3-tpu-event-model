@@ -8,6 +8,7 @@ set(SIM_CORE_SOURCES
     schedule/op_registry.cpp
     schedule/scheduler.cpp
     schedule/tiler.cpp
+    schedule/fa2_tiler.cpp
     units/printing_unit.cpp
     units/delay_unit.cpp
     units/systolic_unit.cpp

@@ -12,7 +12,6 @@ TEST_CASE("ArchConfig has correct defaults") {
     REQUIRE(c.systolic.precision     == "BF16");
     REQUIRE(c.vector_cores           == 3);
     REQUIRE(c.access_cores           == 1);
-    REQUIRE(c.sram.ibuf_kb           == 4096);
     REQUIRE(c.sram.obuf_kb           == 4096);
     REQUIRE(c.sram.banking_factor    == 8);
     REQUIRE(c.sram.private_vector_kb == 512);

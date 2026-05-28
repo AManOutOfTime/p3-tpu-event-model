@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code when working with this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project overview
 
@@ -102,13 +102,16 @@ src/
     vector_unit.h/.cpp    Vector/tandem core — scale, rowmax, update_rowmax,
                           exp_shift, update_rowsum, accumulate, normalize, logsumexp
     access_unit.h/.cpp    Access core — init_fill, transpose
+    buffer_unit.h/.cpp    Double-buffered banked SRAM — sram_read / sram_write ops,
+                          banking contention model, double-buffer ping/pong halves
 
 tests/
-  test_event_engine.cpp   EventEngine unit tests
-  test_config.cpp         ArchConfig YAML round-trip tests
-  test_schedule.cpp       Schedule parser tests
-  test_dummy_units.cpp    DelayUnit / PrintingUnit tests
-  test_fa2_schedule.cpp   FA2 schedule parse + DAG + simulation tests
+  test_event_engine.cpp     EventEngine unit tests
+  test_config.cpp           ArchConfig YAML round-trip tests
+  test_schedule.cpp         Schedule parser tests
+  test_dummy_units.cpp      DelayUnit / PrintingUnit tests
+  test_fa2_schedule.cpp     FA2 schedule parse + DAG + simulation tests
+  test_fa2_correctness.cpp  End-to-end FA2 numerical correctness tests
 ```
 
 ---
@@ -193,6 +196,8 @@ The full op set used by `schedules/fa2_single_tile.yaml`:
 | `dma_load` | dma | copies HBM key into `shared_ibuf`, charges HBM latency |
 | `dma_store` | dma | copies `shared_obuf` key to HBM, charges HBM latency |
 | `dma_stage` | dma | copies IBUF key → array register, charges SRAM read latency |
+| `sram_read` | shared_ibuf / shared_obuf | read through BufferUnit with banking contention + double-buffer |
+| `sram_write` | shared_ibuf / shared_obuf | write through BufferUnit with banking contention + double-buffer |
 | `init_fill` | access_core | fills buffer with 0 / −∞ in TensorStore |
 | `transpose` | access_core | row-major matrix transpose in TensorStore |
 | `gemm` | systolic | C = A × B tiled float GEMM, writes result to TensorStore |
@@ -246,23 +251,24 @@ vector_cores: 3
 access_cores: 1
 
 sram:
-  ibuf_kb:        4096
-  obuf_kb:        4096
-  banking_factor: 8        # parallel SRAM ports (affects dma_stage latency)
+  ibuf_kb:           4096   # shared input buffer
+  obuf_kb:           4096   # shared output buffer
+  banking_factor:    8      # parallel SRAM ports (affects dma_stage and sram_read/write latency)
+  private_vector_kb: 512    # per-vector-core private SRAM
 
 hbm:
-  bandwidth_tb_s: 2.0
-  latency_cycles: 200
+  bandwidth_tb_s: 0.9       # TPUv3-like; TPUv2 ~0.7, H100 ~3.35
+  latency_cycles: 100       # ~100 ns at 1 GHz
 
 dma:
   channels: 1
 
 vector_core:
-  simd_width:  64
-  exp_latency: 4
+  simd_width:  128          # TPUv2: 128 vector lanes (Norrie 2021 p.4)
+  exp_latency: 10           # transcendental pipeline depth ~10-20 cycles
 
 access_core:
-  bandwidth: 64            # elements per cycle for transpose / init_fill
+  bandwidth: 256            # elements/cycle for transpose / init_fill (TPUv2 Norrie 2021 p.5)
 ```
 
 Bidirectional fill latency: `ceil((rows-1)/2) + ceil((cols-1)/2)` instead of
@@ -366,6 +372,9 @@ Run with:
 - Bidirectional wavefront (halved fill cost)
 - HBM load/store latency (fixed + bandwidth)
 - On-chip SRAM stage latency (banking factor)
+- SRAM banking contention between concurrent accesses (BufferUnit)
+- Double-buffer IBUF/OBUF — producer (DMA) and consumer (systolic/vector) overlap via ping/pong halves
+- Weight-stationary pre-loading cost
 - Vector core SIMD latency + transcendental (exp/log) overhead
 - Access core transpose / init-fill latency
 - Unit structural hazards (one array — all GEMMs serialized)
@@ -373,10 +382,8 @@ Run with:
 - Actual float values for all operations end-to-end
 
 **Not yet modeled:**
-- SRAM banking contention between concurrent accesses
-- Double-buffer IBUF/OBUF (producer-consumer tile overlap)
 - Multi-head attention / GQA outer loops (single head only)
 - Multi-core / multi-chip parallelism
 - Sparse attention / paged KV cache / scatter-gather
 - K-split (tiling the K/d_head dimension across multiple array executions)
-- Weight-stationary pre-loading cost (weights assumed pre-staged)
+- Weight-stationary pre-loading of subsequent tiles during compute (weights assumed pre-staged before first tile)

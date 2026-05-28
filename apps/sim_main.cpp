@@ -6,12 +6,14 @@
 #include "schedule/op_registry.h"
 #include "schedule/scheduler.h"
 #include "schedule/tiler.h"
+#include "schedule/fa2_tiler.h"
 #include "units/delay_unit.h"
 #include "units/systolic_unit.h"
 #include "units/dma_unit.h"
 #include "units/buffer_unit.h"
 #include "units/vector_unit.h"
 #include "units/access_unit.h"
+#include <yaml-cpp/yaml.h>
 #include <iostream>
 #include <iomanip>
 #include <string>
@@ -487,30 +489,118 @@ int main(int argc, char** argv) {
     TensorStore       ts;
     Schedule          schedule;
     TileDecomposition tile_decomp;
-    bool              used_tiler = false;
+    bool              used_tiler      = false;
+    bool              used_fa2_tiler  = false;
+    WorkloadAttention fa2_wl;
 
     if (!workload_path.empty()) {
-        // --workload: tiler generates STAGE+GEMM instructions automatically
-        WorkloadGemm wl = Tiler::from_yaml_file(workload_path);
-        tile_decomp     = Tiler::decompose(wl, arch, ts);
-        Tiler::print_decomposition(tile_decomp);
-        schedule.instructions = tile_decomp.instructions;
-        used_tiler = true;
+        // Peek at the workload YAML to determine the type.
+        auto wl_root = YAML::LoadFile(workload_path);
+        std::string wl_type;
+        if (wl_root["workload"] && wl_root["workload"]["type"])
+            wl_type = wl_root["workload"]["type"].as<std::string>();
+
+        if (wl_type == "attention") {
+            // -- FA2 full-head attention workload ---------------------------
+            fa2_wl = FA2Tiler::from_yaml_file(workload_path);
+            std::cout << "FA2 attention workload:"
+                      << "  seq_len=" << fa2_wl.seq_len
+                      << "  d_head="  << fa2_wl.d_head
+                      << "  Nq=" << fa2_wl.Nq()
+                      << "  Nkv=" << fa2_wl.Nkv()
+                      << "  (" << fa2_wl.Nq()*fa2_wl.Nkv()
+                      << " GEMM pairs)\n\n";
+            schedule.instructions = FA2Tiler::decompose(fa2_wl, arch, ts);
+            used_fa2_tiler = true;
+        } else {
+            // -- Legacy GEMM workload via Tiler -----------------------------
+            WorkloadGemm wl = Tiler::from_yaml_file(workload_path);
+            tile_decomp     = Tiler::decompose(wl, arch, ts);
+            Tiler::print_decomposition(tile_decomp);
+            schedule.instructions = tile_decomp.instructions;
+            used_tiler = true;
+        }
     } else {
-        // --schedule: hand-written YAML, pre-seed FA2 buffers
+        // --schedule: hand-written or generated YAML
         schedule = Schedule::from_yaml_file(sched_path);
-        ts.init_random("shared_ibuf.Q_tile",   (size_t)Br*DH, -1.f, 1.f, 1);
-        ts.init_random("shared_ibuf.K_tile",   (size_t)Bc*DH, -1.f, 1.f, 2);
-        ts.init_random("shared_ibuf.K_tile_T", (size_t)DH*Bc, -1.f, 1.f, 3);
-        ts.init_random("shared_ibuf.V_tile",   (size_t)Bc*DH, -1.f, 1.f, 4);
-        ts.init_zeros ("shared_ibuf.P_tile",   (size_t)Br*Bc);
-        ts.init_zeros  ("shared_obuf.O_acc",      (size_t)Br*DH);
-        ts.init_neg_inf("shared_obuf.m",          (size_t)Br);
-        ts.init_zeros  ("shared_obuf.l",          (size_t)Br);
-        ts.init_zeros  ("shared_obuf.correction", (size_t)Br);
-        ts.init_random ("systolic_array.Q_operand", (size_t)Br*DH, -1.f, 1.f, 1);
-        ts.init_zeros  ("systolic_array.P_operand", (size_t)Br*Bc);
-        ts.init_zeros  ("vector_scratch.rowmax_tmp", (size_t)Br);
+
+        if (schedule.metadata.is_fa2_full_matrix()) {
+            // Generated FA2 multi-tile schedule — seed all HBM tiles.
+            const auto& m  = schedule.metadata;
+            const int   nq = m.Nq, nkv = m.Nkv;
+            const int   br = m.Br, bc  = m.Bc, dh = m.d_head;
+            std::cout << "FA2 full-matrix schedule:"
+                      << "  Nq=" << nq << "  Nkv=" << nkv
+                      << "  Br=" << br << "  Bc=" << bc
+                      << "  d_head=" << dh
+                      << "  instr=" << schedule.instructions.size() << "\n\n";
+
+            // Seed HBM input tiles
+            uint32_t seed = 1;
+            for (int i = 0; i < nq; ++i) {
+                ts.init_random("HBM.Q[" + std::to_string(i*br) + ":" +
+                               std::to_string((i+1)*br) + ",0:" +
+                               std::to_string(dh) + "]",
+                               (size_t)br*dh, -0.1f, 0.1f, seed++);
+            }
+            for (int j = 0; j < nkv; ++j) {
+                ts.init_random("HBM.K[" + std::to_string(j*bc) + ":" +
+                               std::to_string((j+1)*bc) + ",0:" +
+                               std::to_string(dh) + "]",
+                               (size_t)bc*dh, -0.1f, 0.1f, seed++);
+                ts.init_random("HBM.V[" + std::to_string(j*bc) + ":" +
+                               std::to_string((j+1)*bc) + ",0:" +
+                               std::to_string(dh) + "]",
+                               (size_t)bc*dh, -0.1f, 0.1f, seed++);
+            }
+            // Seed output placeholders (written by dma_store at OP_DONE)
+            for (int i = 0; i < nq; ++i) {
+                ts.init_zeros("HBM.O[" + std::to_string(i*br) + ":" +
+                              std::to_string((i+1)*br) + ",0:" +
+                              std::to_string(dh) + "]", (size_t)br*dh);
+                ts.init_zeros("HBM.L[" + std::to_string(i*br) + ":" +
+                              std::to_string((i+1)*br) + "]", (size_t)br);
+            }
+            // Seed on-chip buffers
+            ts.init_zeros("shared_ibuf.Q_tile",  (size_t)br*dh);
+            ts.init_zeros("shared_ibuf.K_buf0",  (size_t)bc*dh);
+            ts.init_zeros("shared_ibuf.K_buf1",  (size_t)bc*dh);
+            ts.init_zeros("shared_ibuf.V_buf0",  (size_t)bc*dh);
+            ts.init_zeros("shared_ibuf.V_buf1",  (size_t)bc*dh);
+            ts.init_zeros("shared_ibuf.KT_buf0", (size_t)bc*dh);
+            ts.init_zeros("shared_ibuf.KT_buf1", (size_t)bc*dh);
+            ts.init_zeros("shared_ibuf.P_tile",  (size_t)br*bc);
+            ts.init_zeros("shared_obuf.S_tile",  (size_t)br*bc);
+            ts.init_zeros("shared_obuf.Temp",    (size_t)br*dh);
+            ts.init_zeros("shared_obuf.O_acc",   (size_t)br*dh);
+            ts.init_zeros("shared_obuf.O_tile",  (size_t)br*dh);
+            ts.init_neg_inf("shared_obuf.m",     (size_t)br);
+            ts.init_zeros("shared_obuf.l",       (size_t)br);
+            ts.init_zeros("shared_obuf.correction", (size_t)br);
+            ts.init_zeros("shared_obuf.L_tile",  (size_t)br);
+            ts.init_zeros("vector_scratch.rowmax_tmp", (size_t)br);
+            ts.init_zeros("systolic_array.Q_operand",  (size_t)br*dh);
+            ts.init_zeros("systolic_array.P_operand",  (size_t)br*bc);
+        } else {
+            // Standard single-tile FA2 schedule (fa2_single_tile.yaml)
+            ts.init_random("shared_ibuf.Q_tile",   (size_t)Br*DH, -1.f, 1.f, 1);
+            ts.init_random("shared_ibuf.K_tile",   (size_t)Bc*DH, -1.f, 1.f, 2);
+            ts.init_random("shared_ibuf.K_tile_T", (size_t)DH*Bc, -1.f, 1.f, 3);
+            ts.init_random("shared_ibuf.V_tile",   (size_t)Bc*DH, -1.f, 1.f, 4);
+            ts.init_zeros ("shared_ibuf.P_tile",   (size_t)Br*Bc);
+            ts.init_zeros  ("shared_obuf.O_acc",      (size_t)Br*DH);
+            ts.init_neg_inf("shared_obuf.m",          (size_t)Br);
+            ts.init_zeros  ("shared_obuf.l",          (size_t)Br);
+            ts.init_zeros  ("shared_obuf.correction", (size_t)Br);
+            ts.init_random ("systolic_array.Q_operand", (size_t)Br*DH, -1.f, 1.f, 1);
+            ts.init_zeros  ("systolic_array.P_operand", (size_t)Br*Bc);
+            ts.init_zeros  ("vector_scratch.rowmax_tmp", (size_t)Br);
+
+            // HBM buffers for fa2_single_tile (dma_load reads from HBM.*)
+            ts.init_random("HBM.Q[i*Br:(i+1)*Br, 0:d_k]", (size_t)Br*DH, -1.f,1.f,1);
+            ts.init_random("HBM.K[j*Bc:(j+1)*Bc, 0:d_k]", (size_t)Bc*DH, -1.f,1.f,2);
+            ts.init_random("HBM.V[j*Bc:(j+1)*Bc, 0:d_head]",(size_t)Bc*DH,-1.f,1.f,4);
+        }
     }
 
     // ── Build engine ─────────────────────────────────────────────────────
@@ -594,13 +684,27 @@ int main(int argc, char** argv) {
         const auto& wl = tile_decomp.workload;
         std::cout << "\nAssembled \"" << wl.dst_c << "\" ["
                   << wl.M << "x" << wl.N << "] from "
-                  << tile_decomp.tiles.size() << " tile(s):\n";
-        ts.print(wl.dst_c, wl.M, wl.N, 4);
+                  << tile_decomp.tiles.size() << " tile(s) (matrix readout suppressed).\n";
+        // Matrix readout removed — timing-only mode produces zeroed buffers.
+        // To re-enable: ts.print(wl.dst_c, wl.M, wl.N, 4);
+    } else if (used_fa2_tiler) {
+        // Report arithmetic intensity estimate
+        uint64_t flops_qkt  = 2ULL * fa2_wl.Nq() * fa2_wl.Nkv()
+                              * fa2_wl.Br * fa2_wl.Bc * fa2_wl.d_head;
+        uint64_t flops_pv   = flops_qkt;
+        uint64_t total_flops = flops_qkt + flops_pv;
+        double ns = cycles_to_ns(final_cycle, arch.clock_ghz);
+        double tflops = static_cast<double>(total_flops) / (ns * 1e-9) / 1e12;
+        std::cout << "\nAttention FLOPS:  " << total_flops / 1e9 << " GFLOP"
+                  << "  time=" << ns/1e6 << " ms"
+                  << "  throughput=" << tflops << " TFLOP/s\n";
+        // FA2 output tile readout removed — timing-only mode produces zeroed buffers.
+        // To re-enable: ts.print("HBM.O[0:Br,0:d_head]", fa2_wl.Br, fa2_wl.d_head, 4);
     } else {
-        if (ts.has("shared_obuf.S_tile"))
-            ts.print("shared_obuf.S_tile", Br, Bc, 4);
-        if (ts.has("shared_obuf.O_tile"))
-            ts.print("shared_obuf.O_tile", Br, DH, 4);
+        // Schedule-mode readout removed — timing-only mode produces zeroed buffers.
+        // To re-enable:
+        //   if (ts.has("shared_obuf.S_tile")) ts.print("shared_obuf.S_tile", Br, Bc, 4);
+        //   if (ts.has("shared_obuf.O_tile")) ts.print("shared_obuf.O_tile", Br, DH, 4);
     }
 
     // ── CPU reference verification (--verify) ────────────────────────────

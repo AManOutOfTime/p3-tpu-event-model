@@ -23,7 +23,19 @@ Schedule from_node(const YAML::Node& root) {
     if (!seq || !seq.IsSequence())
         throw std::runtime_error("Schedule YAML must have a top-level 'schedule' sequence");
 
+    // ── Optional metadata block ──────────────────────────────────────────
+    // Carries tile dimensions (Nq, Nkv, Br, Bc, d_head) so sim_main can
+    // pre-seed the right HBM buffers for a generated multi-tile schedule.
     Schedule sched;
+    if (auto meta = root["metadata"]) {
+        if (meta["type"])   sched.metadata.type   = meta["type"].as<std::string>();
+        if (meta["Nq"])     sched.metadata.Nq     = meta["Nq"].as<int>();
+        if (meta["Nkv"])    sched.metadata.Nkv    = meta["Nkv"].as<int>();
+        if (meta["Br"])     sched.metadata.Br     = meta["Br"].as<int>();
+        if (meta["Bc"])     sched.metadata.Bc     = meta["Bc"].as<int>();
+        if (meta["d_head"]) sched.metadata.d_head = meta["d_head"].as<int>();
+    }
+
     sched.instructions.reserve(seq.size());
     InstructionId auto_id = 0;
 

@@ -10,6 +10,11 @@ struct SystolicConfig {
     std::string precision     = "BF16";   // FP8 | FP16 | BF16 | FP32
     bool        bidirectional = false;    // halves pipeline-fill latency
     uint32_t    d_head        = 128;      // attention head dim (= K dimension)
+    /*define 
+    d_model - dim rep size of model
+    n_head - num of attention heads
+    d_head = d_model/n_head
+    GQA parameter */
 };
 
 struct SramConfig {

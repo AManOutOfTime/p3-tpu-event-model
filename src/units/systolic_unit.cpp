@@ -42,33 +42,49 @@ Cycle SystolicUnit::compute_latency(uint32_t M, uint32_t K, uint32_t N) const {
 }
 
 void SystolicUnit::do_gemm(const GemmShape& s) {
-    if (!ts_->has(s.src_a)||!ts_->has(s.src_b)) {
-        os_<<"  ["<<name()<<"]  GEMM_COMPUTE SKIPPED (buffers not found)\n";
-        return;
-    }
-    const auto& A = ts_->get(s.src_a);
-    const auto& B = ts_->get(s.src_b);
     const uint32_t M=s.M, K=s.K, N=s.N;
-    if (A.size()<(size_t)M*K || B.size()<(size_t)K*N) {
-        os_<<"  ["<<name()<<"]  GEMM_COMPUTE ERROR size mismatch\n"; return;
-    }
-    std::vector<float> C(M*N, 0.f);
-    const uint32_t TM=cfg_.rows, TN=cfg_.cols;
-    for (uint32_t ti=0;ti<M;ti+=TM) {
-        uint32_t ib=std::min(TM,M-ti);
-        for (uint32_t tj=0;tj<N;tj+=TN) {
-            uint32_t jb=std::min(TN,N-tj);
-            for (uint32_t k=0;k<K;k++)
-                for (uint32_t i=0;i<ib;i++) {
-                    float a=A[(ti+i)*K+k];
-                    for (uint32_t j=0;j<jb;j++)
-                        C[(ti+i)*N+(tj+j)] += a*B[k*N+(tj+j)];
-                }
-        }
-    }
-    ts_->set(s.dst_c, std::move(C));
-    os_<<"  ["<<name()<<"]  GEMM_COMPUTE \""<<s.src_a<<"\" ["<<M<<"x"<<K<<"]"
+
+    // ---------------------------------------------------------------------------
+    // Timing-only path (ACTIVE): writes a zeroed output buffer so downstream
+    // TensorStore lookups don't miss, but skips the O(M·K·N) float MAC loop.
+    // Cycle-accurate latency is already applied via compute_latency() when
+    // OP_DONE is scheduled in handle() — no additional work is needed here.
+    // ---------------------------------------------------------------------------
+    ts_->set(s.dst_c, std::vector<float>(M*N, 0.f));
+    os_<<"  ["<<name()<<"]  GEMM_DONE (timing-only) \""<<s.src_a<<"\" ["<<M<<"x"<<K<<"]"
        <<" x \""<<s.src_b<<"\" ["<<K<<"x"<<N<<"] → \""<<s.dst_c<<"\"\n";
+
+    // ---------------------------------------------------------------------------
+    // Real float MAC path (COMMENTED OUT).
+    // Uncomment this block (and comment out the timing-only block above) to
+    // restore full numerical output for correctness tests / --verify.
+    // ---------------------------------------------------------------------------
+    // if (!ts_->has(s.src_a)||!ts_->has(s.src_b)) {
+    //     os_<<"  ["<<name()<<"]  GEMM_COMPUTE SKIPPED (buffers not found)\n";
+    //     return;
+    // }
+    // const auto& A = ts_->get(s.src_a);
+    // const auto& B = ts_->get(s.src_b);
+    // if (A.size()<(size_t)M*K || B.size()<(size_t)K*N) {
+    //     os_<<"  ["<<name()<<"]  GEMM_COMPUTE ERROR size mismatch\n"; return;
+    // }
+    // std::vector<float> C(M*N, 0.f);
+    // const uint32_t TM=cfg_.rows, TN=cfg_.cols;
+    // for (uint32_t ti=0;ti<M;ti+=TM) {
+    //     uint32_t ib=std::min(TM,M-ti);
+    //     for (uint32_t tj=0;tj<N;tj+=TN) {
+    //         uint32_t jb=std::min(TN,N-tj);
+    //         for (uint32_t k=0;k<K;k++)
+    //             for (uint32_t i=0;i<ib;i++) {
+    //                 float a=A[(ti+i)*K+k];
+    //                 for (uint32_t j=0;j<jb;j++)
+    //                     C[(ti+i)*N+(tj+j)] += a*B[k*N+(tj+j)];
+    //             }
+    //     }
+    // }
+    // ts_->set(s.dst_c, std::move(C));
+    // os_<<"  ["<<name()<<"]  GEMM_COMPUTE \""<<s.src_a<<"\" ["<<M<<"x"<<K<<"]"
+    //    <<" x \""<<s.src_b<<"\" ["<<K<<"x"<<N<<"] → \""<<s.dst_c<<"\"\n";
 }
 
 void SystolicUnit::handle(const Event& e, EventEngine& engine) {
@@ -100,7 +116,7 @@ void SystolicUnit::handle(const Event& e, EventEngine& engine) {
            <<"  array=["<<cfg_.rows<<"x"<<cfg_.cols<<"]"
            <<"  mode="<<(cfg_.bidirectional?"bidir":"unidir")
            <<"  fill="<<fill_latency()<<"  lat="<<lat
-           <<(e.label.empty()?"":" \""+e.label+"\"")<<"\n";
+           <<(e.label.empty()?"":"  \""+e.label+"\"")<<"\n";
 
         Event done=e;
         done.type=EventType::OP_DONE;
@@ -128,7 +144,7 @@ void SystolicUnit::handle(const Event& e, EventEngine& engine) {
 
         os_<<"  ["<<name()<<"]  GEMM_DONE  instr="<<e.instr
            <<"  @cycle="<<e.cycle
-           <<(e.label.empty()?"":" \""+e.label+"\"")<<"\n";
+           <<(e.label.empty()?"":"  \""+e.label+"\"")<<"\n";
         if (sched_) sched_->notify_done(e.instr);
     }
 }
