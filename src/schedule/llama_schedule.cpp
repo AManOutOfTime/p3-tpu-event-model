@@ -38,19 +38,62 @@ uint32_t effective_max_seq_len(const LlamaScheduleConfig& cfg) {
     return std::max(cfg.seq_len, cfg.prompt_len + cfg.generation_steps);
 }
 
-std::string cache_prefix(const LlamaScheduleConfig& cfg) {
-    return cfg.kv_cache_location == "hbm" ? "HBM.kv_cache" : "SRAM.kv_cache";
+uint32_t effective_cache_block_tokens(const LlamaScheduleConfig& cfg) {
+    return cfg.kv_cache_block_tokens ? cfg.kv_cache_block_tokens : cfg.tile_cols;
 }
 
 std::string range_suffix(uint32_t start, uint32_t rows) {
     return ".range" + std::to_string(start) + "_" + std::to_string(start + rows);
 }
 
+uint64_t kv_cache_required_bytes(const LlamaScheduleConfig& cfg, uint32_t tokens) {
+    return static_cast<uint64_t>(cfg.num_layers)
+         * cfg.num_kv_heads * tokens * cfg.head_dim
+         * cfg.dtype_bytes * 2;
+}
+
+uint64_t kv_cache_page_bytes(const LlamaScheduleConfig& cfg) {
+    return static_cast<uint64_t>(cfg.num_layers)
+         * cfg.num_kv_heads * effective_cache_block_tokens(cfg)
+         * cfg.head_dim * cfg.dtype_bytes * 2;
+}
+
+bool cache_name_is_hbm(const std::string& cache) {
+    return cache.rfind("HBM.", 0) == 0;
+}
+
+bool cache_page_is_hbm(const LlamaScheduleConfig& cfg, uint32_t start,
+                       uint32_t live_tokens) {
+    if (cfg.kv_cache_location == "hbm") return true;
+    if (cfg.kv_cache_eviction_policy != "spill_to_hbm") return false;
+    if (!cfg.sram_kv_capacity_kb) return false;
+
+    const uint64_t page_bytes = kv_cache_page_bytes(cfg);
+    if (!page_bytes) return false;
+    const uint64_t capacity = static_cast<uint64_t>(cfg.sram_kv_capacity_kb) * 1024;
+    const uint32_t hot_pages = static_cast<uint32_t>(capacity / page_bytes);
+    if (!hot_pages) return true;
+
+    const uint32_t block_tokens = effective_cache_block_tokens(cfg);
+    const uint32_t page = start / block_tokens;
+    const uint32_t live_pages = ceil_div(std::max<uint32_t>(live_tokens, 1), block_tokens);
+    const uint32_t first_hot_page = live_pages > hot_pages ? live_pages - hot_pages : 0;
+    return page < first_hot_page;
+}
+
 std::string cache_range_name(const LlamaScheduleConfig& cfg, const std::string& layer,
                              uint32_t kvh, const std::string& kind,
-                             uint32_t start, uint32_t rows) {
-    return cache_prefix(cfg) + "." + layer + ".kv" + std::to_string(kvh)
-         + "." + kind + range_suffix(start, rows);
+                             uint32_t start, uint32_t rows, uint32_t live_tokens) {
+    const uint32_t block_tokens = effective_cache_block_tokens(cfg);
+    const uint32_t page = start / block_tokens;
+    const uint32_t block = page;
+    const std::string prefix = cache_page_is_hbm(cfg, start, live_tokens)
+        ? "HBM.kv_cache"
+        : "SRAM.kv_cache";
+    return prefix + "." + layer + ".kv" + std::to_string(kvh)
+         + "." + kind + ".page" + std::to_string(page)
+         + ".block" + std::to_string(block)
+         + range_suffix(start, rows);
 }
 
 LlamaScheduleConfig normalize_cfg(LlamaScheduleConfig cfg) {
@@ -63,6 +106,18 @@ LlamaScheduleConfig normalize_cfg(LlamaScheduleConfig cfg) {
         throw std::runtime_error("LlamaScheduleConfig: dimensions and tile sizes must be non-zero");
     if (!cfg.dtype_bytes)
         throw std::runtime_error("LlamaScheduleConfig: dtype_bytes must be non-zero");
+    if (!cfg.kv_cache_block_tokens)
+        cfg.kv_cache_block_tokens = cfg.tile_cols;
+    if (!cfg.kv_cache_block_tokens)
+        throw std::runtime_error("LlamaScheduleConfig: kv_cache_block_tokens must be non-zero");
+    if (cfg.kv_prefetch != "none" && cfg.kv_prefetch != "double_buffer")
+        throw std::runtime_error("LlamaScheduleConfig: kv_prefetch must be none or double_buffer");
+    if (!cfg.kv_stage_buffers)
+        throw std::runtime_error("LlamaScheduleConfig: kv_stage_buffers must be non-zero");
+    if (cfg.kv_prefetch == "double_buffer" && cfg.kv_stage_buffers < 2)
+        throw std::runtime_error("LlamaScheduleConfig: double_buffer prefetch requires at least two KV stage buffers");
+    if (cfg.kv_cache_eviction_policy != "fail" && cfg.kv_cache_eviction_policy != "spill_to_hbm")
+        throw std::runtime_error("LlamaScheduleConfig: kv_cache_eviction_policy must be fail or spill_to_hbm");
     if (cfg.schedule_granularity != "detailed" && cfg.schedule_granularity != "coarse")
         throw std::runtime_error("LlamaScheduleConfig: schedule_granularity must be detailed or coarse");
     if (cfg.hidden_dim % cfg.num_q_heads != 0)
@@ -84,10 +139,9 @@ LlamaScheduleConfig normalize_cfg(LlamaScheduleConfig cfg) {
     if (cfg.kv_cache_location != "sram" && cfg.kv_cache_location != "hbm")
         throw std::runtime_error("LlamaScheduleConfig: kv_cache_location must be sram or hbm");
     const bool uses_cache = cfg.kv_cache_enabled || cfg.mode == "prefill_decode";
-    if (uses_cache && cfg.kv_cache_location == "sram" && cfg.sram_kv_capacity_kb) {
-        const uint64_t required = static_cast<uint64_t>(cfg.num_layers)
-            * cfg.num_kv_heads * effective_max_seq_len(cfg) * cfg.head_dim
-            * cfg.dtype_bytes * 2;
+    if (uses_cache && cfg.kv_cache_location == "sram" && cfg.sram_kv_capacity_kb
+        && cfg.kv_cache_eviction_policy == "fail") {
+        const uint64_t required = kv_cache_required_bytes(cfg, effective_max_seq_len(cfg));
         const uint64_t capacity = static_cast<uint64_t>(cfg.sram_kv_capacity_kb) * 1024;
         if (required > capacity) {
             throw std::runtime_error("LlamaScheduleConfig: SRAM KV cache capacity exceeded");
@@ -99,12 +153,13 @@ LlamaScheduleConfig normalize_cfg(LlamaScheduleConfig cfg) {
 InstructionId cache_move(Builder& b, const LlamaScheduleConfig& cfg, bool read,
                          const std::string& tensor, const std::string& cache,
                          uint32_t rows, std::vector<InstructionId> deps) {
-    const bool hbm = cfg.kv_cache_location == "hbm";
+    const bool hbm = cache_name_is_hbm(cache);
     ParamMap p;
     p["source"] = read ? cache : tensor;
     p["destination"] = read ? tensor : cache;
     p["rows"] = static_cast<int64_t>(rows);
     p["cols"] = static_cast<int64_t>(cfg.head_dim);
+    p["cache_location"] = hbm ? std::string("hbm") : std::string("sram");
     return b.add(hbm ? (read ? "dma_load" : "dma_store") : "sram_copy",
                  hbm ? "dma" : "access_core",
                  (read ? "KV cache read " : "KV cache write ") + cache,
@@ -563,6 +618,67 @@ struct AttentionIds {
     std::vector<InstructionId> terminal_heads;
 };
 
+struct KvTileLoad {
+    uint32_t start = 0;
+    uint32_t rows = 0;
+    uint32_t slot = 0;
+    std::string tag;
+    std::string k;
+    std::string k_t;
+    std::string v;
+    InstructionId read_k = 0;
+    InstructionId read_v = 0;
+    InstructionId transpose_k = 0;
+};
+
+KvTileLoad append_kv_tile_load(Builder& b, const LlamaScheduleConfig& cfg,
+                               const std::string& layer, const std::string& step,
+                               uint32_t kvh, uint32_t kt, uint32_t kv_len,
+                               const std::vector<InstructionId>& deps) {
+    KvTileLoad load;
+    load.start = kt * cfg.tile_cols;
+    load.rows = tile_extent(kv_len, cfg.tile_cols, kt);
+    load.slot = cfg.kv_prefetch == "double_buffer"
+        ? kt % cfg.kv_stage_buffers
+        : 0;
+    load.tag = layer + "." + step + ".kv" + std::to_string(kvh)
+             + ".tile" + std::to_string(kt);
+
+    const std::string slot_tag = "shared_ibuf.kv_stage.kv" + std::to_string(kvh)
+                               + ".slot" + std::to_string(load.slot);
+    load.k = slot_tag + ".K";
+    load.k_t = slot_tag + ".K_T";
+    load.v = slot_tag + ".V";
+
+    if (cfg.kv_cache_enabled) {
+        const std::string k_cache = cache_range_name(cfg, layer, kvh, "K",
+                                                     load.start, load.rows, kv_len);
+        const std::string v_cache = cache_range_name(cfg, layer, kvh, "V",
+                                                     load.start, load.rows, kv_len);
+        load.read_k = cache_move(b, cfg, true, load.k, k_cache, load.rows, deps);
+        load.read_v = cache_move(b, cfg, true, load.v, v_cache, load.rows, deps);
+    } else {
+        load.read_k = on_chip_move(b, "shared_obuf." + layer + "." + step + ".K_rope",
+                                   load.k, load.rows, cfg.head_dim,
+                                   "on-chip K tile read " + load.tag, deps);
+        load.read_v = on_chip_move(b, "shared_obuf." + layer + "." + step + ".V",
+                                   load.v, load.rows, cfg.head_dim,
+                                   "on-chip V tile read " + load.tag, deps);
+    }
+
+    ParamMap tr;
+    tr["source"] = load.k;
+    tr["destination"] = load.k_t;
+    tr["input_rows"] = static_cast<int64_t>(load.rows);
+    tr["input_cols"] = static_cast<int64_t>(cfg.head_dim);
+    tr["stage_slot"] = static_cast<int64_t>(load.slot);
+    load.transpose_k = b.add("transpose", "access_core",
+                             "transpose " + load.tag + " K in slot"
+                             + std::to_string(load.slot),
+                             tr, {load.read_k});
+    return load;
+}
+
 AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                               uint32_t layer, uint32_t q_len, uint32_t kv_len,
                               uint32_t decode_step, const std::string& input,
@@ -613,10 +729,10 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                                         + range_suffix(start, rows);
                 cache_write_deps.push_back(cache_move(
                     b, cfg, false, k_src,
-                    cache_range_name(cfg, l, kvh, "K", start, rows), rows, {k_rope}));
+                    cache_range_name(cfg, l, kvh, "K", start, rows, kv_len), rows, {k_rope}));
                 cache_write_deps.push_back(cache_move(
                     b, cfg, false, v_src,
-                    cache_range_name(cfg, l, kvh, "V", start, rows), rows, {v_proj}));
+                    cache_range_name(cfg, l, kvh, "V", start, rows, kv_len), rows, {v_proj}));
             }
         }
     }
@@ -626,45 +742,23 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
     const uint32_t kv_tiles = ceil_div(kv_len, cfg.tile_cols);
 
     for (uint32_t kvh = 0; kvh < cfg.num_kv_heads; kvh++) {
+        std::vector<InstructionId> slot_free(cfg.kv_stage_buffers);
         for (uint32_t kt = 0; kt < kv_tiles; kt++) {
-            const uint32_t k_rows = tile_extent(kv_len, cfg.tile_cols, kt);
-            const uint32_t k_start = kt * cfg.tile_cols;
-            const std::string kv_tag = l + "." + step + ".kv" + std::to_string(kvh)
-                                     + ".tile" + std::to_string(kt);
             std::vector<InstructionId> read_deps = cache_write_deps;
-            InstructionId read_k;
-            InstructionId read_v;
-            if (cfg.kv_cache_enabled) {
-                read_k = cache_move(b, cfg, true, "shared_ibuf." + kv_tag + ".K",
-                                    cache_range_name(cfg, l, kvh, "K", k_start, k_rows),
-                                    k_rows, read_deps);
-                read_v = cache_move(b, cfg, true, "shared_ibuf." + kv_tag + ".V",
-                                    cache_range_name(cfg, l, kvh, "V", k_start, k_rows),
-                                    k_rows, {read_k});
-            } else {
-                read_k = on_chip_move(b, "shared_obuf." + l + "." + step + ".K_rope",
-                                      "shared_ibuf." + kv_tag + ".K",
-                                      k_rows, cfg.head_dim,
-                                      "on-chip K tile read " + kv_tag, read_deps);
-                read_v = on_chip_move(b, "shared_obuf." + l + "." + step + ".V",
-                                      "shared_ibuf." + kv_tag + ".V",
-                                      k_rows, cfg.head_dim,
-                                      "on-chip V tile read " + kv_tag, {read_k});
-            }
-
-            ParamMap tr;
-            tr["source"] = "shared_ibuf." + kv_tag + ".K";
-            tr["destination"] = "shared_ibuf." + kv_tag + ".K_T";
-            tr["input_rows"] = static_cast<int64_t>(k_rows);
-            tr["input_cols"] = static_cast<int64_t>(cfg.head_dim);
-            InstructionId k_t = b.add("transpose", "access_core", "transpose " + kv_tag + " K", tr, {read_k});
+            const uint32_t slot = cfg.kv_prefetch == "double_buffer"
+                ? kt % cfg.kv_stage_buffers
+                : 0;
+            if (slot_free[slot]) read_deps.push_back(slot_free[slot]);
+            KvTileLoad kv_load = append_kv_tile_load(
+                b, cfg, l, step, kvh, kt, kv_len, read_deps);
+            std::vector<InstructionId> slot_consumers;
 
             for (uint32_t local = 0; local < group; local++) {
                 const uint32_t qh = kvh * group + local;
                 for (uint32_t qt = 0; qt < q_tiles; qt++) {
                     const uint32_t q_rows = tile_extent(q_len, cfg.tile_rows, qt);
                     const uint32_t q_start = (cfg.mode == "decode") ? decode_step : qt * cfg.tile_rows;
-                    const std::string tag = kv_tag + ".qh" + std::to_string(qh)
+                    const std::string tag = kv_load.tag + ".qh" + std::to_string(qh)
                                           + ".qt" + std::to_string(qt);
 
                     ParamMap init_o;
@@ -699,25 +793,25 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
 
                     ParamMap qk;
                     qk["source_a"] = "systolic_array.Q_operand";
-                    qk["source_b"] = "shared_ibuf." + kv_tag + ".K_T";
+                    qk["source_b"] = kv_load.k_t;
                     qk["destination"] = "shared_obuf." + tag + ".S";
                     qk["M"] = static_cast<int64_t>(q_rows);
                     qk["K"] = static_cast<int64_t>(cfg.head_dim);
-                    qk["N"] = static_cast<int64_t>(k_rows);
+                    qk["N"] = static_cast<int64_t>(kv_load.rows);
                     InstructionId mat_qk = b.add("gemm", "systolic", "QK " + tag,
-                                                 qk, {stage_q, k_t});
+                                                 qk, {stage_q, kv_load.transpose_k});
 
                     ParamMap scale;
                     scale["source"] = "shared_obuf." + tag + ".S";
                     scale["destination"] = "shared_obuf." + tag + ".S";
                     scale["rows"] = static_cast<int64_t>(q_rows);
-                    scale["cols"] = static_cast<int64_t>(k_rows);
+                    scale["cols"] = static_cast<int64_t>(kv_load.rows);
                     InstructionId scale_id = b.add("scale", "vector_core", "scale " + tag,
                                                    scale, {mat_qk});
 
                     ParamMap mask = scale;
                     mask["row_start"] = static_cast<int64_t>(q_start);
-                    mask["col_start"] = static_cast<int64_t>(k_start);
+                    mask["col_start"] = static_cast<int64_t>(kv_load.start);
                     InstructionId mask_id = b.add("causal_mask", "vector_core",
                                                   "causal mask " + tag, mask, {scale_id});
 
@@ -725,7 +819,7 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                     rowmax["source"] = "shared_obuf." + tag + ".S";
                     rowmax["destination"] = "vector_scratch." + tag + ".rowmax";
                     rowmax["rows"] = static_cast<int64_t>(q_rows);
-                    rowmax["cols"] = static_cast<int64_t>(k_rows);
+                    rowmax["cols"] = static_cast<int64_t>(kv_load.rows);
                     InstructionId rowmax_id = b.add("rowmax", "vector_core", "rowmax " + tag,
                                                     rowmax, {mask_id});
 
@@ -743,7 +837,7 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                     exp["source_shift"] = "shared_obuf." + tag + ".m";
                     exp["destination"] = "shared_ibuf." + tag + ".P";
                     exp["rows"] = static_cast<int64_t>(q_rows);
-                    exp["cols"] = static_cast<int64_t>(k_rows);
+                    exp["cols"] = static_cast<int64_t>(kv_load.rows);
                     InstructionId exp_id = b.add("exp_shift", "vector_core", "softmax exp " + tag,
                                                  exp, {upd_m_id});
 
@@ -753,7 +847,7 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                     rowsum["source_l_old"] = "shared_obuf." + tag + ".l";
                     rowsum["destination"] = "shared_obuf." + tag + ".l";
                     rowsum["rows"] = static_cast<int64_t>(q_rows);
-                    rowsum["cols"] = static_cast<int64_t>(k_rows);
+                    rowsum["cols"] = static_cast<int64_t>(kv_load.rows);
                     InstructionId rowsum_id = b.add("update_rowsum", "vector_core",
                                                     "update l " + tag, rowsum, {exp_id, upd_m_id, init_l_id});
 
@@ -770,19 +864,19 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                     stp["source"] = "shared_ibuf." + tag + ".P";
                     stp["destination"] = "systolic_array.P_operand";
                     stp["rows"] = static_cast<int64_t>(q_rows);
-                    stp["cols"] = static_cast<int64_t>(k_rows);
+                    stp["cols"] = static_cast<int64_t>(kv_load.rows);
                     InstructionId stage_p = b.add("dma_stage", "dma", "stage P " + tag,
-                                                  stp, {exp_id, read_v});
+                                                  stp, {exp_id, kv_load.read_v});
 
                     ParamMap pv;
                     pv["source_a"] = "systolic_array.P_operand";
-                    pv["source_b"] = "shared_ibuf." + kv_tag + ".V";
+                    pv["source_b"] = kv_load.v;
                     pv["destination"] = "shared_obuf." + tag + ".Temp";
                     pv["M"] = static_cast<int64_t>(q_rows);
-                    pv["K"] = static_cast<int64_t>(k_rows);
+                    pv["K"] = static_cast<int64_t>(kv_load.rows);
                     pv["N"] = static_cast<int64_t>(cfg.head_dim);
                     InstructionId mat_pv = b.add("gemm", "systolic", "PV " + tag,
-                                                 pv, {stage_p, read_v});
+                                                 pv, {stage_p, kv_load.read_v});
 
                     ParamMap acc;
                     acc["source_a"] = "shared_obuf." + tag + ".O_acc";
@@ -802,8 +896,17 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                     InstructionId out = b.add("normalize", "vector_core", "normalize " + tag,
                                               norm, {acc_id, rowsum_id});
                     head_outputs.push_back(out);
+                    slot_consumers.push_back(out);
                 }
             }
+            slot_free[kv_load.slot] = b.add("kv_stage_release", "access_core",
+                                            "release KV stage slot"
+                                            + std::to_string(kv_load.slot)
+                                            + " after " + kv_load.tag,
+                                            {{"slot", static_cast<int64_t>(kv_load.slot)},
+                                             {"rows", static_cast<int64_t>(kv_load.rows)},
+                                             {"cols", static_cast<int64_t>(cfg.head_dim)}},
+                                            slot_consumers);
         }
     }
 
@@ -1091,8 +1194,12 @@ LlamaScheduleConfig llama_config_from_node(const YAML::Node& root) {
     read_scalar(n, "max_seq_len", cfg.max_seq_len);
     read_scalar(n, "dtype_bytes", cfg.dtype_bytes);
     read_scalar(n, "sram_kv_capacity_kb", cfg.sram_kv_capacity_kb);
+    read_scalar(n, "kv_cache_block_tokens", cfg.kv_cache_block_tokens);
+    read_scalar(n, "kv_stage_buffers", cfg.kv_stage_buffers);
     read_scalar(n, "kv_cache_enabled", cfg.kv_cache_enabled);
     read_scalar(n, "kv_cache_location", cfg.kv_cache_location);
+    read_scalar(n, "kv_prefetch", cfg.kv_prefetch);
+    read_scalar(n, "kv_cache_eviction_policy", cfg.kv_cache_eviction_policy);
     return normalize_cfg(cfg);
 }
 

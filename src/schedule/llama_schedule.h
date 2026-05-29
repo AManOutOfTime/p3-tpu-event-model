@@ -26,8 +26,12 @@ struct LlamaScheduleConfig {
     uint32_t max_seq_len = 0;
     uint32_t dtype_bytes = 2;
     uint32_t sram_kv_capacity_kb = 0;
+    uint32_t kv_cache_block_tokens = 0;
+    uint32_t kv_stage_buffers = 2;
     bool kv_cache_enabled = false;
     std::string kv_cache_location = "sram";  // sram | hbm
+    std::string kv_prefetch = "double_buffer";  // none | double_buffer
+    std::string kv_cache_eviction_policy = "fail";  // fail | spill_to_hbm
 };
 
 Schedule build_attention_schedule(const LlamaScheduleConfig& cfg);

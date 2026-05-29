@@ -482,13 +482,100 @@ TEST_CASE("decode cache reads use the same range address scheme as cache writes"
     for (const Instruction& inst : s.instructions) {
         const std::string src = pget_str(inst.params, "source");
         const std::string dst = pget_str(inst.params, "destination");
-        if (inst.op == "dma_store" && dst == "HBM.kv_cache.L0.kv0.K.range2_3")
+        if (inst.op == "dma_store" && dst == "HBM.kv_cache.L0.kv0.K.page2.block2.range2_3")
             wrote_decode_k = true;
-        if (inst.op == "dma_load" && src == "HBM.kv_cache.L0.kv0.K.range2_3")
+        if (inst.op == "dma_load" && src == "HBM.kv_cache.L0.kv0.K.page2.block2.range2_3")
             read_decode_k = true;
     }
     REQUIRE(wrote_decode_k);
     REQUIRE(read_decode_k);
+}
+
+TEST_CASE("KV cache prefetch alternates staging slots and read-aheads independent K/V tiles") {
+    LlamaScheduleConfig cfg;
+    cfg.mode = "attention";
+    cfg.seq_len = 3;
+    cfg.num_q_heads = 1;
+    cfg.num_kv_heads = 1;
+    cfg.hidden_dim = 8;
+    cfg.intermediate_dim = 16;
+    cfg.tile_rows = 1;
+    cfg.tile_cols = 1;
+    cfg.kv_cache_enabled = true;
+    cfg.kv_cache_location = "hbm";
+    cfg.kv_prefetch = "double_buffer";
+    cfg.kv_stage_buffers = 2;
+
+    Schedule s = build_attention_schedule(cfg);
+
+    const Instruction* k0 = find_label_op(s, "KV cache read HBM.kv_cache.L0.kv0.K.page0.block0.range0_1", "dma_load");
+    const Instruction* v0 = find_label_op(s, "KV cache read HBM.kv_cache.L0.kv0.V.page0.block0.range0_1", "dma_load");
+    const Instruction* k1 = find_label_op(s, "KV cache read HBM.kv_cache.L0.kv0.K.page1.block1.range1_2", "dma_load");
+    const Instruction* k2 = find_label_op(s, "KV cache read HBM.kv_cache.L0.kv0.K.page2.block2.range2_3", "dma_load");
+    const Instruction* release0 = find_label_op(s, "release KV stage slot0 after L0.S128.kv0.tile0", "kv_stage_release");
+    const Instruction* qk0 = find_label_op(s, "QK L0.S128.kv0.tile0.qh0.qt0", "gemm");
+    const Instruction* pv0 = find_label_op(s, "PV L0.S128.kv0.tile0.qh0.qt0", "gemm");
+    REQUIRE(k0 != nullptr);
+    REQUIRE(v0 != nullptr);
+    REQUIRE(k1 != nullptr);
+    REQUIRE(k2 != nullptr);
+    REQUIRE(release0 != nullptr);
+    REQUIRE(qk0 != nullptr);
+    REQUIRE(pv0 != nullptr);
+
+    CHECK(pget_str(k0->params, "destination") == "shared_ibuf.kv_stage.kv0.slot0.K");
+    CHECK(pget_str(k1->params, "destination") == "shared_ibuf.kv_stage.kv0.slot1.K");
+    CHECK(pget_str(k2->params, "destination") == "shared_ibuf.kv_stage.kv0.slot0.K");
+
+    CHECK(std::find(v0->depends_on.begin(), v0->depends_on.end(), k0->id) == v0->depends_on.end());
+    CHECK(std::find(k1->depends_on.begin(), k1->depends_on.end(), qk0->id) == k1->depends_on.end());
+    CHECK(std::find(k1->depends_on.begin(), k1->depends_on.end(), pv0->id) == k1->depends_on.end());
+    CHECK(std::find(k2->depends_on.begin(), k2->depends_on.end(), release0->id) != k2->depends_on.end());
+}
+
+TEST_CASE("GQA reuses one staged K/V tile across query heads in a group") {
+    LlamaScheduleConfig cfg;
+    cfg.mode = "attention";
+    cfg.seq_len = 1;
+    cfg.num_q_heads = 4;
+    cfg.num_kv_heads = 2;
+    cfg.hidden_dim = 32;
+    cfg.intermediate_dim = 64;
+    cfg.tile_rows = 1;
+    cfg.tile_cols = 1;
+    cfg.kv_cache_enabled = true;
+    cfg.kv_cache_location = "hbm";
+
+    Schedule s = build_attention_schedule(cfg);
+
+    CHECK(count_label_op(s, "KV cache read HBM.kv_cache.L0.kv0.K.page0.block0.range0_1", "dma_load") == 1);
+    CHECK(count_label_op(s, "QK L0.S128.kv0.tile0.qh0", "gemm") == 1);
+    CHECK(count_label_op(s, "QK L0.S128.kv0.tile0.qh1", "gemm") == 1);
+}
+
+TEST_CASE("SRAM KV cache spill policy emits mixed SRAM and HBM page accesses") {
+    LlamaScheduleConfig cfg;
+    cfg.mode = "attention";
+    cfg.seq_len = 4;
+    cfg.num_q_heads = 1;
+    cfg.num_kv_heads = 1;
+    cfg.hidden_dim = 128;
+    cfg.intermediate_dim = 256;
+    cfg.tile_rows = 1;
+    cfg.tile_cols = 1;
+    cfg.max_seq_len = 4;
+    cfg.dtype_bytes = 2;
+    cfg.sram_kv_capacity_kb = 1;
+    cfg.kv_cache_enabled = true;
+    cfg.kv_cache_location = "sram";
+    cfg.kv_cache_eviction_policy = "spill_to_hbm";
+
+    Schedule s = build_attention_schedule(cfg);
+
+    REQUIRE(has_cache_label(s, "dma_store", "KV cache write HBM.kv_cache"));
+    REQUIRE(has_cache_label(s, "sram_copy", "KV cache write SRAM.kv_cache"));
+    REQUIRE(has_cache_label(s, "dma_load", "KV cache read HBM.kv_cache"));
+    REQUIRE(has_cache_label(s, "sram_copy", "KV cache read SRAM.kv_cache"));
 }
 
 TEST_CASE("SRAM KV cache capacity is validated when configured") {

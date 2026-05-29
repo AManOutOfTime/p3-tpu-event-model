@@ -212,6 +212,20 @@ void register_builtin_ops(OpRegistry& reg, const ArchConfig& arch) {
         ctx.engine.schedule(std::move(e));
     });
 
+    reg.register_op("kv_stage_release", [](const IssueCtx& ctx) {
+        auto targets = ctx.engine.find_unit_pool(ctx.inst.unit);
+        if (targets.empty()) throw std::runtime_error("kv_stage_release: unknown unit");
+        auto res = ctx.scheduler.reserve_unit_pool(targets, 0);
+        Event e;
+        e.type = EventType::OP_START;
+        e.target = res.id;
+        e.cycle = res.start;
+        e.instr = ctx.inst.id;
+        e.label = ctx.inst.label;
+        e.payload = static_cast<int64_t>(0);
+        ctx.engine.schedule(std::move(e));
+    });
+
     reg.register_op("gemm", [arch](const IssueCtx& ctx) {
         auto targets = ctx.engine.find_unit_pool("systolic");
         if (targets.empty()) throw std::runtime_error("gemm: systolic not found");

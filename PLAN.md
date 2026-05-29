@@ -8,7 +8,7 @@
 - Existing hand-written FA2 schedule remains available at `schedules/fa2_single_tile.yaml`.
 - Generated LLaMA schedules now model TPU-style dataflow explicitly: weights move HBM -> shared SRAM/input buffer -> systolic operands, MXU outputs land in shared output buffers, and KV cache movement is explicit HBM DMA or SRAM copy depending on config.
 - LLaMA schedule configs now derive `head_dim = hidden_dim / num_q_heads` and `gqa_group_size = num_q_heads / num_kv_heads` when omitted, and reject inconsistent attention dimensions.
-- Generated LLaMA schedules now default to detailed granularity. The sample prefill/decode workload emits 4312 instructions after expanding linear tiling, RMSNorm, RoPE, SwiGLU, logits softmax, and sampling phases.
+- Generated LLaMA schedules now default to detailed granularity. The sample prefill/decode workload emits 4328 instructions after expanding linear tiling, RMSNorm, RoPE, SwiGLU, logits softmax, sampling phases, and KV staging-slot release events.
 
 ## Completed
 
@@ -91,6 +91,13 @@
   - Detailed MLP/SwiGLU now emits separate SiLU and elementwise multiply phases between tiled gate/up and down projections.
   - Detailed logits now emit tiled LM-head projection, rowmax, exp, rowsum, normalize, and sample phases.
   - Coarse mode remains available for quick schedule generation.
+
+- [x] Added double-buffered KV prefetch and cache residency modeling.
+  - Added `kv_prefetch: none|double_buffer`, `kv_stage_buffers`, `kv_cache_block_tokens`, and `kv_cache_eviction_policy: fail|spill_to_hbm`.
+  - K/V cache names now include page/block/range components so writes, reads, prefill ranges, and decode appends use one logical address scheme.
+  - Decode/prefill attention now stages cached K/V tiles into alternating `shared_ibuf.kv_stage.*.slotN` buffers, with explicit `kv_stage_release` events before slot reuse.
+  - K and V cache reads for the same tile are independently schedulable; the scheduler/resource model decides whether they serialize or overlap on available DMA/SRAM units.
+  - `spill_to_hbm` models hot SRAM-resident KV pages and older HBM-spilled pages; default `fail` still rejects over-capacity fully-SRAM KV cache workloads.
 
 ## Changed Files
 
