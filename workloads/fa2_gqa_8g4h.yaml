@@ -1,0 +1,32 @@
+# FlashAttention-2 GQA workload — 8 groups × 4 heads per group
+# ----------------------------------------------------------------
+# LLaMA-3-8B style:
+#   Total Q heads : 32  (num_gqa_groups * heads_per_group)
+#   Total KV heads:  8  (num_gqa_groups)
+#   seq_len       : 4096
+#   d_head        : 128
+#
+# Tiling (128×128 systolic array):
+#   Br = Bc = 128  →  Nq = Nkv = 32
+#
+# Schedule structure (per group, per Q-tile):
+#   Prologue : 4 heads × (3 init + 1 load_Q + 1 stage_Q)  = 20 ops
+#   KV loop  : 32 kv-tiles × (4 shared + 4 heads × 11)    = 32 × 48 = 1536 ops
+#   Epilogue : 4 heads × (normalize + logsumexp + 2 store) = 16 ops
+#   Per (group, Q-tile) total : 20 + 1536 + 16 = 1572 ops
+#
+# Total instructions: 8 groups × 32 Q-tiles × 1572 = 402,432
+#
+# KV HBM traffic vs MHA:
+#   MHA (32 heads, each loads K/V): 32 × 32 × 2 tiles loaded
+#   GQA (8 groups, K/V shared):      8 × 32 × 2 tiles loaded  → 4× savings
+
+workload:
+  type:             attention
+  seq_len:          4096
+  d_head:           128
+  Br:               128
+  Bc:               128
+  num_gqa_groups:   8
+  heads_per_group:  4
+  fill:             random

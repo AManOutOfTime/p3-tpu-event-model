@@ -397,18 +397,25 @@ TEST_CASE("FA2Tiler: double-buffer K_buf0/K_buf1 alternation") {
 }
 
 // ===========================================================================
-// 7. Cross-KV DMA chain: load_K[j] depends on load_V[j-1]
+// 7. DMA prefetch: load_K[kv] depends on gemm_S[kv-2] (same buf slot),
+//    NOT on load_V[kv-1].  For kv=0,1 (buf slot never used before) the dep
+//    is stage_Q (the sentinel's initial value), so load_K can start as soon
+//    as Q is staged rather than waiting for the previous V load.
 // ===========================================================================
 
-TEST_CASE("FA2Tiler: load_K[kv] depends on load_V[kv-1] (prev_dma)") {
+TEST_CASE("FA2Tiler: load_K[kv] uses ping-pong buf sentinel, not prev_dma") {
     TensorStore ts;
     auto v = build_small(ts);
 
-    // load_K[kv=1] must depend on load_V[kv=0]
-    REQUIRE(has_dep(v[id_kv(1,OFF_LOAD_K)], id_kv(0,OFF_LOAD_V)));
-
-    // load_K[kv=0] depends on stage_Q (not on load_V of a previous tile)
+    // load_K[kv=0]: buf=0, prev_gemm_S_per_buf[0]=stage_Q → dep on stage_Q
+    // load_K[kv=1]: buf=1, prev_gemm_S_per_buf[1]=stage_Q → dep on stage_Q
+    // Neither should depend on load_V of a previous iteration
     CHECK(!has_dep(v[id_kv(0,OFF_LOAD_K)], id_kv(0,OFF_LOAD_V)));
+    CHECK(!has_dep(v[id_kv(1,OFF_LOAD_K)], id_kv(0,OFF_LOAD_V)));
+
+    // load_V[kv=0] must depend on load_K[kv=0] (same-iteration ordering)
+    REQUIRE(has_dep(v[id_kv(0,OFF_LOAD_V)], id_kv(0,OFF_LOAD_K)));
+    REQUIRE(has_dep(v[id_kv(1,OFF_LOAD_V)], id_kv(1,OFF_LOAD_K)));
 }
 
 // ===========================================================================
@@ -530,28 +537,26 @@ TEST_CASE("FA2Tiler: seed_hbm creates all expected HBM keys") {
     TensorStore ts;
     WorkloadAttention wl;
     wl.seq_len = 256; wl.Br = 128; wl.Bc = 128; wl.d_head = 128;
+    wl.num_gqa_groups = 1; wl.heads_per_group = 1;
     FA2Tiler::seed_hbm(wl, ts);
 
-    // Q tiles  (2 tiles)
-    CHECK(ts.has("HBM.Q[0:128,0:128]"));
-    CHECK(ts.has("HBM.Q[128:256,0:128]"));
+    // Q tiles for group 0, head 0 (2 Q-tiles for seq=256, Br=128)
+    CHECK(ts.has("HBM.Q_g0_h0[0:128,0:128]"));
+    CHECK(ts.has("HBM.Q_g0_h0[128:256,0:128]"));
 
-    // K tiles  (2 tiles)
-    CHECK(ts.has("HBM.K[0:128,0:128]"));
-    CHECK(ts.has("HBM.K[128:256,0:128]"));
-
-    // V tiles  (2 tiles)
-    CHECK(ts.has("HBM.V[0:128,0:128]"));
-    CHECK(ts.has("HBM.V[128:256,0:128]"));
+    // K/V tiles for group 0 (2 KV-tiles)
+    CHECK(ts.has("HBM.K_g0[0:128,0:128]"));
+    CHECK(ts.has("HBM.K_g0[128:256,0:128]"));
+    CHECK(ts.has("HBM.V_g0[0:128,0:128]"));
+    CHECK(ts.has("HBM.V_g0[128:256,0:128]"));
 
     // Output placeholders
-    CHECK(ts.has("HBM.O[0:128,0:128]"));
-    CHECK(ts.has("HBM.O[128:256,0:128]"));
-    CHECK(ts.has("HBM.L[0:128]"));
-    CHECK(ts.has("HBM.L[128:256]"));
+    CHECK(ts.has("HBM.O_g0_h0[0:128,0:128]"));
+    CHECK(ts.has("HBM.O_g0_h0[128:256,0:128]"));
+    CHECK(ts.has("HBM.L_g0_h0[0:128]"));
+    CHECK(ts.has("HBM.L_g0_h0[128:256]"));
 
-    // Q tiles are seeded with non-trivial random data (not all zeros)
-    const auto& q0 = ts.get("HBM.Q[0:128,0:128]");
+    const auto& q0 = ts.get("HBM.Q_g0_h0[0:128,0:128]");
     REQUIRE(q0.size() == 128u * 128u);
     bool has_nonzero = std::any_of(q0.begin(), q0.end(), [](float f){ return f != 0.f; });
     CHECK(has_nonzero);
@@ -733,6 +738,107 @@ TEST_CASE("FA2 full-matrix YAML simulation: all 15648 instructions complete") {
 
     Schedule sched_obj = Schedule::from_yaml_file(FA2_FULL_SCH);
     REQUIRE(sched_obj.instructions.size() == static_cast<size_t>(INSTRS_FULL));
+
+    OpRegistry reg;
+    add_all_delay_ops(reg);
+    Scheduler sched(engine, reg, sched_obj);
+    wire(engine, sched);
+
+    sched.launch();
+    engine.run();
+
+    CHECK(sched.all_done());
+    CHECK(sched.outstanding() == 0);
+}
+
+// ===========================================================================
+// 21–26.  GQA tests  (2 groups × 2 heads = G=2, H=2, Nq=1, Nkv=1)
+//
+// Small GQA: seq=128, Br=Bc=128 → Nq=Nkv=1, G=2, H=2
+//   Prologue per (g,qi): H×5 = 10 ops
+//   KV body  per (g,qi): 1 kv × (4 shared + H×11) = 26 ops
+//   Epilogue per (g,qi): H×4 = 8 ops
+//   Per (g,qi) total: 44 ops
+//   Total: G × Nq × 44 = 2 × 1 × 44 = 88 ops
+// ===========================================================================
+
+static std::vector<Instruction> build_gqa_small(TensorStore& ts) {
+    WorkloadAttention wl;
+    wl.seq_len = 128; wl.Br = 128; wl.Bc = 128; wl.d_head = 128;
+    wl.num_gqa_groups = 2; wl.heads_per_group = 2;
+    ArchConfig arch = ArchConfig::from_yaml_file(ARCH_PATH);
+    return FA2Tiler::decompose(wl, arch, ts);
+}
+
+TEST_CASE("FA2Tiler GQA: instruction count 2g×2h×1q×1kv = 88") {
+    TensorStore ts;
+    auto v = build_gqa_small(ts);
+    // 2 groups × 1 Q-tile × (10 prologue + 26 kv + 8 epilogue) = 88
+    CHECK(v.size() == 88u);
+}
+
+TEST_CASE("FA2Tiler GQA: K/V tiles named per-group") {
+    TensorStore ts;
+    build_gqa_small(ts);
+    // Each group has its own K/V HBM tile
+    CHECK(ts.has("HBM.K_g0[0:128,0:128]"));
+    CHECK(ts.has("HBM.V_g0[0:128,0:128]"));
+    CHECK(ts.has("HBM.K_g1[0:128,0:128]"));
+    CHECK(ts.has("HBM.V_g1[0:128,0:128]"));
+    // No cross-group K contamination
+    CHECK(!ts.has("HBM.K_g2[0:128,0:128]"));
+}
+
+TEST_CASE("FA2Tiler GQA: Q tiles named per-group and per-head") {
+    TensorStore ts;
+    build_gqa_small(ts);
+    CHECK(ts.has("HBM.Q_g0_h0[0:128,0:128]"));
+    CHECK(ts.has("HBM.Q_g0_h1[0:128,0:128]"));
+    CHECK(ts.has("HBM.Q_g1_h0[0:128,0:128]"));
+    CHECK(ts.has("HBM.Q_g1_h1[0:128,0:128]"));
+}
+
+TEST_CASE("FA2Tiler GQA: per-head O_acc buffers present in on-chip init") {
+    TensorStore ts;
+    build_gqa_small(ts);
+    CHECK(ts.has("shared_obuf.O_acc_h0"));
+    CHECK(ts.has("shared_obuf.O_acc_h1"));
+    CHECK(ts.has("shared_obuf.m_h0"));
+    CHECK(ts.has("shared_obuf.m_h1"));
+    CHECK(ts.has("shared_obuf.l_h0"));
+    CHECK(ts.has("shared_obuf.l_h1"));
+}
+
+TEST_CASE("FA2Tiler GQA: K/V tile NOT loaded per-head (GQA sharing verified)") {
+    TensorStore ts;
+    auto v = build_gqa_small(ts);
+    // Count dma_load ops targeting K_buf0 — should be exactly G×Nkv = 2,
+    // NOT G×H×Nkv = 4. K/V are loaded once per (group, kv-tile).
+    int k_loads = 0;
+    for (auto& ins : v)
+        if (ins.op == "dma_load")
+            if (auto* dst = std::get_if<std::string>(&ins.params.at("destination")))
+                if (dst->find("K_buf") != std::string::npos) ++k_loads;
+    // G=2 groups × Nkv=1 kv-tile × 1 K_buf load = 2
+    CHECK(k_loads == 2);
+}
+
+TEST_CASE("FA2Tiler GQA: all instructions complete (delay-unit sim, 2g×2h)") {
+    std::ostringstream ss;
+    EventEngine engine;
+
+    // Register all units needed by GQA (same pool as single-head)
+    for (const char* n : {"systolic", "access_core_0",
+                          "vector_core_0", "vector_core_1", "vector_core_2",
+                          "dma_0"})
+        engine.register_unit(n, std::make_shared<DelayUnit>(n, 1, ss));
+
+    TensorStore ts;
+    auto v = build_gqa_small(ts);
+    REQUIRE(v.size() == 88u);
+
+    Schedule sched_obj;
+    sched_obj.instructions = v;
 
     OpRegistry reg;
     add_all_delay_ops(reg);

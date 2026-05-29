@@ -501,14 +501,20 @@ int main(int argc, char** argv) {
             wl_type = wl_root["workload"]["type"].as<std::string>();
 
         if (wl_type == "attention") {
-            // -- FA2 full-head attention workload ---------------------------
+            // -- FA2 GQA attention workload ---------------------------------
             fa2_wl = FA2Tiler::from_yaml_file(workload_path);
-            std::cout << "FA2 attention workload:"
-                      << "  seq_len=" << fa2_wl.seq_len
-                      << "  d_head="  << fa2_wl.d_head
+            std::cout << "FA2 GQA attention workload:"
+                      << "  seq_len="   << fa2_wl.seq_len
+                      << "  d_head="    << fa2_wl.d_head
+                      << "  groups="    << fa2_wl.num_gqa_groups
+                      << "  heads/grp=" << fa2_wl.heads_per_group
+                      << "  Q_heads="   << fa2_wl.num_q_heads()
+                      << "  KV_heads="  << fa2_wl.num_kv_heads()
                       << "  Nq=" << fa2_wl.Nq()
                       << "  Nkv=" << fa2_wl.Nkv()
-                      << "  (" << fa2_wl.Nq()*fa2_wl.Nkv()
+                      << "  (" << (uint64_t)fa2_wl.num_gqa_groups
+                                    * fa2_wl.heads_per_group
+                                    * fa2_wl.Nq() * fa2_wl.Nkv()
                       << " GEMM pairs)\n\n";
             schedule.instructions = FA2Tiler::decompose(fa2_wl, arch, ts);
             used_fa2_tiler = true;
@@ -688,18 +694,25 @@ int main(int argc, char** argv) {
         // Matrix readout removed — timing-only mode produces zeroed buffers.
         // To re-enable: ts.print(wl.dst_c, wl.M, wl.N, 4);
     } else if (used_fa2_tiler) {
-        // Report arithmetic intensity estimate
-        uint64_t flops_qkt  = 2ULL * fa2_wl.Nq() * fa2_wl.Nkv()
-                              * fa2_wl.Br * fa2_wl.Bc * fa2_wl.d_head;
-        uint64_t flops_pv   = flops_qkt;
-        uint64_t total_flops = flops_qkt + flops_pv;
-        double ns = cycles_to_ns(final_cycle, arch.clock_ghz);
+        // Total FLOPs = 2 × G × H × Nq × Nkv × Br × Bc × d_head  (for Q×K^T + P×V)
+        const uint64_t G  = fa2_wl.num_gqa_groups;
+        const uint64_t H  = fa2_wl.heads_per_group;
+        const uint64_t nq = fa2_wl.Nq(), nkv = fa2_wl.Nkv();
+        const uint64_t Br = fa2_wl.Br,   Bc  = fa2_wl.Bc;
+        const uint64_t dh = fa2_wl.d_head;
+        uint64_t total_flops = 2ULL * G * H * nq * nkv * (Br * dh * Bc + Br * Bc * dh);
+        double ns     = cycles_to_ns(final_cycle, arch.clock_ghz);
         double tflops = static_cast<double>(total_flops) / (ns * 1e-9) / 1e12;
+        // KV HBM tiles: GQA loads K/V once per (group, kv-tile); MHA would load H× more
+        uint64_t kv_tiles_loaded = G * nkv * 2;          // actual (GQA)
+        uint64_t kv_tiles_mha    = G * H * nkv * 2;      // hypothetical MHA
         std::cout << "\nAttention FLOPS:  " << total_flops / 1e9 << " GFLOP"
                   << "  time=" << ns/1e6 << " ms"
-                  << "  throughput=" << tflops << " TFLOP/s\n";
-        // FA2 output tile readout removed — timing-only mode produces zeroed buffers.
-        // To re-enable: ts.print("HBM.O[0:Br,0:d_head]", fa2_wl.Br, fa2_wl.d_head, 4);
+                  << "  throughput=" << tflops << " TFLOP/s"
+                  << "\nKV tiles loaded:  " << kv_tiles_loaded
+                  << "  (MHA equiv: " << kv_tiles_mha
+                  << ", GQA saving: " << H << "×)\n";
+        // Output readout suppressed — timing-only mode produces zeroed buffers.
     } else {
         // Schedule-mode readout removed — timing-only mode produces zeroed buffers.
         // To re-enable:
