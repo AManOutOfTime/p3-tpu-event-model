@@ -95,6 +95,48 @@ Expected output for `dummy_example.yaml` (320-cycle serial chain):
 
 ---
 
+## Generated LLaMA workloads
+
+The simulator can generate LLaMA-style schedules from a workload YAML instead
+of requiring a hand-written schedule file:
+
+```bash
+./build/apps/sim_main --config configs/default.yaml \
+  --llama-workload workloads/llama_prefill_decode.yaml --no-trace
+```
+
+Supported `llama.mode` values:
+
+| Mode | Meaning |
+|---|---|
+| `attention` | Build only the attention block. |
+| `layer` | Build one full transformer layer. |
+| `prefill` | Process a prompt sequence and optionally populate KV cache. |
+| `decode` | Process one generated token using existing prompt/KV context. |
+| `prefill_decode` | Run prefill once, then run `generation_steps` decode iterations. |
+
+Important sequence fields:
+
+| Field | Meaning |
+|---|---|
+| `prompt_len` | Number of input prompt tokens processed during prefill. |
+| `generation_steps` | Number of new tokens generated after prefill in `prefill_decode` mode. |
+| `seq_len` | General sequence length used by standalone `attention`, `layer`, and non-combined schedule paths. |
+| `max_seq_len` | KV-cache capacity/planning length. If omitted, the effective value is `max(seq_len, prompt_len + generation_steps)`. |
+
+For `mode: prefill_decode`, the initial prefill work is driven by
+`prompt_len`. Each decode step processes one token and attends over the prompt
+plus previously generated tokens. For example, with `prompt_len: 4` and
+`generation_steps: 2`, the schedule prefills 4 tokens, then decodes token
+positions 4 and 5, using zero-based positions, with KV lengths 5 and 6.
+
+In a workload that is only intended for `prefill_decode`, `seq_len` can be
+omitted if `max_seq_len` is set explicitly. If omitted, the internal config
+still has a default `seq_len`, so keep `seq_len` when reusing the same YAML for
+standalone `attention`, `layer`, or `prefill` modes.
+
+---
+
 ## How to add a new hardware unit
 
 1. Copy `src/units/delay_unit.h/.cpp` → `src/units/my_unit.h/.cpp`, rename class, implement `handle()`.

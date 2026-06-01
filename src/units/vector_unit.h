@@ -15,21 +15,21 @@ class Scheduler;
 //   groups  = ceil(elements / simd_width)
 //   latency = passes × groups  +  exp_ops × exp_latency × groups
 //
-// Buffer fields used per op (all are TensorStore keys):
+// Buffer fields used per op are symbolic keys for event labels/dependencies:
 //
-//  scale         src, dst, src_scale (optional row-vector; empty = scalar)
-//  rowmax        src, dst            [Br×Bc] → [Br]
+//  scale         src, dst, src_scale
+//  rowmax        src, dst
 //  update_rowmax src_m, src_rowmax, dst_m, dst_correction
-//  exp_shift     src_matrix, src_shift, dst   P = exp(S - m) broadcast
+//  exp_shift     src_matrix, src_shift, dst
 //  update_rowsum src_p, src_correction, src_l, dst_l
-//  accumulate    src_a, src_b, dst   element-wise dst = src_a + src_b
-//  normalize     src_matrix, src_denom, dst   row-wise divide
-//  logsumexp     src_m, src_l, dst   element-wise dst = m + log(l)
+//  accumulate    src_a, src_b, dst
+//  normalize     src_matrix, src_denom, dst
+//  logsumexp     src_m, src_l, dst
 //  causal_mask   src, dst with row/col absolute starts
-//  rope          src, dst   pairwise rotate by absolute position
-//  rmsnorm       src, dst   row-wise RMS normalization
-//  silu_mul      src_a, src_b, dst   SiLU(src_a) * src_b
-//  residual_add  src_a, src_b, dst   element-wise residual add
+//  rope          src, dst
+//  rmsnorm       src, dst
+//  silu_mul      src_a, src_b, dst
+//  residual_add  src_a, src_b, dst
 // ---------------------------------------------------------------------------
 struct VectorOp {
     std::string kind;
@@ -83,29 +83,14 @@ public:
                std::ostream& os    = std::cout);
 
     void set_scheduler(Scheduler* s)       { sched_ = s; }
-    void set_tensor_store(TensorStore* ts) { ts_    = ts; }
+    void set_tensor_store(TensorStore*) {}
 
     void  handle(const Event& e, EventEngine& engine) override;
     Cycle compute_latency(const VectorOp& op) const;
 
 private:
-    void do_scale        (const VectorOp& op);
-    void do_rowmax       (const VectorOp& op);
-    void do_update_rowmax(const VectorOp& op);
-    void do_exp_shift    (const VectorOp& op);
-    void do_update_rowsum(const VectorOp& op);
-    void do_accumulate   (const VectorOp& op);
-    void do_normalize    (const VectorOp& op);
-    void do_logsumexp    (const VectorOp& op);
-    void do_causal_mask  (const VectorOp& op);
-    void do_rope         (const VectorOp& op);
-    void do_rmsnorm      (const VectorOp& op);
-    void do_silu_mul     (const VectorOp& op);
-    void do_residual_add (const VectorOp& op);
-
     VectorCoreConfig cfg_;
     Scheduler*       sched_;
-    TensorStore*     ts_;
     std::ostream&    os_;
 };
 

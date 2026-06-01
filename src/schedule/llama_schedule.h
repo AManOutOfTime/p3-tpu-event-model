@@ -7,7 +7,7 @@ namespace sim {
 
 struct LlamaScheduleConfig {
     std::string mode = "attention";      // attention | layer | prefill | decode
-    std::string schedule_granularity = "detailed";  // detailed | coarse
+    std::string schedule_granularity = "detailed";  // only detailed is supported
     uint32_t seq_len = 128;
     uint32_t prompt_len = 128;
     uint32_t generation_steps = 1;

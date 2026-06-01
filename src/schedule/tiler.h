@@ -1,7 +1,7 @@
 #pragma once
 #include "config/arch_config.h"
-#include "core/tensor_store.h"
 #include "schedule/instruction.h"
+#include "schedule/schedule.h"
 #include <string>
 #include <vector>
 #include <iostream>
@@ -15,9 +15,9 @@ namespace sim {
 //   K  (or d_head): streaming axis — NEVER tiled (streams fully per execution)
 //   N  (or Bc)    : output cols  — may be tiled across SA cols
 //
-//   src_a  : TensorStore key for full A matrix (already in IBUF after DMA)
-//   src_b  : TensorStore key for full B matrix (already in IBUF after DMA)
-//   dst_c  : TensorStore key for output C
+//   src_a  : symbolic full A matrix location
+//   src_b  : symbolic full B matrix location
+//   dst_c  : symbolic output C location
 // ---------------------------------------------------------------------------
 struct WorkloadGemm {
     uint32_t    M    = 0;   // Br
@@ -85,11 +85,17 @@ struct TileDecomposition {
 // ---------------------------------------------------------------------------
 class Tiler {
 public:
-    // Decompose workload given arch config. Slices written into ts.
+    // Decompose workload given arch config.
     static TileDecomposition decompose(const WorkloadGemm& wl,
                                        const ArchConfig&   arch,
-                                       TensorStore&        ts,
                                        InstructionId       id_start = 0);
+
+    // Rewrite oversized GEMM instructions into the same STAGE+GEMM sub-events
+    // produced by decompose(). Instructions that already fit the array are left
+    // unchanged; dependencies on expanded instructions are rewired to the last
+    // generated sub-event.
+    static Schedule expand_gemm_subtiles(const Schedule& sched,
+                                         const ArchConfig& arch);
 
     // Parse a workload YAML file / string.
     static WorkloadGemm from_yaml_file(const std::string& path);
@@ -99,8 +105,6 @@ public:
     static void print_decomposition(const TileDecomposition& td,
                                     std::ostream& os = std::cout);
 
-    // Assemble S_sub tiles → full dst_c after simulation completes.
-    static void assemble_output(const TileDecomposition& td, TensorStore& ts);
 };
 
 }  // namespace sim

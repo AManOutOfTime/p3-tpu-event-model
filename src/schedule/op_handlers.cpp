@@ -237,12 +237,14 @@ void register_builtin_ops(OpRegistry& reg, const ArchConfig& arch) {
         s.src_a = pget_str(p, "source_a");
         s.src_b = pget_str(p, "source_b");
         s.dst_c = pget_str(p, "destination");
+        if (s.M > arch.systolic.rows || s.N > arch.systolic.cols) {
+            throw std::runtime_error(
+                "gemm: oversized GEMM reached runtime; run Tiler::expand_gemm_subtiles before scheduling");
+        }
         Cycle fill = arch.systolic.bidirectional
             ? (arch.systolic.rows - 1 + 1) / 2 + (arch.systolic.cols - 1 + 1) / 2
             : (arch.systolic.rows - 1) + (arch.systolic.cols - 1);
-        Cycle tm = (s.M + arch.systolic.rows - 1) / arch.systolic.rows;
-        Cycle tn = (s.N + arch.systolic.cols - 1) / arch.systolic.cols;
-        Cycle lat = tm * tn * (static_cast<Cycle>(s.K) + fill);
+        Cycle lat = static_cast<Cycle>(s.K) + fill;
         auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
         Event e;
         e.type = EventType::OP_START;

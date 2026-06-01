@@ -81,11 +81,7 @@ int main(int argc, char** argv) {
               << "  exp_lat=" << arch.vector_core.exp_latency
               << "  access_bw=" << arch.access_core.bandwidth << "\n\n";
 
-    const uint32_t Br = arch.systolic.rows;
-    const uint32_t Bc = arch.systolic.cols;
-    const uint32_t DH = arch.systolic.d_head;
-
-    // ── TensorStore + Schedule ─────────────────────────────────────────
+    // ── Schedule ───────────────────────────────────────────────────────
     TensorStore       ts;
     Schedule          schedule;
     TileDecomposition tile_decomp;
@@ -98,7 +94,7 @@ int main(int argc, char** argv) {
         if (llama_cfg.sram_kv_capacity_kb == 0) {
             llama_cfg.sram_kv_capacity_kb = arch.sram.ibuf_kb + arch.sram.obuf_kb;
         }
-        schedule = build_llama_schedule(llama_cfg);
+        schedule = Tiler::expand_gemm_subtiles(build_llama_schedule(llama_cfg), arch);
         used_llama = true;
         std::cout << "llama_mode=" << llama_cfg.mode
                   << "  q_heads=" << llama_cfg.num_q_heads
@@ -109,25 +105,14 @@ int main(int argc, char** argv) {
     } else if (!workload_path.empty()) {
         // --workload: tiler generates STAGE+GEMM instructions automatically
         WorkloadGemm wl = Tiler::from_yaml_file(workload_path);
-        tile_decomp     = Tiler::decompose(wl, arch, ts);
+        tile_decomp     = Tiler::decompose(wl, arch);
         Tiler::print_decomposition(tile_decomp);
         schedule.instructions = tile_decomp.instructions;
         used_tiler = true;
     } else {
-        // --schedule: hand-written YAML, pre-seed FA2 buffers
+        // --schedule: hand-written YAML
         schedule = Schedule::from_yaml_file(sched_path);
-        ts.init_random("shared_ibuf.Q_tile",   (size_t)Br*DH, -1.f, 1.f, 1);
-        ts.init_random("shared_ibuf.K_tile",   (size_t)Bc*DH, -1.f, 1.f, 2);
-        ts.init_random("shared_ibuf.K_tile_T", (size_t)DH*Bc, -1.f, 1.f, 3);
-        ts.init_random("shared_ibuf.V_tile",   (size_t)Bc*DH, -1.f, 1.f, 4);
-        ts.init_zeros ("shared_ibuf.P_tile",   (size_t)Br*Bc);
-        ts.init_zeros  ("shared_obuf.O_acc",      (size_t)Br*DH);
-        ts.init_neg_inf("shared_obuf.m",          (size_t)Br);
-        ts.init_zeros  ("shared_obuf.l",          (size_t)Br);
-        ts.init_zeros  ("shared_obuf.correction", (size_t)Br);
-        ts.init_random ("systolic_array.Q_operand", (size_t)Br*DH, -1.f, 1.f, 1);
-        ts.init_zeros  ("systolic_array.P_operand", (size_t)Br*Bc);
-        ts.init_zeros  ("vector_scratch.rowmax_tmp", (size_t)Br);
+        schedule = Tiler::expand_gemm_subtiles(schedule, arch);
     }
 
     // ── Build engine ─────────────────────────────────────────────────────
@@ -175,20 +160,15 @@ int main(int argc, char** argv) {
 
     // ── Output ────────────────────────────────────────────────────────
     if (used_tiler) {
-        Tiler::assemble_output(tile_decomp, ts);
         const auto& wl = tile_decomp.workload;
-        std::cout << "\nAssembled \"" << wl.dst_c << "\" ["
-                  << wl.M << "x" << wl.N << "] from "
-                  << tile_decomp.tiles.size() << " tile(s):\n";
-        ts.print(wl.dst_c, wl.M, wl.N, 4);
+        std::cout << "\nGenerated tiled GEMM schedule for \"" << wl.dst_c
+                  << "\" [" << wl.M << "x" << wl.N << "] with "
+                  << tile_decomp.tiles.size() << " array execution(s)\n";
     } else if (used_llama) {
         std::cout << "\nGenerated LLaMA schedule instructions="
                   << schedule.instructions.size() << "\n";
     } else {
-        if (ts.has("shared_obuf.S_tile"))
-            ts.print("shared_obuf.S_tile", Br, Bc, 4);
-        if (ts.has("shared_obuf.O_tile"))
-            ts.print("shared_obuf.O_tile", Br, DH, 4);
+        std::cout << "\nSchedule instructions=" << schedule.instructions.size() << "\n";
     }
 
     return scheduler.all_done() ? 0 : 1;

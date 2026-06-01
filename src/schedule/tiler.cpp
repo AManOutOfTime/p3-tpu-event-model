@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <limits>
+#include <unordered_map>
 
 namespace sim {
 
@@ -42,7 +43,6 @@ WorkloadGemm Tiler::from_yaml_file(const std::string& path) {
 // ---------------------------------------------------------------------------
 TileDecomposition Tiler::decompose(const WorkloadGemm& wl,
                                    const ArchConfig&   arch,
-                                   TensorStore&        ts,
                                    InstructionId       id_start) {
     if (!wl.M || !wl.K || !wl.N)
         throw std::runtime_error("Tiler: M/K/N must all be > 0");
@@ -51,29 +51,6 @@ TileDecomposition Tiler::decompose(const WorkloadGemm& wl,
     const uint32_t SA_C = arch.systolic.cols;
     const uint32_t TM   = (wl.M + SA_R - 1) / SA_R;   // Q row sub-tiles
     const uint32_t TN   = (wl.N + SA_C - 1) / SA_C;   // KT col sub-tiles
-
-    // ── Seed source data in TensorStore ────────────────────────────────
-    // Represents IBUF contents after prior DMA loads.
-    if (!ts.has(wl.src_a)) {
-        if      (wl.fill == "zeros") ts.init_zeros (wl.src_a, wl.M * wl.K);
-        else if (wl.fill == "ones")  ts.init_ones  (wl.src_a, wl.M * wl.K);
-        else                         ts.init_random(wl.src_a, wl.M * wl.K, -1.f, 1.f, 42u);
-    }
-    if (!ts.has(wl.src_b)) {
-        if      (wl.fill == "zeros") ts.init_zeros (wl.src_b, wl.K * wl.N);
-        else if (wl.fill == "ones")  ts.init_ones  (wl.src_b, wl.K * wl.N);
-        else                         ts.init_random(wl.src_b, wl.K * wl.N, -1.f, 1.f, 99u);
-    }
-    ts.init_zeros(wl.dst_c, wl.M * wl.N);
-
-    // Pre-slice all KT col sub-tiles once — reused across all Q rows
-    for (uint32_t j = 0; j < TN; j++) {
-        const uint32_t col_start = j * SA_C;
-        const uint32_t tn        = std::min(SA_C, wl.N - col_start);
-        const std::string name_b = "shared_ibuf.KT_sub_c" + std::to_string(j);
-        if (!ts.has(name_b))
-            ts.slice_cols(wl.src_b, name_b, col_start, tn, wl.K, wl.N);
-    }
 
     TileDecomposition td;
     td.workload = wl;
@@ -85,16 +62,13 @@ TileDecomposition Tiler::decompose(const WorkloadGemm& wl,
     InstructionId next_id      = id_start;
     InstructionId prev_gemm_id = 0;
     bool          has_prev_gemm = false;
-    const uint32_t dtype_bytes = 2;  // BF16
 
     // ── Q-stationary outer loop ─────────────────────────────────────────
     for (uint32_t i = 0; i < TM; i++) {
         const uint32_t row_start = i * SA_R;
         const uint32_t tm        = std::min(SA_R, wl.M - row_start);
 
-        // Slice Q row sub-tile from IBUF
         const std::string name_a = "shared_ibuf.Q_sub_r" + std::to_string(i);
-        ts.slice_rows(wl.src_a, name_a, row_start, tm, wl.K);
 
         // ── STAGE: IBUF → systolic_array.Q_operand ─────────────────────
         // Must wait for array to drain (prev GEMM) before overwriting Q_operand.
@@ -166,15 +140,72 @@ TileDecomposition Tiler::decompose(const WorkloadGemm& wl,
 }
 
 // ---------------------------------------------------------------------------
-// assemble_output — place S_sub tiles → full dst_c
+// expand_gemm_subtiles
 // ---------------------------------------------------------------------------
-void Tiler::assemble_output(const TileDecomposition& td, TensorStore& ts) {
-    for (const auto& t : td.tiles) {
-        if (!ts.has(t.name_c)) continue;
-        ts.place_tile(t.name_c, td.workload.dst_c,
-                      t.row_start, t.col_start,
-                      t.tm, t.tn, td.workload.N);
+Schedule Tiler::expand_gemm_subtiles(const Schedule& sched,
+                                     const ArchConfig& arch) {
+    Schedule expanded;
+    expanded.instructions.reserve(sched.instructions.size());
+
+    InstructionId next_id = 0;
+    for (const auto& inst : sched.instructions)
+        next_id = std::max(next_id, inst.id + 1);
+
+    std::unordered_map<InstructionId, InstructionId> terminal_by_original;
+
+    for (const auto& inst : sched.instructions) {
+        if (inst.op != "gemm") {
+            expanded.instructions.push_back(inst);
+            continue;
+        }
+
+        WorkloadGemm wl;
+        wl.M = static_cast<uint32_t>(pget_int(inst.params, "M", arch.systolic.rows));
+        wl.K = static_cast<uint32_t>(pget_int(inst.params, "K", arch.systolic.d_head));
+        wl.N = static_cast<uint32_t>(pget_int(inst.params, "N", arch.systolic.cols));
+        wl.src_a = pget_str(inst.params, "source_a");
+        wl.src_b = pget_str(inst.params, "source_b");
+        wl.dst_c = pget_str(inst.params, "destination");
+        wl.fill = "zeros";
+
+        const bool needs_subtiles = wl.M > arch.systolic.rows
+                                 || wl.N > arch.systolic.cols;
+        if (!needs_subtiles) {
+            expanded.instructions.push_back(inst);
+            continue;
+        }
+
+        TileDecomposition td = Tiler::decompose(wl, arch, next_id);
+        if (td.instructions.empty()) {
+            expanded.instructions.push_back(inst);
+            continue;
+        }
+
+        td.instructions.front().depends_on.insert(
+            td.instructions.front().depends_on.end(),
+            inst.depends_on.begin(), inst.depends_on.end());
+
+        for (auto& sub : td.instructions) {
+            if (!inst.label.empty())
+                sub.label = inst.label + " / " + sub.label;
+            sub.params["subtiled_from"] = static_cast<int64_t>(inst.id);
+            expanded.instructions.push_back(std::move(sub));
+        }
+
+        terminal_by_original[inst.id] = expanded.instructions.back().id;
+        next_id = expanded.instructions.back().id + 1;
     }
+
+    for (auto& inst : expanded.instructions) {
+        for (auto& dep : inst.depends_on) {
+            auto it = terminal_by_original.find(dep);
+            if (it != terminal_by_original.end())
+                dep = it->second;
+        }
+    }
+
+    expanded.validate();
+    return expanded;
 }
 
 // ---------------------------------------------------------------------------

@@ -6,8 +6,8 @@
 namespace sim {
 
 DmaUnit::DmaUnit(std::string name, const ArchConfig& cfg,
-                 TensorStore* ts, Scheduler* sched, std::ostream& os)
-    : Unit(std::move(name)), cfg_(cfg), ts_(ts), sched_(sched), os_(os) {}
+                 TensorStore*, Scheduler* sched, std::ostream& os)
+    : Unit(std::move(name)), cfg_(cfg), sched_(sched), os_(os) {}
 
 Cycle DmaUnit::load_store_latency(uint64_t bytes) const {
     if (!bytes) return 0;
@@ -51,17 +51,6 @@ void DmaUnit::handle(const Event& e, EventEngine& engine) {
         engine.schedule(done);
 
     } else if (e.type == EventType::OP_DONE) {
-        // Copy buffer in TensorStore — data has arrived at destination
-        if (ts_)
-            if (const auto* t = std::any_cast<DmaTransfer>(&e.payload))
-                if (!t->src_buf.empty() && !t->dst_buf.empty()
-                    && ts_->has(t->src_buf)) {
-                    ts_->copy(t->src_buf, t->dst_buf);
-                    os_ << "  [" << name() << "]  "
-                        << (t->on_chip ? "STAGE" : "DMA") << "_COPY  \""
-                        << t->src_buf << "\" → \"" << t->dst_buf << "\"\n";
-                }
-
         os_ << "  [" << name() << "]  DMA_DONE"
             << "  instr=" << e.instr << "  @cycle=" << e.cycle
             << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";

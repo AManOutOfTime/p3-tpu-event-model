@@ -118,8 +118,8 @@ LlamaScheduleConfig normalize_cfg(LlamaScheduleConfig cfg) {
         throw std::runtime_error("LlamaScheduleConfig: double_buffer prefetch requires at least two KV stage buffers");
     if (cfg.kv_cache_eviction_policy != "fail" && cfg.kv_cache_eviction_policy != "spill_to_hbm")
         throw std::runtime_error("LlamaScheduleConfig: kv_cache_eviction_policy must be fail or spill_to_hbm");
-    if (cfg.schedule_granularity != "detailed" && cfg.schedule_granularity != "coarse")
-        throw std::runtime_error("LlamaScheduleConfig: schedule_granularity must be detailed or coarse");
+    if (cfg.schedule_granularity != "detailed")
+        throw std::runtime_error("LlamaScheduleConfig: only detailed schedule generation is supported");
     if (cfg.hidden_dim % cfg.num_q_heads != 0)
         throw std::runtime_error("LlamaScheduleConfig: hidden_dim must be divisible by num_q_heads");
     const uint32_t derived_head_dim = cfg.hidden_dim / cfg.num_q_heads;
@@ -177,51 +177,6 @@ InstructionId on_chip_move(Builder& b, const std::string& source,
     p["rows"] = static_cast<int64_t>(rows);
     p["cols"] = static_cast<int64_t>(cols);
     return b.add("sram_copy", "access_core", label, std::move(p), std::move(deps));
-}
-
-InstructionId append_coarse_staged_gemm(Builder& b, const std::string& label,
-                                        const std::string& tag,
-                                        const std::string& source_a,
-                                        const std::string& hbm_weight,
-                                        const std::string& destination,
-                                        uint32_t m, uint32_t k, uint32_t n,
-                                        const std::vector<InstructionId>& deps) {
-    const std::string weight_buf = "shared_ibuf." + tag + ".W";
-    const std::string a_operand = "systolic_array." + tag + ".A_operand";
-    const std::string b_operand = "systolic_array." + tag + ".B_operand";
-
-    ParamMap load_w;
-    load_w["source"] = hbm_weight;
-    load_w["destination"] = weight_buf;
-    load_w["rows"] = static_cast<int64_t>(k);
-    load_w["cols"] = static_cast<int64_t>(n);
-    InstructionId weight_load = b.add("dma_load", "dma", label + " weight load",
-                                      load_w, deps);
-
-    ParamMap stage_a;
-    stage_a["source"] = source_a;
-    stage_a["destination"] = a_operand;
-    stage_a["rows"] = static_cast<int64_t>(m);
-    stage_a["cols"] = static_cast<int64_t>(k);
-    InstructionId a_stage = b.add("dma_stage", "dma", label + " activation stage",
-                                  stage_a, deps);
-
-    ParamMap stage_b;
-    stage_b["source"] = weight_buf;
-    stage_b["destination"] = b_operand;
-    stage_b["rows"] = static_cast<int64_t>(k);
-    stage_b["cols"] = static_cast<int64_t>(n);
-    InstructionId b_stage = b.add("dma_stage", "dma", label + " weight stage",
-                                  stage_b, {weight_load});
-
-    ParamMap gemm;
-    gemm["source_a"] = a_operand;
-    gemm["source_b"] = b_operand;
-    gemm["destination"] = destination;
-    gemm["M"] = static_cast<int64_t>(m);
-    gemm["K"] = static_cast<int64_t>(k);
-    gemm["N"] = static_cast<int64_t>(n);
-    return b.add("gemm", "systolic", label, gemm, {a_stage, b_stage});
 }
 
 InstructionId append_detailed_tiled_gemm(Builder& b, const LlamaScheduleConfig& cfg,
@@ -341,10 +296,6 @@ InstructionId append_staged_gemm(Builder& b, const LlamaScheduleConfig& cfg,
                                  const std::string& destination,
                                  uint32_t m, uint32_t k, uint32_t n,
                                  const std::vector<InstructionId>& deps) {
-    if (cfg.schedule_granularity == "coarse") {
-        return append_coarse_staged_gemm(b, label, tag, source_a, hbm_weight,
-                                         destination, m, k, n, deps);
-    }
     return append_detailed_tiled_gemm(b, cfg, label, tag, source_a, hbm_weight,
                                      destination, m, k, n, deps);
 }
@@ -445,14 +396,6 @@ InstructionId append_rmsnorm(Builder& b, const LlamaScheduleConfig& cfg,
                              const std::string& destination,
                              uint32_t rows, uint32_t cols,
                              const std::vector<InstructionId>& deps) {
-    if (cfg.schedule_granularity == "coarse") {
-        ParamMap rn;
-        rn["source"] = source;
-        rn["destination"] = destination;
-        rn["rows"] = static_cast<int64_t>(rows);
-        rn["cols"] = static_cast<int64_t>(cols);
-        return b.add("rmsnorm", "vector_core", label, rn, deps);
-    }
     return append_detailed_rmsnorm(b, cfg, label, tag, source, destination, rows, cols, deps);
 }
 
@@ -497,73 +440,278 @@ InstructionId append_detailed_rope(Builder& b,
                                rows, cols, {rot});
 }
 
-InstructionId append_rope(Builder& b, const LlamaScheduleConfig& cfg,
+InstructionId append_rope(Builder& b,
                           const std::string& label,
                           const std::string& tag,
                           const std::string& source,
                           const std::string& destination,
                           uint32_t rows, uint32_t cols, uint32_t row_start,
                           const std::vector<InstructionId>& deps) {
-    if (cfg.schedule_granularity == "coarse") {
-        ParamMap rope;
-        rope["source"] = source;
-        rope["destination"] = destination;
-        rope["rows"] = static_cast<int64_t>(rows);
-        rope["cols"] = static_cast<int64_t>(cols);
-        rope["row_start"] = static_cast<int64_t>(row_start);
-        return b.add("rope", "vector_core", label, rope, deps);
-    }
     return append_detailed_rope(b, label, tag, source, destination, rows, cols, row_start, deps);
 }
 
-InstructionId append_swiglu(Builder& b, const LlamaScheduleConfig& cfg,
-                            const std::string& label,
-                            const std::string& tag,
-                            const std::string& gate,
-                            const std::string& up,
-                            const std::string& destination,
-                            uint32_t rows, uint32_t cols,
-                            const std::vector<InstructionId>& deps) {
-    if (cfg.schedule_granularity == "coarse") {
-        ParamMap act;
-        act["source_a"] = gate;
-        act["source_b"] = up;
-        act["destination"] = destination;
-        act["rows"] = static_cast<int64_t>(rows);
-        act["cols"] = static_cast<int64_t>(cols);
-        return b.add("silu_mul", "vector_core", label, act, deps);
-    }
-    ParamMap silu;
-    silu["source"] = gate;
-    silu["destination"] = "vector_scratch." + tag + ".silu_gate";
-    silu["rows"] = static_cast<int64_t>(rows);
-    silu["cols"] = static_cast<int64_t>(cols);
-    InstructionId silu_id = b.add("silu", "vector_core", label + " SiLU gate", silu, deps);
+InstructionId append_detailed_mlp_kernel(Builder& b, const LlamaScheduleConfig& cfg,
+                                         const std::string& layer,
+                                         const std::string& source,
+                                         const std::string& destination,
+                                         uint32_t rows,
+                                         const std::vector<InstructionId>& deps) {
+    const uint32_t row_tiles = ceil_div(rows, cfg.linear_tile_rows);
+    const uint32_t inter_tiles = ceil_div(cfg.intermediate_dim, cfg.linear_tile_cols);
+    const uint32_t out_tiles = ceil_div(cfg.hidden_dim, cfg.linear_tile_cols);
+    std::vector<InstructionId> output_tiles;
 
-    ParamMap mul;
-    mul["source_a"] = "vector_scratch." + tag + ".silu_gate";
-    mul["source_b"] = up;
-    mul["destination"] = destination;
-    mul["rows"] = static_cast<int64_t>(rows);
-    mul["cols"] = static_cast<int64_t>(cols);
-    return b.add("elementwise_mul", "vector_core", label + " multiply up", mul, {silu_id});
+    for (uint32_t rt = 0; rt < row_tiles; rt++) {
+        const uint32_t row_start = rt * cfg.linear_tile_rows;
+        const uint32_t row_count = tile_extent(rows, cfg.linear_tile_rows, rt);
+        const std::string row_tag = layer + ".mlp.r" + std::to_string(rt);
+        const std::string a_tile = "shared_ibuf." + row_tag + ".A";
+
+        InstructionId a_load = on_chip_move(
+            b, source, a_tile, row_count, cfg.hidden_dim,
+            layer + " MLP activation tile r" + std::to_string(rt) + " load", deps);
+
+        std::vector<InstructionId> acc_state(out_tiles);
+        for (uint32_t ot = 0; ot < out_tiles; ot++) {
+            const uint32_t out_cols = tile_extent(cfg.hidden_dim, cfg.linear_tile_cols, ot);
+            const std::string out_tag = row_tag + ".out.c" + std::to_string(ot);
+
+            ParamMap init;
+            init["destination"] = "shared_obuf." + out_tag + ".O_acc";
+            init["rows"] = static_cast<int64_t>(row_count);
+            init["cols"] = static_cast<int64_t>(out_cols);
+            init["init_value"] = static_cast<int64_t>(0);
+            acc_state[ot] = b.add("init_fill", "access_core",
+                                  layer + " MLP down init O tile r" + std::to_string(rt)
+                                  + " c" + std::to_string(ot),
+                                  init, {a_load});
+        }
+
+        for (uint32_t it = 0; it < inter_tiles; it++) {
+            const uint32_t inter_start = it * cfg.linear_tile_cols;
+            const uint32_t inter_cols = tile_extent(cfg.intermediate_dim,
+                                                   cfg.linear_tile_cols, it);
+            const std::string tile_tag = row_tag + ".i" + std::to_string(it);
+
+            ParamMap stage_gate_a;
+            stage_gate_a["source"] = a_tile;
+            stage_gate_a["destination"] = "systolic_array." + tile_tag + ".gate.A";
+            stage_gate_a["rows"] = static_cast<int64_t>(row_count);
+            stage_gate_a["cols"] = static_cast<int64_t>(cfg.hidden_dim);
+            InstructionId gate_a = b.add("dma_stage", "dma",
+                                         layer + " MLP gate activation tile r"
+                                         + std::to_string(rt) + " i" + std::to_string(it)
+                                         + " stage",
+                                         stage_gate_a, {a_load});
+
+            ParamMap gate_w_load;
+            gate_w_load["source"] = "HBM." + layer + ".W_gate[0:"
+                                  + std::to_string(cfg.hidden_dim) + ","
+                                  + std::to_string(inter_start) + ":"
+                                  + std::to_string(inter_start + inter_cols) + "]";
+            gate_w_load["destination"] = "shared_ibuf." + tile_tag + ".W_gate";
+            gate_w_load["rows"] = static_cast<int64_t>(cfg.hidden_dim);
+            gate_w_load["cols"] = static_cast<int64_t>(inter_cols);
+            InstructionId gate_w = b.add("dma_load", "dma",
+                                         layer + " MLP gate weight tile i"
+                                         + std::to_string(it) + " load",
+                                         gate_w_load, deps);
+
+            ParamMap stage_gate_w;
+            stage_gate_w["source"] = "shared_ibuf." + tile_tag + ".W_gate";
+            stage_gate_w["destination"] = "systolic_array." + tile_tag + ".gate.B";
+            stage_gate_w["rows"] = static_cast<int64_t>(cfg.hidden_dim);
+            stage_gate_w["cols"] = static_cast<int64_t>(inter_cols);
+            InstructionId gate_b = b.add("dma_stage", "dma",
+                                         layer + " MLP gate weight tile i"
+                                         + std::to_string(it) + " stage",
+                                         stage_gate_w, {gate_w});
+
+            ParamMap gate_gemm;
+            gate_gemm["source_a"] = "systolic_array." + tile_tag + ".gate.A";
+            gate_gemm["source_b"] = "systolic_array." + tile_tag + ".gate.B";
+            gate_gemm["destination"] = "shared_obuf." + tile_tag + ".gate";
+            gate_gemm["M"] = static_cast<int64_t>(row_count);
+            gate_gemm["K"] = static_cast<int64_t>(cfg.hidden_dim);
+            gate_gemm["N"] = static_cast<int64_t>(inter_cols);
+            InstructionId gate = b.add("gemm", "systolic",
+                                       layer + " MLP gate tile r" + std::to_string(rt)
+                                       + " i" + std::to_string(it),
+                                       gate_gemm, {gate_a, gate_b});
+
+            ParamMap stage_up_a = stage_gate_a;
+            stage_up_a["destination"] = "systolic_array." + tile_tag + ".up.A";
+            InstructionId up_a = b.add("dma_stage", "dma",
+                                       layer + " MLP up activation tile r"
+                                       + std::to_string(rt) + " i" + std::to_string(it)
+                                       + " stage",
+                                       stage_up_a, {a_load});
+
+            ParamMap up_w_load;
+            up_w_load["source"] = "HBM." + layer + ".W_up[0:"
+                                + std::to_string(cfg.hidden_dim) + ","
+                                + std::to_string(inter_start) + ":"
+                                + std::to_string(inter_start + inter_cols) + "]";
+            up_w_load["destination"] = "shared_ibuf." + tile_tag + ".W_up";
+            up_w_load["rows"] = static_cast<int64_t>(cfg.hidden_dim);
+            up_w_load["cols"] = static_cast<int64_t>(inter_cols);
+            InstructionId up_w = b.add("dma_load", "dma",
+                                       layer + " MLP up weight tile i"
+                                       + std::to_string(it) + " load",
+                                       up_w_load, deps);
+
+            ParamMap stage_up_w;
+            stage_up_w["source"] = "shared_ibuf." + tile_tag + ".W_up";
+            stage_up_w["destination"] = "systolic_array." + tile_tag + ".up.B";
+            stage_up_w["rows"] = static_cast<int64_t>(cfg.hidden_dim);
+            stage_up_w["cols"] = static_cast<int64_t>(inter_cols);
+            InstructionId up_b = b.add("dma_stage", "dma",
+                                       layer + " MLP up weight tile i"
+                                       + std::to_string(it) + " stage",
+                                       stage_up_w, {up_w});
+
+            ParamMap up_gemm;
+            up_gemm["source_a"] = "systolic_array." + tile_tag + ".up.A";
+            up_gemm["source_b"] = "systolic_array." + tile_tag + ".up.B";
+            up_gemm["destination"] = "shared_obuf." + tile_tag + ".up";
+            up_gemm["M"] = static_cast<int64_t>(row_count);
+            up_gemm["K"] = static_cast<int64_t>(cfg.hidden_dim);
+            up_gemm["N"] = static_cast<int64_t>(inter_cols);
+            InstructionId up = b.add("gemm", "systolic",
+                                     layer + " MLP up tile r" + std::to_string(rt)
+                                     + " i" + std::to_string(it),
+                                     up_gemm, {up_a, up_b});
+
+            ParamMap silu;
+            silu["source"] = "shared_obuf." + tile_tag + ".gate";
+            silu["destination"] = "vector_scratch." + tile_tag + ".silu_gate";
+            silu["rows"] = static_cast<int64_t>(row_count);
+            silu["cols"] = static_cast<int64_t>(inter_cols);
+            InstructionId silu_id = b.add("silu", "vector_core",
+                                          layer + " MLP SwiGLU SiLU tile r"
+                                          + std::to_string(rt) + " i" + std::to_string(it),
+                                          silu, {gate});
+
+            ParamMap mul;
+            mul["source_a"] = "vector_scratch." + tile_tag + ".silu_gate";
+            mul["source_b"] = "shared_obuf." + tile_tag + ".up";
+            mul["destination"] = "shared_ibuf." + tile_tag + ".ff";
+            mul["rows"] = static_cast<int64_t>(row_count);
+            mul["cols"] = static_cast<int64_t>(inter_cols);
+            InstructionId ff = b.add("elementwise_mul", "vector_core",
+                                     layer + " MLP SwiGLU multiply tile r"
+                                     + std::to_string(rt) + " i" + std::to_string(it),
+                                     mul, {silu_id, up});
+
+            for (uint32_t ot = 0; ot < out_tiles; ot++) {
+                const uint32_t out_col_start = ot * cfg.linear_tile_cols;
+                const uint32_t out_cols = tile_extent(cfg.hidden_dim, cfg.linear_tile_cols, ot);
+                const std::string down_tag = tile_tag + ".out.c" + std::to_string(ot);
+                const std::string out_tag = row_tag + ".out.c" + std::to_string(ot);
+
+                ParamMap stage_ff;
+                stage_ff["source"] = "shared_ibuf." + tile_tag + ".ff";
+                stage_ff["destination"] = "systolic_array." + down_tag + ".ff.A";
+                stage_ff["rows"] = static_cast<int64_t>(row_count);
+                stage_ff["cols"] = static_cast<int64_t>(inter_cols);
+                InstructionId ff_stage = b.add("dma_stage", "dma",
+                                               layer + " MLP down FF tile r"
+                                               + std::to_string(rt) + " i" + std::to_string(it)
+                                               + " stage",
+                                               stage_ff, {ff});
+
+                ParamMap down_w_load;
+                down_w_load["source"] = "HBM." + layer + ".W_down["
+                                      + std::to_string(inter_start) + ":"
+                                      + std::to_string(inter_start + inter_cols) + ","
+                                      + std::to_string(out_col_start) + ":"
+                                      + std::to_string(out_col_start + out_cols) + "]";
+                down_w_load["destination"] = "shared_ibuf." + down_tag + ".W_down";
+                down_w_load["rows"] = static_cast<int64_t>(inter_cols);
+                down_w_load["cols"] = static_cast<int64_t>(out_cols);
+                InstructionId down_w = b.add("dma_load", "dma",
+                                             layer + " MLP down weight tile i"
+                                             + std::to_string(it) + " c"
+                                             + std::to_string(ot) + " load",
+                                             down_w_load, deps);
+
+                ParamMap stage_down_w;
+                stage_down_w["source"] = "shared_ibuf." + down_tag + ".W_down";
+                stage_down_w["destination"] = "systolic_array." + down_tag + ".down.B";
+                stage_down_w["rows"] = static_cast<int64_t>(inter_cols);
+                stage_down_w["cols"] = static_cast<int64_t>(out_cols);
+                InstructionId down_b = b.add("dma_stage", "dma",
+                                             layer + " MLP down weight tile i"
+                                             + std::to_string(it) + " c"
+                                             + std::to_string(ot) + " stage",
+                                             stage_down_w, {down_w});
+
+                ParamMap down_gemm;
+                down_gemm["source_a"] = "systolic_array." + down_tag + ".ff.A";
+                down_gemm["source_b"] = "systolic_array." + down_tag + ".down.B";
+                down_gemm["destination"] = "shared_obuf." + down_tag + ".partial";
+                down_gemm["M"] = static_cast<int64_t>(row_count);
+                down_gemm["K"] = static_cast<int64_t>(inter_cols);
+                down_gemm["N"] = static_cast<int64_t>(out_cols);
+                InstructionId down = b.add("gemm", "systolic",
+                                           layer + " MLP down tile r" + std::to_string(rt)
+                                           + " i" + std::to_string(it)
+                                           + " c" + std::to_string(ot),
+                                           down_gemm, {ff_stage, down_b});
+
+                ParamMap acc;
+                acc["source_a"] = "shared_obuf." + out_tag + ".O_acc";
+                acc["source_b"] = "shared_obuf." + down_tag + ".partial";
+                acc["destination"] = "shared_obuf." + out_tag + ".O_acc";
+                acc["rows"] = static_cast<int64_t>(row_count);
+                acc["cols"] = static_cast<int64_t>(out_cols);
+                acc_state[ot] = b.add("accumulate", "vector_core",
+                                      layer + " MLP down accumulate tile r"
+                                      + std::to_string(rt) + " i" + std::to_string(it)
+                                      + " c" + std::to_string(ot),
+                                      acc, {acc_state[ot], down});
+            }
+        }
+
+        for (uint32_t ot = 0; ot < out_tiles; ot++) {
+            const uint32_t out_col_start = ot * cfg.linear_tile_cols;
+            const uint32_t out_cols = tile_extent(cfg.hidden_dim, cfg.linear_tile_cols, ot);
+            const std::string out_tag = row_tag + ".out.c" + std::to_string(ot);
+
+            ParamMap place;
+            place["source"] = "shared_obuf." + out_tag + ".O_acc";
+            place["destination"] = destination + ".range"
+                                 + std::to_string(row_start) + "_"
+                                 + std::to_string(row_start + row_count)
+                                 + "." + std::to_string(out_col_start) + "_"
+                                 + std::to_string(out_col_start + out_cols);
+            place["rows"] = static_cast<int64_t>(row_count);
+            place["cols"] = static_cast<int64_t>(out_cols);
+            InstructionId place_id = b.add("sram_copy", "access_core",
+                                           layer + " MLP down place tile r"
+                                           + std::to_string(rt) + " c"
+                                           + std::to_string(ot),
+                                           place, {acc_state[ot]});
+            output_tiles.push_back(place_id);
+        }
+    }
+
+    ParamMap assemble;
+    assemble["source"] = destination + ".tiles";
+    assemble["destination"] = destination;
+    assemble["rows"] = static_cast<int64_t>(rows);
+    assemble["cols"] = static_cast<int64_t>(cfg.hidden_dim);
+    assemble["tile_rows"] = static_cast<int64_t>(row_tiles);
+    assemble["tile_cols"] = static_cast<int64_t>(out_tiles);
+    return b.add("sram_copy", "access_core", layer + " MLP down assemble output",
+                 assemble, output_tiles);
 }
 
-InstructionId append_logits_softmax(Builder& b, const LlamaScheduleConfig& cfg,
-                                    const std::string& tag,
+InstructionId append_logits_softmax(Builder& b, const std::string& tag,
                                     const std::string& logits,
                                     const std::string& probs,
                                     uint32_t vocab_size,
                                     const std::vector<InstructionId>& deps) {
-    if (cfg.schedule_granularity == "coarse") {
-        ParamMap sm;
-        sm["source"] = logits;
-        sm["destination"] = probs;
-        sm["rows"] = static_cast<int64_t>(1);
-        sm["cols"] = static_cast<int64_t>(vocab_size);
-        return b.add("softmax", "vector_core", "logits softmax", sm, deps);
-    }
-
     ParamMap rowmax;
     rowmax["source"] = logits;
     rowmax["destination"] = "vector_scratch." + tag + ".logits_max";
@@ -595,8 +743,7 @@ InstructionId append_logits_softmax(Builder& b, const LlamaScheduleConfig& cfg,
     return b.add("normalize", "vector_core", "logits softmax normalize", norm, {sum_id});
 }
 
-InstructionId append_sample(Builder& b, const LlamaScheduleConfig& cfg,
-                            const std::string& source,
+InstructionId append_sample(Builder& b, const std::string& source,
                             const std::string& destination,
                             uint32_t vocab_size,
                             const std::vector<InstructionId>& deps) {
@@ -605,10 +752,6 @@ InstructionId append_sample(Builder& b, const LlamaScheduleConfig& cfg,
     sample["destination"] = destination;
     sample["rows"] = static_cast<int64_t>(1);
     sample["cols"] = static_cast<int64_t>(vocab_size);
-    if (cfg.schedule_granularity == "coarse") {
-        return b.add("sample_token", "vector_core", "sample next token from logits",
-                     sample, deps);
-    }
     return b.add("sample_top1", "vector_core", "sample next token from logits",
                  sample, deps);
 }
@@ -629,6 +772,17 @@ struct KvTileLoad {
     InstructionId read_k = 0;
     InstructionId read_v = 0;
     InstructionId transpose_k = 0;
+};
+
+struct Fa2TileState {
+    uint32_t qh = 0;
+    uint32_t qt = 0;
+    uint32_t rows = 0;
+    uint32_t q_start = 0;
+    std::string tag;
+    InstructionId last_m = 0;
+    InstructionId last_l = 0;
+    InstructionId last_o = 0;
 };
 
 KvTileLoad append_kv_tile_load(Builder& b, const LlamaScheduleConfig& cfg,
@@ -703,13 +857,13 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
         q_len, cfg.hidden_dim, cfg.num_kv_heads * cfg.head_dim, deps);
 
     InstructionId q_rope = append_rope(
-        b, cfg, l + " RoPE Q", l + "." + step + ".Q",
+        b, l + " RoPE Q", l + "." + step + ".Q",
         "shared_obuf." + l + "." + step + ".Q",
         "shared_obuf." + l + "." + step + ".Q_rope",
         q_len, cfg.head_dim, decode_step, {q_proj});
 
     InstructionId k_rope = append_rope(
-        b, cfg, l + " RoPE K", l + "." + step + ".K",
+        b, l + " RoPE K", l + "." + step + ".K",
         "shared_obuf." + l + "." + step + ".K",
         "shared_obuf." + l + "." + step + ".K_rope",
         q_len, cfg.head_dim, decode_step, {k_proj});
@@ -742,6 +896,44 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
     const uint32_t kv_tiles = ceil_div(kv_len, cfg.tile_cols);
 
     for (uint32_t kvh = 0; kvh < cfg.num_kv_heads; kvh++) {
+        std::vector<Fa2TileState> states;
+        states.reserve(static_cast<size_t>(group) * q_tiles);
+        for (uint32_t local = 0; local < group; local++) {
+            const uint32_t qh = kvh * group + local;
+            for (uint32_t qt = 0; qt < q_tiles; qt++) {
+                const uint32_t q_rows = tile_extent(q_len, cfg.tile_rows, qt);
+                const uint32_t q_start = (cfg.mode == "decode") ? decode_step : qt * cfg.tile_rows;
+                const std::string tag = l + "." + step + ".kv" + std::to_string(kvh)
+                                      + ".qh" + std::to_string(qh)
+                                      + ".qt" + std::to_string(qt);
+
+                ParamMap init_o;
+                init_o["destination"] = "shared_obuf." + tag + ".O_acc";
+                init_o["rows"] = static_cast<int64_t>(q_rows);
+                init_o["cols"] = static_cast<int64_t>(cfg.head_dim);
+                init_o["init_value"] = static_cast<int64_t>(0);
+                InstructionId init_o_id = b.add("init_fill", "access_core",
+                                                "init O " + tag, init_o, {q_rope});
+
+                ParamMap init_m;
+                init_m["destination"] = "shared_obuf." + tag + ".m";
+                init_m["length"] = static_cast<int64_t>(q_rows);
+                init_m["init_value"] = std::string("-inf");
+                InstructionId init_m_id = b.add("init_fill", "access_core",
+                                                "init m " + tag, init_m, {init_o_id});
+
+                ParamMap init_l;
+                init_l["destination"] = "shared_obuf." + tag + ".l";
+                init_l["length"] = static_cast<int64_t>(q_rows);
+                init_l["init_value"] = static_cast<int64_t>(0);
+                InstructionId init_l_id = b.add("init_fill", "access_core",
+                                                "init l " + tag, init_l, {init_m_id});
+
+                states.push_back(Fa2TileState{qh, qt, q_rows, q_start, tag,
+                                              init_m_id, init_l_id, init_o_id});
+            }
+        }
+
         std::vector<InstructionId> slot_free(cfg.kv_stage_buffers);
         for (uint32_t kt = 0; kt < kv_tiles; kt++) {
             std::vector<InstructionId> read_deps = cache_write_deps;
@@ -753,151 +945,122 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                 b, cfg, l, step, kvh, kt, kv_len, read_deps);
             std::vector<InstructionId> slot_consumers;
 
-            for (uint32_t local = 0; local < group; local++) {
-                const uint32_t qh = kvh * group + local;
-                for (uint32_t qt = 0; qt < q_tiles; qt++) {
-                    const uint32_t q_rows = tile_extent(q_len, cfg.tile_rows, qt);
-                    const uint32_t q_start = (cfg.mode == "decode") ? decode_step : qt * cfg.tile_rows;
-                    const std::string tag = kv_load.tag + ".qh" + std::to_string(qh)
-                                          + ".qt" + std::to_string(qt);
+            for (auto& state : states) {
+                const std::string tile_tag = kv_load.tag + ".qh"
+                                           + std::to_string(state.qh)
+                                           + ".qt" + std::to_string(state.qt);
+                ParamMap stq;
+                stq["source"] = "shared_obuf." + l + "." + step + ".Q_rope";
+                stq["destination"] = "systolic_array." + tile_tag + ".Q_operand";
+                stq["rows"] = static_cast<int64_t>(state.rows);
+                stq["cols"] = static_cast<int64_t>(cfg.head_dim);
+                InstructionId stage_q = b.add("dma_stage", "dma",
+                                              "stage Q " + tile_tag,
+                                              stq, {state.last_l});
 
-                    ParamMap init_o;
-                    init_o["destination"] = "shared_obuf." + tag + ".O_acc";
-                    init_o["rows"] = static_cast<int64_t>(q_rows);
-                    init_o["cols"] = static_cast<int64_t>(cfg.head_dim);
-                    init_o["init_value"] = static_cast<int64_t>(0);
-                    InstructionId init_o_id = b.add("init_fill", "access_core", "init O " + tag,
-                                                    init_o, {q_rope});
+                ParamMap qk;
+                qk["source_a"] = "systolic_array." + tile_tag + ".Q_operand";
+                qk["source_b"] = kv_load.k_t;
+                qk["destination"] = "shared_obuf." + tile_tag + ".S";
+                qk["M"] = static_cast<int64_t>(state.rows);
+                qk["K"] = static_cast<int64_t>(cfg.head_dim);
+                qk["N"] = static_cast<int64_t>(kv_load.rows);
+                InstructionId mat_qk = b.add("gemm", "systolic", "QK " + tile_tag,
+                                             qk, {stage_q, kv_load.transpose_k});
 
-                    ParamMap init_m;
-                    init_m["destination"] = "shared_obuf." + tag + ".m";
-                    init_m["length"] = static_cast<int64_t>(q_rows);
-                    init_m["init_value"] = std::string("-inf");
-                    InstructionId init_m_id = b.add("init_fill", "access_core", "init m " + tag,
-                                                    init_m, {init_o_id});
+                ParamMap scale;
+                scale["source"] = "shared_obuf." + tile_tag + ".S";
+                scale["destination"] = "shared_obuf." + tile_tag + ".S";
+                scale["rows"] = static_cast<int64_t>(state.rows);
+                scale["cols"] = static_cast<int64_t>(kv_load.rows);
+                InstructionId scale_id = b.add("scale", "vector_core", "scale " + tile_tag,
+                                               scale, {mat_qk});
 
-                    ParamMap init_l;
-                    init_l["destination"] = "shared_obuf." + tag + ".l";
-                    init_l["length"] = static_cast<int64_t>(q_rows);
-                    init_l["init_value"] = static_cast<int64_t>(0);
-                    InstructionId init_l_id = b.add("init_fill", "access_core", "init l " + tag,
-                                                    init_l, {init_m_id});
+                ParamMap mask = scale;
+                mask["row_start"] = static_cast<int64_t>(state.q_start);
+                mask["col_start"] = static_cast<int64_t>(kv_load.start);
+                InstructionId mask_id = b.add("causal_mask", "vector_core",
+                                              "causal mask " + tile_tag, mask, {scale_id});
 
-                    ParamMap stq;
-                    stq["source"] = "shared_obuf." + l + "." + step + ".Q_rope";
-                    stq["destination"] = "systolic_array.Q_operand";
-                    stq["rows"] = static_cast<int64_t>(q_rows);
-                    stq["cols"] = static_cast<int64_t>(cfg.head_dim);
-                    InstructionId stage_q = b.add("dma_stage", "dma", "stage Q " + tag,
-                                                  stq, {init_l_id});
+                ParamMap rowmax;
+                rowmax["source"] = "shared_obuf." + tile_tag + ".S";
+                rowmax["destination"] = "vector_scratch." + tile_tag + ".rowmax";
+                rowmax["rows"] = static_cast<int64_t>(state.rows);
+                rowmax["cols"] = static_cast<int64_t>(kv_load.rows);
+                InstructionId rowmax_id = b.add("rowmax", "vector_core", "rowmax " + tile_tag,
+                                                rowmax, {mask_id});
 
-                    ParamMap qk;
-                    qk["source_a"] = "systolic_array.Q_operand";
-                    qk["source_b"] = kv_load.k_t;
-                    qk["destination"] = "shared_obuf." + tag + ".S";
-                    qk["M"] = static_cast<int64_t>(q_rows);
-                    qk["K"] = static_cast<int64_t>(cfg.head_dim);
-                    qk["N"] = static_cast<int64_t>(kv_load.rows);
-                    InstructionId mat_qk = b.add("gemm", "systolic", "QK " + tag,
-                                                 qk, {stage_q, kv_load.transpose_k});
+                ParamMap upd_m;
+                upd_m["source_m_old"] = "shared_obuf." + state.tag + ".m";
+                upd_m["source_rowmax"] = "vector_scratch." + tile_tag + ".rowmax";
+                upd_m["destination_m"] = "shared_obuf." + state.tag + ".m";
+                upd_m["destination_correction"] = "shared_obuf." + state.tag + ".correction";
+                upd_m["length"] = static_cast<int64_t>(state.rows);
+                InstructionId upd_m_id = b.add("update_rowmax", "vector_core",
+                                               "update m " + tile_tag,
+                                               upd_m, {rowmax_id, state.last_m});
 
-                    ParamMap scale;
-                    scale["source"] = "shared_obuf." + tag + ".S";
-                    scale["destination"] = "shared_obuf." + tag + ".S";
-                    scale["rows"] = static_cast<int64_t>(q_rows);
-                    scale["cols"] = static_cast<int64_t>(kv_load.rows);
-                    InstructionId scale_id = b.add("scale", "vector_core", "scale " + tag,
-                                                   scale, {mat_qk});
+                ParamMap exp;
+                exp["source_matrix"] = "shared_obuf." + tile_tag + ".S";
+                exp["source_shift"] = "shared_obuf." + state.tag + ".m";
+                exp["destination"] = "shared_ibuf." + tile_tag + ".P";
+                exp["rows"] = static_cast<int64_t>(state.rows);
+                exp["cols"] = static_cast<int64_t>(kv_load.rows);
+                InstructionId exp_id = b.add("exp_shift", "vector_core", "softmax exp " + tile_tag,
+                                             exp, {upd_m_id});
 
-                    ParamMap mask = scale;
-                    mask["row_start"] = static_cast<int64_t>(q_start);
-                    mask["col_start"] = static_cast<int64_t>(kv_load.start);
-                    InstructionId mask_id = b.add("causal_mask", "vector_core",
-                                                  "causal mask " + tag, mask, {scale_id});
+                ParamMap rowsum;
+                rowsum["source_p"] = "shared_ibuf." + tile_tag + ".P";
+                rowsum["source_correction"] = "shared_obuf." + state.tag + ".correction";
+                rowsum["source_l_old"] = "shared_obuf." + state.tag + ".l";
+                rowsum["destination"] = "shared_obuf." + state.tag + ".l";
+                rowsum["rows"] = static_cast<int64_t>(state.rows);
+                rowsum["cols"] = static_cast<int64_t>(kv_load.rows);
+                InstructionId rowsum_id = b.add("update_rowsum", "vector_core",
+                                                "update l " + tile_tag,
+                                                rowsum, {exp_id, upd_m_id, state.last_l});
 
-                    ParamMap rowmax;
-                    rowmax["source"] = "shared_obuf." + tag + ".S";
-                    rowmax["destination"] = "vector_scratch." + tag + ".rowmax";
-                    rowmax["rows"] = static_cast<int64_t>(q_rows);
-                    rowmax["cols"] = static_cast<int64_t>(kv_load.rows);
-                    InstructionId rowmax_id = b.add("rowmax", "vector_core", "rowmax " + tag,
-                                                    rowmax, {mask_id});
+                ParamMap rescale;
+                rescale["source"] = "shared_obuf." + state.tag + ".O_acc";
+                rescale["source_scale"] = "shared_obuf." + state.tag + ".correction";
+                rescale["destination"] = "shared_obuf." + state.tag + ".O_acc";
+                rescale["rows"] = static_cast<int64_t>(state.rows);
+                rescale["cols"] = static_cast<int64_t>(cfg.head_dim);
+                InstructionId rescale_id = b.add("scale", "vector_core",
+                                                 "rescale O " + tile_tag,
+                                                 rescale, {upd_m_id, state.last_o});
 
-                    ParamMap upd_m;
-                    upd_m["source_m_old"] = "shared_obuf." + tag + ".m";
-                    upd_m["source_rowmax"] = "vector_scratch." + tag + ".rowmax";
-                    upd_m["destination_m"] = "shared_obuf." + tag + ".m";
-                    upd_m["destination_correction"] = "shared_obuf." + tag + ".correction";
-                    upd_m["length"] = static_cast<int64_t>(q_rows);
-                    InstructionId upd_m_id = b.add("update_rowmax", "vector_core",
-                                                   "update m " + tag, upd_m, {rowmax_id, init_m_id});
+                ParamMap stp;
+                stp["source"] = "shared_ibuf." + tile_tag + ".P";
+                stp["destination"] = "systolic_array." + tile_tag + ".P_operand";
+                stp["rows"] = static_cast<int64_t>(state.rows);
+                stp["cols"] = static_cast<int64_t>(kv_load.rows);
+                InstructionId stage_p = b.add("dma_stage", "dma", "stage P " + tile_tag,
+                                              stp, {exp_id, kv_load.read_v});
 
-                    ParamMap exp;
-                    exp["source_matrix"] = "shared_obuf." + tag + ".S";
-                    exp["source_shift"] = "shared_obuf." + tag + ".m";
-                    exp["destination"] = "shared_ibuf." + tag + ".P";
-                    exp["rows"] = static_cast<int64_t>(q_rows);
-                    exp["cols"] = static_cast<int64_t>(kv_load.rows);
-                    InstructionId exp_id = b.add("exp_shift", "vector_core", "softmax exp " + tag,
-                                                 exp, {upd_m_id});
+                ParamMap pv;
+                pv["source_a"] = "systolic_array." + tile_tag + ".P_operand";
+                pv["source_b"] = kv_load.v;
+                pv["destination"] = "shared_obuf." + tile_tag + ".Temp";
+                pv["M"] = static_cast<int64_t>(state.rows);
+                pv["K"] = static_cast<int64_t>(kv_load.rows);
+                pv["N"] = static_cast<int64_t>(cfg.head_dim);
+                InstructionId mat_pv = b.add("gemm", "systolic", "PV " + tile_tag,
+                                             pv, {stage_p, kv_load.read_v});
 
-                    ParamMap rowsum;
-                    rowsum["source_p"] = "shared_ibuf." + tag + ".P";
-                    rowsum["source_correction"] = "shared_obuf." + tag + ".correction";
-                    rowsum["source_l_old"] = "shared_obuf." + tag + ".l";
-                    rowsum["destination"] = "shared_obuf." + tag + ".l";
-                    rowsum["rows"] = static_cast<int64_t>(q_rows);
-                    rowsum["cols"] = static_cast<int64_t>(kv_load.rows);
-                    InstructionId rowsum_id = b.add("update_rowsum", "vector_core",
-                                                    "update l " + tag, rowsum, {exp_id, upd_m_id, init_l_id});
+                ParamMap acc;
+                acc["source_a"] = "shared_obuf." + state.tag + ".O_acc";
+                acc["source_b"] = "shared_obuf." + tile_tag + ".Temp";
+                acc["destination"] = "shared_obuf." + state.tag + ".O_acc";
+                acc["rows"] = static_cast<int64_t>(state.rows);
+                acc["cols"] = static_cast<int64_t>(cfg.head_dim);
+                InstructionId acc_id = b.add("accumulate", "vector_core", "accumulate O " + tile_tag,
+                                             acc, {rescale_id, mat_pv});
 
-                    ParamMap rescale;
-                    rescale["source"] = "shared_obuf." + tag + ".O_acc";
-                    rescale["source_scale"] = "shared_obuf." + tag + ".correction";
-                    rescale["destination"] = "shared_obuf." + tag + ".O_acc";
-                    rescale["rows"] = static_cast<int64_t>(q_rows);
-                    rescale["cols"] = static_cast<int64_t>(cfg.head_dim);
-                    InstructionId rescale_id = b.add("scale", "vector_core", "rescale O " + tag,
-                                                     rescale, {upd_m_id, init_o_id});
-
-                    ParamMap stp;
-                    stp["source"] = "shared_ibuf." + tag + ".P";
-                    stp["destination"] = "systolic_array.P_operand";
-                    stp["rows"] = static_cast<int64_t>(q_rows);
-                    stp["cols"] = static_cast<int64_t>(kv_load.rows);
-                    InstructionId stage_p = b.add("dma_stage", "dma", "stage P " + tag,
-                                                  stp, {exp_id, kv_load.read_v});
-
-                    ParamMap pv;
-                    pv["source_a"] = "systolic_array.P_operand";
-                    pv["source_b"] = kv_load.v;
-                    pv["destination"] = "shared_obuf." + tag + ".Temp";
-                    pv["M"] = static_cast<int64_t>(q_rows);
-                    pv["K"] = static_cast<int64_t>(kv_load.rows);
-                    pv["N"] = static_cast<int64_t>(cfg.head_dim);
-                    InstructionId mat_pv = b.add("gemm", "systolic", "PV " + tag,
-                                                 pv, {stage_p, kv_load.read_v});
-
-                    ParamMap acc;
-                    acc["source_a"] = "shared_obuf." + tag + ".O_acc";
-                    acc["source_b"] = "shared_obuf." + tag + ".Temp";
-                    acc["destination"] = "shared_obuf." + tag + ".O_acc";
-                    acc["rows"] = static_cast<int64_t>(q_rows);
-                    acc["cols"] = static_cast<int64_t>(cfg.head_dim);
-                    InstructionId acc_id = b.add("accumulate", "vector_core", "accumulate O " + tag,
-                                                 acc, {rescale_id, mat_pv});
-
-                    ParamMap norm;
-                    norm["source_matrix"] = "shared_obuf." + tag + ".O_acc";
-                    norm["source_denom"] = "shared_obuf." + tag + ".l";
-                    norm["destination"] = "shared_obuf." + tag + ".O";
-                    norm["rows"] = static_cast<int64_t>(q_rows);
-                    norm["cols"] = static_cast<int64_t>(cfg.head_dim);
-                    InstructionId out = b.add("normalize", "vector_core", "normalize " + tag,
-                                              norm, {acc_id, rowsum_id});
-                    head_outputs.push_back(out);
-                    slot_consumers.push_back(out);
-                }
+                state.last_m = upd_m_id;
+                state.last_l = rowsum_id;
+                state.last_o = acc_id;
+                slot_consumers.push_back(acc_id);
             }
             slot_free[kv_load.slot] = b.add("kv_stage_release", "access_core",
                                             "release KV stage slot"
@@ -908,10 +1071,31 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                                              {"cols", static_cast<int64_t>(cfg.head_dim)}},
                                             slot_consumers);
         }
+
+        for (auto& state : states) {
+            ParamMap norm;
+            norm["source_matrix"] = "shared_obuf." + state.tag + ".O_acc";
+            norm["source_denom"] = "shared_obuf." + state.tag + ".l";
+            norm["destination"] = "shared_obuf." + state.tag + ".O";
+            norm["rows"] = static_cast<int64_t>(state.rows);
+            norm["cols"] = static_cast<int64_t>(cfg.head_dim);
+            InstructionId out = b.add("normalize", "vector_core", "normalize " + state.tag,
+                                      norm, {state.last_o, state.last_l});
+
+            ParamMap lse;
+            lse["source_m"] = "shared_obuf." + state.tag + ".m";
+            lse["source_l"] = "shared_obuf." + state.tag + ".l";
+            lse["destination"] = "shared_obuf." + state.tag + ".L";
+            lse["length"] = static_cast<int64_t>(state.rows);
+            InstructionId logsumexp = b.add("logsumexp", "vector_core",
+                                            "logsumexp " + state.tag,
+                                            lse, {state.last_m, state.last_l, out});
+            head_outputs.push_back(logsumexp);
+        }
     }
 
     ParamMap merge;
-    merge["source"] = "shared_obuf." + l + "." + step + ".attention_tile_outputs";
+    merge["source"] = "shared_obuf." + l + "." + step + ".attention_head_tiles";
     merge["destination"] = "shared_obuf." + l + "." + step + ".attention_heads";
     merge["rows"] = static_cast<int64_t>(q_len);
     merge["cols"] = static_cast<int64_t>(cfg.num_q_heads * cfg.head_dim);
@@ -920,7 +1104,7 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
     merge["num_q_heads"] = static_cast<int64_t>(cfg.num_q_heads);
     merge["head_dim"] = static_cast<int64_t>(cfg.head_dim);
     merge["input_elements"] = static_cast<int64_t>(
-        static_cast<uint64_t>(q_len) * cfg.num_q_heads * cfg.head_dim * kv_tiles);
+        static_cast<uint64_t>(q_len) * cfg.num_q_heads * cfg.head_dim);
     merge["output_elements"] = static_cast<int64_t>(
         static_cast<uint64_t>(q_len) * cfg.num_q_heads * cfg.head_dim);
     InstructionId merge_id = b.add("attention_merge", "vector_core",
@@ -963,8 +1147,8 @@ InstructionId append_output_head(Builder& b, const LlamaScheduleConfig& cfg,
         last["rows"] = static_cast<int64_t>(1);
         last["cols"] = static_cast<int64_t>(cfg.hidden_dim);
         last["row_index"] = static_cast<int64_t>(token_count - 1);
-        cur = {b.add(cfg.schedule_granularity == "coarse" ? "select_last_token" : "gather_select",
-                     "access_core", "select final position hidden state", last, cur)};
+        cur = {b.add("gather_select", "access_core",
+                     "select final position hidden state", last, cur)};
         head_input = "shared_obuf." + tag + ".last_hidden";
     }
 
@@ -980,10 +1164,10 @@ InstructionId append_output_head(Builder& b, const LlamaScheduleConfig& cfg,
         1, cfg.hidden_dim, cfg.vocab_size, {final_norm});
 
     InstructionId softmax = append_logits_softmax(
-        b, cfg, tag, "shared_obuf." + tag + ".logits",
+        b, tag, "shared_obuf." + tag + ".logits",
         "shared_obuf." + tag + ".probs", cfg.vocab_size, {logits});
 
-    return append_sample(b, cfg, "shared_obuf." + tag + ".probs",
+    return append_sample(b, "shared_obuf." + tag + ".probs",
                          "shared_obuf." + tag + ".sampled_token",
                          cfg.vocab_size, {softmax});
 }
@@ -1028,29 +1212,11 @@ InstructionId append_layer(Builder& b, const LlamaScheduleConfig& cfg,
         "shared_obuf." + l + ".mlp_norm",
         q_len, cfg.hidden_dim, {attn_res});
 
-    InstructionId gate_id = append_staged_gemm(
-        b, cfg, l + " MLP gate", l + ".W_gate",
-        "shared_obuf." + l + ".mlp_norm", "HBM." + l + ".W_gate",
-        "shared_obuf." + l + ".gate",
-        q_len, cfg.hidden_dim, cfg.intermediate_dim, {norm2});
-
-    InstructionId up_id = append_staged_gemm(
-        b, cfg, l + " MLP up", l + ".W_up",
-        "shared_obuf." + l + ".mlp_norm", "HBM." + l + ".W_up",
-        "shared_obuf." + l + ".up",
-        q_len, cfg.hidden_dim, cfg.intermediate_dim, {norm2});
-
-    InstructionId act_id = append_swiglu(
-        b, cfg, l + " SwiGLU", l + ".swiglu",
-        "shared_obuf." + l + ".gate", "shared_obuf." + l + ".up",
-        "shared_obuf." + l + ".ff",
-        q_len, cfg.intermediate_dim, {gate_id, up_id});
-
-    InstructionId down_id = append_staged_gemm(
-        b, cfg, l + " MLP down", l + ".W_down",
-        "shared_obuf." + l + ".ff", "HBM." + l + ".W_down",
+    InstructionId down_id = append_detailed_mlp_kernel(
+        b, cfg, l,
+        "shared_obuf." + l + ".mlp_norm",
         "shared_obuf." + l + ".mlp_out",
-        q_len, cfg.intermediate_dim, cfg.hidden_dim, {act_id});
+        q_len, {norm2});
 
     ParamMap add2;
     add2["source_a"] = "shared_obuf." + l + ".attn_residual";

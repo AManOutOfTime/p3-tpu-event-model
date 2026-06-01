@@ -10,8 +10,8 @@ class Scheduler;
 
 struct DmaTransfer {
     uint64_t    bytes    = 0;
-    std::string src_buf;       // TensorStore source key (empty = no copy)
-    std::string dst_buf;       // TensorStore destination key
+    std::string src_buf;       // symbolic source key
+    std::string dst_buf;       // symbolic destination key
     bool        on_chip  = false;  // true = IBUF→array (dma_stage)
 };
 
@@ -30,8 +30,7 @@ struct DmaTransfer {
 //     Reads from on-chip SRAM, no HBM penalty.
 //     latency = ceil(bytes / sram.banking_factor)
 //
-// At OP_DONE, if src_buf and dst_buf are set in the payload, the unit copies
-// the buffer in TensorStore — this models data arriving at its destination.
+// The unit models transfer latency only. It never mutates buffer contents.
 // ---------------------------------------------------------------------------
 class DmaUnit : public Unit {
 public:
@@ -41,7 +40,7 @@ public:
             std::ostream& os    = std::cout);
 
     void set_scheduler(Scheduler* s)       { sched_ = s; }
-    void set_tensor_store(TensorStore* ts) { ts_    = ts; }
+    void set_tensor_store(TensorStore*) {}
 
     void handle(const Event& e, EventEngine& engine) override;
 
@@ -50,7 +49,6 @@ public:
 
 private:
     const ArchConfig& cfg_;
-    TensorStore*      ts_;
     Scheduler*        sched_;
     std::ostream&     os_;
 };

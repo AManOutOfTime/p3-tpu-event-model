@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <sstream>
 #include <string>
+#include <vector>
 #include "config/arch_config.h"
 #include "core/event_engine.h"
 #include "core/tensor_store.h"
@@ -9,6 +10,7 @@
 #include "schedule/op_handlers.h"
 #include "schedule/schedule.h"
 #include "schedule/scheduler.h"
+#include "schedule/tiler.h"
 #include "units/access_unit.h"
 #include "units/dma_unit.h"
 #include "units/systolic_unit.h"
@@ -56,6 +58,11 @@ bool has_cache_label(const Schedule& s, const std::string& op,
         [&](const Instruction& inst) {
             return inst.op == op && inst.label.find(text) != std::string::npos;
         });
+}
+
+bool depends_on(const Instruction& inst, InstructionId dependency) {
+    return std::find(inst.depends_on.begin(), inst.depends_on.end(), dependency)
+           != inst.depends_on.end();
 }
 
 void register_real_units(EventEngine& engine, TensorStore& ts, const ArchConfig& arch) {
@@ -124,7 +131,80 @@ TEST_CASE("attention schedule includes GQA grouped cache reads and causal mask")
     REQUIRE(has_op(s, "dma_load"));
     REQUIRE(has_op(s, "dma_store"));
     REQUIRE(count_op(s, "transpose") == 4); // num_kv_heads * kv_tiles
-    REQUIRE(count_op(s, "normalize") == 16); // kv_heads * group * q_tiles * kv_tiles
+    REQUIRE(count_op(s, "normalize") == 8); // num_q_heads * q_tiles, after all KV tiles
+    REQUIRE(count_op(s, "logsumexp") == 8);
+
+    const Instruction* init_o = find_label_op(s, "init O L0.S128.kv0.qh0.qt0", "init_fill");
+    const Instruction* init_m = find_label_op(s, "init m L0.S128.kv0.qh0.qt0", "init_fill");
+    const Instruction* init_l = find_label_op(s, "init l L0.S128.kv0.qh0.qt0", "init_fill");
+    REQUIRE(init_o != nullptr);
+    REQUIRE(init_m != nullptr);
+    REQUIRE(init_l != nullptr);
+
+    const std::vector<std::pair<std::string, std::string>> fa2_inner = {
+        {"stage Q L0.S128.kv0.tile0.qh0.qt0", "dma_stage"},
+        {"QK L0.S128.kv0.tile0.qh0.qt0", "gemm"},
+        {"scale L0.S128.kv0.tile0.qh0.qt0", "scale"},
+        {"causal mask L0.S128.kv0.tile0.qh0.qt0", "causal_mask"},
+        {"rowmax L0.S128.kv0.tile0.qh0.qt0", "rowmax"},
+        {"update m L0.S128.kv0.tile0.qh0.qt0", "update_rowmax"},
+        {"softmax exp L0.S128.kv0.tile0.qh0.qt0", "exp_shift"},
+        {"update l L0.S128.kv0.tile0.qh0.qt0", "update_rowsum"},
+        {"rescale O L0.S128.kv0.tile0.qh0.qt0", "scale"},
+        {"stage P L0.S128.kv0.tile0.qh0.qt0", "dma_stage"},
+        {"PV L0.S128.kv0.tile0.qh0.qt0", "gemm"},
+        {"accumulate O L0.S128.kv0.tile0.qh0.qt0", "accumulate"},
+    };
+
+    std::vector<const Instruction*> inner_events;
+    inner_events.reserve(fa2_inner.size());
+    for (const auto& expected : fa2_inner) {
+        const Instruction* inst = find_label_op(s, expected.first, expected.second);
+        REQUIRE(inst != nullptr);
+        inner_events.push_back(inst);
+    }
+    CHECK(depends_on(*inner_events[1], inner_events[0]->id));  // QK waits on staged Q.
+    CHECK(depends_on(*inner_events[2], inner_events[1]->id));  // scale waits on QK.
+    CHECK(depends_on(*inner_events[3], inner_events[2]->id));  // causal mask waits on scale.
+    CHECK(depends_on(*inner_events[4], inner_events[3]->id));  // rowmax waits on mask.
+    CHECK(depends_on(*inner_events[5], inner_events[4]->id));  // m update waits on rowmax.
+    CHECK(depends_on(*inner_events[5], init_m->id));
+    CHECK(depends_on(*inner_events[6], inner_events[5]->id));  // exp waits on m update.
+    CHECK(depends_on(*inner_events[7], inner_events[6]->id));  // l update waits on exp.
+    CHECK(depends_on(*inner_events[7], init_l->id));
+    CHECK(depends_on(*inner_events[8], inner_events[5]->id));  // O rescale waits on m update.
+    CHECK(depends_on(*inner_events[8], init_o->id));
+    CHECK(depends_on(*inner_events[9], inner_events[6]->id));  // stage P waits on exp.
+    CHECK(depends_on(*inner_events[10], inner_events[9]->id)); // PV waits on staged P.
+    CHECK(depends_on(*inner_events[11], inner_events[8]->id)); // accumulate waits on rescale.
+    CHECK(depends_on(*inner_events[11], inner_events[10]->id));
+
+    const Instruction* upd0 = find_label_op(s, "update m L0.S128.kv0.tile0.qh0.qt0", "update_rowmax");
+    const Instruction* upd1 = find_label_op(s, "update m L0.S128.kv0.tile1.qh0.qt0", "update_rowmax");
+    const Instruction* l0 = find_label_op(s, "update l L0.S128.kv0.tile0.qh0.qt0", "update_rowsum");
+    const Instruction* l1 = find_label_op(s, "update l L0.S128.kv0.tile1.qh0.qt0", "update_rowsum");
+    const Instruction* acc0 = find_label_op(s, "accumulate O L0.S128.kv0.tile0.qh0.qt0", "accumulate");
+    const Instruction* acc1 = find_label_op(s, "accumulate O L0.S128.kv0.tile1.qh0.qt0", "accumulate");
+    const Instruction* rescale1 = find_label_op(s, "rescale O L0.S128.kv0.tile1.qh0.qt0", "scale");
+    const Instruction* norm = find_label_op(s, "normalize L0.S128.kv0.qh0.qt0", "normalize");
+    const Instruction* lse = find_label_op(s, "logsumexp L0.S128.kv0.qh0.qt0", "logsumexp");
+    REQUIRE(upd0 != nullptr);
+    REQUIRE(upd1 != nullptr);
+    REQUIRE(l0 != nullptr);
+    REQUIRE(l1 != nullptr);
+    REQUIRE(acc0 != nullptr);
+    REQUIRE(acc1 != nullptr);
+    REQUIRE(rescale1 != nullptr);
+    REQUIRE(norm != nullptr);
+    REQUIRE(lse != nullptr);
+    CHECK(depends_on(*upd1, upd0->id));
+    CHECK(depends_on(*l1, l0->id));
+    CHECK(depends_on(*rescale1, acc0->id));
+    CHECK(depends_on(*norm, acc1->id));
+    CHECK(depends_on(*norm, l1->id));
+    CHECK(depends_on(*lse, upd1->id));
+    CHECK(depends_on(*lse, l1->id));
+    CHECK(depends_on(*lse, norm->id));
 }
 
 TEST_CASE("SRAM KV cache uses access-core copies instead of HBM DMA movement") {
@@ -256,6 +336,46 @@ TEST_CASE("detailed LLaMA schedule decomposes large linear projections into MXU 
     CHECK(pget_int(q_tile->params, "N") == 16);
 }
 
+TEST_CASE("oversized generated GEMM tiles expand through the original Tiler") {
+    LlamaScheduleConfig cfg;
+    cfg.mode = "layer";
+    cfg.seq_len = 4;
+    cfg.num_q_heads = 2;
+    cfg.num_kv_heads = 1;
+    cfg.hidden_dim = 16;
+    cfg.intermediate_dim = 32;
+    cfg.vocab_size = 64;
+    cfg.tile_rows = 2;
+    cfg.tile_cols = 2;
+    cfg.linear_tile_rows = 4;
+    cfg.linear_tile_cols = 16;
+
+    Schedule logical = build_transformer_layer_schedule(cfg);
+    REQUIRE(count_label_op(logical, "L0 Q projection tile r0 c0", "gemm") == 1);
+
+    ArchConfig arch;
+    arch.systolic.rows = 2;
+    arch.systolic.cols = 8;
+    arch.systolic.d_head = 16;
+
+    Schedule expanded = Tiler::expand_gemm_subtiles(logical, arch);
+
+    CHECK(count_label_op(expanded, "L0 Q projection tile r0 c0 / STAGE Q_sub_r",
+                         "dma_stage") == 2);
+    CHECK(count_label_op(expanded, "L0 Q projection tile r0 c0 / S[r",
+                         "gemm") == 4);
+
+    for (const Instruction& inst : expanded.instructions) {
+        if (inst.op != "gemm"
+            || inst.label.find("L0 Q projection tile r0 c0 / S[r") == std::string::npos)
+            continue;
+        CHECK(pget_int(inst.params, "M") <= 2);
+        CHECK(pget_int(inst.params, "N") <= 8);
+        CHECK(pget_int(inst.params, "K") == 16);
+        CHECK(pget_int(inst.params, "subtiled_from") >= 0);
+    }
+}
+
 TEST_CASE("detailed LLaMA schedule expands norm, RoPE, SwiGLU, logits, and sample phases") {
     LlamaScheduleConfig cfg;
     cfg.mode = "layer";
@@ -293,6 +413,67 @@ TEST_CASE("detailed LLaMA schedule expands norm, RoPE, SwiGLU, logits, and sampl
     CHECK(!has_op(s, "sample_token"));
     CHECK(has_op(s, "sample_top1"));
     CHECK(has_op(s, "gather_select"));
+}
+
+TEST_CASE("LLaMA MLP streams a tile-level SwiGLU down-projection kernel") {
+    LlamaScheduleConfig cfg;
+    cfg.mode = "layer";
+    cfg.seq_len = 2;
+    cfg.num_q_heads = 2;
+    cfg.num_kv_heads = 1;
+    cfg.hidden_dim = 16;
+    cfg.intermediate_dim = 32;
+    cfg.vocab_size = 64;
+    cfg.tile_rows = 1;
+    cfg.tile_cols = 1;
+    cfg.linear_tile_rows = 1;
+    cfg.linear_tile_cols = 16;
+
+    Schedule s = build_transformer_layer_schedule(cfg);
+
+    CHECK(count_label_op(s, "L0 MLP gate tile r", "gemm") == 4);
+    CHECK(count_label_op(s, "L0 MLP up tile r", "gemm") == 4);
+    CHECK(count_label_op(s, "L0 MLP SwiGLU SiLU tile r", "silu") == 4);
+    CHECK(count_label_op(s, "L0 MLP SwiGLU multiply tile r", "elementwise_mul") == 4);
+    CHECK(count_label_op(s, "L0 MLP down tile r", "gemm") == 4);
+    CHECK(count_label_op(s, "L0 MLP down accumulate tile r", "accumulate") == 4);
+    CHECK(find_label_op(s, "L0 MLP down assemble output", "sram_copy") != nullptr);
+    CHECK(find_label_op(s, "L0 MLP gate assemble output", "sram_copy") == nullptr);
+    CHECK(find_label_op(s, "L0 MLP up assemble output", "sram_copy") == nullptr);
+
+    const Instruction* gate = find_label_op(s, "L0 MLP gate tile r0 i0", "gemm");
+    const Instruction* up = find_label_op(s, "L0 MLP up tile r0 i0", "gemm");
+    const Instruction* silu = find_label_op(s, "L0 MLP SwiGLU SiLU tile r0 i0", "silu");
+    const Instruction* mul = find_label_op(s, "L0 MLP SwiGLU multiply tile r0 i0", "elementwise_mul");
+    const Instruction* down0 = find_label_op(s, "L0 MLP down tile r0 i0 c0", "gemm");
+    const Instruction* down1 = find_label_op(s, "L0 MLP down tile r0 i1 c0", "gemm");
+    const Instruction* acc0 = find_label_op(s, "L0 MLP down accumulate tile r0 i0 c0", "accumulate");
+    const Instruction* acc1 = find_label_op(s, "L0 MLP down accumulate tile r0 i1 c0", "accumulate");
+    REQUIRE(gate != nullptr);
+    REQUIRE(up != nullptr);
+    REQUIRE(silu != nullptr);
+    REQUIRE(mul != nullptr);
+    REQUIRE(down0 != nullptr);
+    REQUIRE(down1 != nullptr);
+    REQUIRE(acc0 != nullptr);
+    REQUIRE(acc1 != nullptr);
+
+    CHECK(pget_int(gate->params, "M") == 1);
+    CHECK(pget_int(gate->params, "K") == 16);
+    CHECK(pget_int(gate->params, "N") == 16);
+    CHECK(pget_int(up->params, "K") == 16);
+    CHECK(pget_int(up->params, "N") == 16);
+    CHECK(pget_int(down0->params, "M") == 1);
+    CHECK(pget_int(down0->params, "K") == 16);
+    CHECK(pget_int(down0->params, "N") == 16);
+    CHECK(pget_int(down1->params, "K") == 16);
+
+    CHECK(depends_on(*silu, gate->id));
+    CHECK(depends_on(*mul, silu->id));
+    CHECK(depends_on(*mul, up->id));
+    CHECK(depends_on(*acc0, down0->id));
+    CHECK(depends_on(*acc1, acc0->id));
+    CHECK(depends_on(*acc1, down1->id));
 }
 
 TEST_CASE("LLaMA schedule derives head_dim and GQA group size from model shape") {
@@ -373,6 +554,12 @@ TEST_CASE("LLaMA schedule rejects inconsistent attention dimensions") {
     cfg.gqa_group_size = 3;
     CHECK_THROWS_WITH_AS(build_attention_schedule(cfg),
                          doctest::Contains("gqa_group_size must equal num_q_heads/num_kv_heads"),
+                         std::runtime_error);
+
+    cfg.gqa_group_size = 2;
+    cfg.schedule_granularity = "coarse";
+    CHECK_THROWS_WITH_AS(build_attention_schedule(cfg),
+                         doctest::Contains("only detailed schedule generation is supported"),
                          std::runtime_error);
 }
 
@@ -684,7 +871,7 @@ TEST_CASE("full prefill/decode pipeline has diagram-level events with explicit d
     REQUIRE(pget_int(merge->params, "kv_tiles") == 2);
     REQUIRE(pget_int(merge->params, "num_q_heads") == 4);
     REQUIRE(pget_int(merge->params, "head_dim") == 8);
-    REQUIRE(pget_int(merge->params, "input_elements") == 256);
+    REQUIRE(pget_int(merge->params, "input_elements") == 128);
     REQUIRE(pget_int(merge->params, "output_elements") == 128);
 
     const Instruction* feedback = find_label(s, "feed sampled token back");
