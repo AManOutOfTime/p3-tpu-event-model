@@ -44,6 +44,7 @@ private:
 
     std::unordered_map<InstructionId, int>                        remaining_deps_;
     std::unordered_map<InstructionId, std::vector<InstructionId>> successors_;
+    std::unordered_map<InstructionId, const Instruction*>         inst_index_;  // O(1) lookup
     std::unordered_set<InstructionId>                             issued_;
     size_t done_count_ = 0;
 };
