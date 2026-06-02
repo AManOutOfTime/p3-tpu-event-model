@@ -24,6 +24,9 @@ ArchConfig parse(const YAML::Node& root) {
         try_load(s, "bidirectional", c.systolic.bidirectional);
         try_load(s, "d_head",        c.systolic.d_head);
     }
+    try_load(root, "systolic_units", c.systolic_units);
+    if (c.systolic_units == 0)
+        throw std::runtime_error("systolic_units must be > 0");
     try_load(root, "vector_cores", c.vector_cores);
     try_load(root, "access_cores", c.access_cores);
 
@@ -69,6 +72,7 @@ std::string ArchConfig::to_yaml_string() const {
             << YAML::Key << "cols"      << YAML::Value << systolic.cols
             << YAML::Key << "precision" << YAML::Value << systolic.precision
             << YAML::EndMap
+        << YAML::Key << "systolic_units" << YAML::Value << systolic_units
         << YAML::Key << "vector_cores" << YAML::Value << vector_cores
         << YAML::Key << "access_cores" << YAML::Value << access_cores
         << YAML::Key << "sram"         << YAML::BeginMap

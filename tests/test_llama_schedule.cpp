@@ -66,7 +66,10 @@ bool depends_on(const Instruction& inst, InstructionId dependency) {
 }
 
 void register_real_units(EventEngine& engine, TensorStore& ts, const ArchConfig& arch) {
-    engine.register_unit(std::make_unique<SystolicUnit>("systolic", arch.systolic, nullptr, &ts));
+    for (uint32_t i = 0; i < arch.systolic_units; i++) {
+        engine.register_unit(std::make_unique<SystolicUnit>(
+            "systolic_" + std::to_string(i), arch.systolic, nullptr, &ts));
+    }
     engine.register_unit(std::make_unique<DmaUnit>("dma_0", arch, &ts));
     engine.register_unit(std::make_unique<VectorUnit>("vector_core_0", arch.vector_core, nullptr, &ts));
     engine.register_unit(std::make_unique<VectorUnit>("vector_core_1", arch.vector_core, nullptr, &ts));
@@ -108,6 +111,38 @@ TEST_CASE("typed FA2 schedule runs through reusable builtin op handlers as timin
     Cycle final_cycle = engine.run();
     REQUIRE(sched.all_done());
     REQUIRE(final_cycle > 0);
+}
+
+TEST_CASE("multiple systolic units execute independent GEMMs in parallel") {
+    ArchConfig arch;
+    arch.systolic.rows = 4;
+    arch.systolic.cols = 4;
+    arch.systolic.d_head = 16;
+    arch.systolic.bidirectional = false;
+    arch.systolic_units = 2;
+
+    Schedule schedule;
+    schedule.instructions = {
+        Instruction{1, "gemm", "systolic",
+                    {{"M", int64_t{4}}, {"K", int64_t{16}}, {"N", int64_t{4}}},
+                    {}, "independent GEMM 0"},
+        Instruction{2, "gemm", "systolic",
+                    {{"M", int64_t{4}}, {"K", int64_t{16}}, {"N", int64_t{4}}},
+                    {}, "independent GEMM 1"},
+    };
+
+    TensorStore ts;
+    EventEngine engine(arch.clock_ghz);
+    register_real_units(engine, ts, arch);
+    OpRegistry reg;
+    register_builtin_ops(reg, arch);
+    Scheduler sched(engine, reg, schedule);
+    wire(engine, sched, ts);
+
+    sched.launch();
+    Cycle final_cycle = engine.run();
+    REQUIRE(sched.all_done());
+    REQUIRE(final_cycle == 22);
 }
 
 TEST_CASE("attention schedule includes GQA grouped cache reads and causal mask") {

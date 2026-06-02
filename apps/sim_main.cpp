@@ -72,6 +72,7 @@ int main(int argc, char** argv) {
 
     std::cout << "clock=" << arch.clock_ghz << " GHz"
               << "  systolic=" << arch.systolic.rows << "x" << arch.systolic.cols
+              << "x" << arch.systolic_units
               << " " << (arch.systolic.bidirectional ? "bidir" : "unidir")
               << "  d_head=" << arch.systolic.d_head << "\n"
               << "hbm_bw=" << arch.hbm.bandwidth_tb_s << " TB/s"
@@ -118,9 +119,10 @@ int main(int argc, char** argv) {
     // ── Build engine ─────────────────────────────────────────────────────
     EventEngine engine(arch.clock_ghz);
 
-    // Single systolic array
-    engine.register_unit(std::make_unique<SystolicUnit>("systolic",
-                          arch.systolic, nullptr, &ts));
+    // Systolic/MXU pool
+    for (uint32_t i = 0; i < arch.systolic_units; i++)
+        engine.register_unit(std::make_unique<SystolicUnit>(
+            "systolic_" + std::to_string(i), arch.systolic, nullptr, &ts));
 
     // DMA channel pool
     for (uint32_t i = 0; i < arch.dma.channels; i++)

@@ -15,6 +15,7 @@
 - Generated LLaMA schedules now support only the detailed path; `schedule_granularity: coarse` is rejected instead of generating a second schedule style.
 - Generated LLaMA MLP now streams a tile-level kernel: gate/up tiles, tile-local SiLU and multiply, partial down GEMMs, accumulated down output tiles, and final output assembly.
 - Runtime units are event/timing-only. Systolic, vector, DMA, and access units no longer compute or mutate TensorStore values at `OP_DONE`.
+- Architecture config now supports `systolic_units`; `sim_main` registers a systolic/MXU pool and existing logical `systolic` GEMMs dispatch across that pool.
 
 ## Completed
 
@@ -136,10 +137,18 @@
   - Documented `prompt_len`, `seq_len`, `generation_steps`, and `max_seq_len` semantics.
   - Clarified when `seq_len` can be omitted from a `prefill_decode`-only workload.
 
+- [x] Added configurable MXU count.
+  - Added top-level `systolic_units` to `ArchConfig`, YAML parsing, serialization, and `configs/default.yaml`.
+  - `sim_main` now registers `systolic_0..N-1`; existing GEMM instructions still target logical `systolic` and use the event-engine unit pool.
+  - Added regression coverage showing two independent GEMMs complete in parallel with `systolic_units = 2`.
+
 ## Changed Files
 
 - `README.md`
 - `apps/sim_main.cpp`
+- `configs/default.yaml`
+- `src/config/arch_config.h`
+- `src/config/arch_config.cpp`
 - `src/schedule/op_handlers.cpp`
 - `src/schedule/llama_schedule.h`
 - `src/schedule/llama_schedule.cpp`
@@ -147,6 +156,7 @@
 - `src/schedule/tiler.cpp`
 - `src/units/systolic_unit.h`
 - `src/units/systolic_unit.cpp`
+- `tests/test_config.cpp`
 - `tests/test_llama_schedule.cpp`
 - `PLAN.md`
 

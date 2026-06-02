@@ -10,6 +10,7 @@ TEST_CASE("ArchConfig has correct defaults") {
     REQUIRE(c.systolic.rows          == 128);
     REQUIRE(c.systolic.cols          == 128);
     REQUIRE(c.systolic.precision     == "BF16");
+    REQUIRE(c.systolic_units         == 1);
     REQUIRE(c.vector_cores           == 3);
     REQUIRE(c.access_cores           == 1);
     REQUIRE(c.sram.ibuf_kb           == 4096);
@@ -28,6 +29,7 @@ systolic:
   rows: 256
   cols: 256
   precision: FP8
+systolic_units: 2
 vector_cores: 4
 access_cores: 1
 sram:
@@ -46,6 +48,7 @@ dma:
     REQUIRE(c.systolic.rows          == 256);
     REQUIRE(c.systolic.cols          == 256);
     REQUIRE(c.systolic.precision     == "FP8");
+    REQUIRE(c.systolic_units         == 2);
     REQUIRE(c.vector_cores           == 4);
     REQUIRE(c.access_cores           == 1);
     REQUIRE(c.sram.ibuf_kb           == 8192);
@@ -62,6 +65,7 @@ TEST_CASE("ArchConfig round-trips through YAML serialization") {
     orig.clock_ghz          = 2.0;
     orig.systolic.rows      = 64;
     orig.systolic.precision = "FP16";
+    orig.systolic_units     = 3;
     orig.hbm.bandwidth_tb_s = 1.2;
     orig.dma.channels       = 4;
 
@@ -70,6 +74,7 @@ TEST_CASE("ArchConfig round-trips through YAML serialization") {
     REQUIRE(c.clock_ghz          == doctest::Approx(2.0));
     REQUIRE(c.systolic.rows      == 64);
     REQUIRE(c.systolic.precision == "FP16");
+    REQUIRE(c.systolic_units     == 3);
     REQUIRE(c.hbm.bandwidth_tb_s == doctest::Approx(1.2));
     REQUIRE(c.dma.channels       == 4);
 }
@@ -88,4 +93,8 @@ TEST_CASE("hbm_bytes_per_cycle is correctly derived") {
 TEST_CASE("ArchConfig rejects clock_ghz <= 0") {
     REQUIRE_THROWS_AS(ArchConfig::from_yaml_string("clock_ghz: 0.0"), std::runtime_error);
     REQUIRE_THROWS_AS(ArchConfig::from_yaml_string("clock_ghz: -1.0"), std::runtime_error);
+}
+
+TEST_CASE("ArchConfig rejects zero systolic units") {
+    REQUIRE_THROWS_AS(ArchConfig::from_yaml_string("systolic_units: 0"), std::runtime_error);
 }

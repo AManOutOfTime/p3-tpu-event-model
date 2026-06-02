@@ -10,7 +10,6 @@ Scheduler::Scheduler(EventEngine& engine, OpRegistry& registry, Schedule schedul
         remaining_deps_[inst.id] = static_cast<int>(inst.depends_on.size());
         for (auto d : inst.depends_on)
             successors_[d].push_back(inst.id);
-        inst_index_[inst.id] = &inst;  // build O(1) lookup index
     }
 }
 
@@ -42,10 +41,11 @@ UnitReservation Scheduler::reserve_unit_pool(const std::vector<UnitId>& ids,
 void Scheduler::try_issue(InstructionId id) {
     if (!issued_.insert(id).second) return;  // already issued
 
-    auto it = inst_index_.find(id);
-    if (it == inst_index_.end())
+    const Instruction* inst = nullptr;
+    for (const auto& i : sched_.instructions)
+        if (i.id == id) { inst = &i; break; }
+    if (!inst)
         throw std::runtime_error("Scheduler: instruction id not found: " + std::to_string(id));
-    const Instruction* inst = it->second;
 
     registry_.get(inst->op)(IssueCtx{engine_, *this, *inst});
 }

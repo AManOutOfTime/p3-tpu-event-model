@@ -40,6 +40,7 @@ struct AccessCoreConfig {
 struct ArchConfig {
     double           clock_ghz    = 1.0;
     SystolicConfig   systolic;
+    uint32_t         systolic_units = 1;
     uint32_t         vector_cores = 3;
     uint32_t         access_cores = 1;
     SramConfig       sram;

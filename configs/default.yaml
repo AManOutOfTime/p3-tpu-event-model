@@ -5,12 +5,13 @@
 clock_ghz: 1.0
 
 systolic:
-  rows: 128
-  cols: 128
+  rows: 256
+  cols: 256
   precision: BF16          # FP8 | FP16 | BF16 | FP32
-  bidirectional: false
+  bidirectional: true
   d_head: 128              # attention head dimension (= K streaming axis)
 
+systolic_units: 1
 vector_cores: 3
 access_cores: 1
 
