@@ -1,0 +1,4 @@
+[timing] build_llama_schedule: 15.6527s  raw_instrs=1291828
+[timing] expand_gemm_subtiles: 5.8192s  expanded_instrs=1291828
+[timing] scheduler.launch: 0.0850145s
+[timing] engine.run: 13.3376s

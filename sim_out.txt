@@ -1,0 +1,10 @@
+clock=1 GHz  systolic=256x256x1 bidir  d_head=128
+hbm_bw=2 TB/s  hbm_bpc=2000  hbm_lat=200
+vec_simd=64  exp_lat=4  access_bw=64
+
+llama_mode=prefill_decode  q_heads=32  kv_heads=8  gqa_group=4  kv_cache=on:hbm
+
+== simulation start  instructions=1291828 ==
+== simulation done  cycle=3969140345  (3.96914e+09 ns)  outstanding=0 ==
+
+Generated LLaMA schedule instructions=1291828

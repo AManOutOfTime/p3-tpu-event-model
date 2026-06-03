@@ -16,8 +16,19 @@
 #include "units/access_unit.h"
 #include <iostream>
 #include <string>
+#include <chrono>
 
 using namespace sim;
+
+static double secs_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// Discards everything written to it (used to silence per-unit trace output
+// when --no-trace is set, without touching every unit's print statements).
+struct NullBuffer : std::streambuf {
+    int overflow(int c) override { return c; }
+};
 
 static uint32_t precision_bytes(const std::string& precision) {
     if (precision == "FP8") return 1;
@@ -98,7 +109,14 @@ int main(int argc, char** argv) {
         if (llama_cfg.sram_kv_capacity_kb == 0) {
             llama_cfg.sram_kv_capacity_kb = arch.sram.ibuf_kb + arch.sram.obuf_kb;
         }
-        schedule = Tiler::expand_gemm_subtiles(build_llama_schedule(llama_cfg), arch);
+        auto _t0 = std::chrono::steady_clock::now();
+        Schedule _raw = build_llama_schedule(llama_cfg);
+        std::cerr << "[timing] build_llama_schedule: " << secs_since(_t0)
+                  << "s  raw_instrs=" << _raw.instructions.size() << "\n";
+        auto _t1 = std::chrono::steady_clock::now();
+        schedule = Tiler::expand_gemm_subtiles(_raw, arch);
+        std::cerr << "[timing] expand_gemm_subtiles: " << secs_since(_t1)
+                  << "s  expanded_instrs=" << schedule.instructions.size() << "\n";
         used_llama = true;
         std::cout << "llama_mode=" << llama_cfg.mode
                   << "  q_heads=" << llama_cfg.num_q_heads
@@ -122,25 +140,32 @@ int main(int argc, char** argv) {
     // ── Build engine ─────────────────────────────────────────────────────
     EventEngine engine(arch.clock_ghz);
 
+    // Per-unit trace output goes to std::cout only when tracing is enabled;
+    // otherwise it is discarded.  (--no-trace previously only silenced the
+    // engine event hook, leaving millions of per-unit prints on the hot path.)
+    NullBuffer    null_buf;
+    std::ostream  null_os(&null_buf);
+    std::ostream& unit_os = trace ? std::cout : null_os;
+
     // Systolic/MXU pool
     for (uint32_t i = 0; i < arch.systolic_units; i++)
         engine.register_unit(std::make_unique<SystolicUnit>(
-            "systolic_" + std::to_string(i), arch.systolic, nullptr, &ts));
+            "systolic_" + std::to_string(i), arch.systolic, nullptr, &ts, unit_os));
 
     // DMA channel pool
     for (uint32_t i = 0; i < arch.dma.channels; i++)
         engine.register_unit(std::make_unique<DmaUnit>(
-            "dma_" + std::to_string(i), arch, &ts));
+            "dma_" + std::to_string(i), arch, &ts, nullptr, unit_os));
 
     // Vector core pool
     for (uint32_t i = 0; i < arch.vector_cores; i++)
         engine.register_unit(std::make_unique<VectorUnit>(
-            "vector_core_" + std::to_string(i), arch.vector_core, nullptr, &ts));
+            "vector_core_" + std::to_string(i), arch.vector_core, nullptr, &ts, unit_os));
 
     // Access core pool
     for (uint32_t i = 0; i < arch.access_cores; i++)
         engine.register_unit(std::make_unique<AccessUnit>(
-            "access_core_" + std::to_string(i), arch.access_core, nullptr, &ts));
+            "access_core_" + std::to_string(i), arch.access_core, nullptr, &ts, unit_os));
 
     // ── Ops + scheduler ───────────────────────────────────────────────────
     OpRegistry reg;
@@ -156,8 +181,12 @@ int main(int argc, char** argv) {
     // ── Run ───────────────────────────────────────────────────────────────
     std::cout << "== simulation start  instructions="
               << schedule.instructions.size() << " ==\n";
+    auto _trun = std::chrono::steady_clock::now();
     scheduler.launch();
+    std::cerr << "[timing] scheduler.launch: " << secs_since(_trun) << "s\n";
+    auto _teng = std::chrono::steady_clock::now();
     Cycle final_cycle = engine.run();
+    std::cerr << "[timing] engine.run: " << secs_since(_teng) << "s\n";
     std::cout << "== simulation done"
               << "  cycle=" << final_cycle
               << "  (" << cycles_to_ns(final_cycle, arch.clock_ghz) << " ns)"
