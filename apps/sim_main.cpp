@@ -11,6 +11,7 @@
 #include "units/delay_unit.h"
 #include "units/systolic_unit.h"
 #include "units/dma_unit.h"
+#include "units/buffer_unit.h"
 #include "units/vector_unit.h"
 #include "units/access_unit.h"
 #include <iostream>
@@ -31,13 +32,15 @@ static void wire_units(EventEngine& engine, Scheduler& sched, TensorStore& ts) {
     for (UnitId uid = 0; uid < (UnitId)engine.num_units(); uid++) {
         Unit* u = engine.get_unit(uid);
         if (auto* x = dynamic_cast<DelayUnit*>   (u)) { x->set_scheduler(&sched); continue; }
-        if (auto* x = dynamic_cast<SystolicUnit*>(u)) { x->set_scheduler(&sched); continue; }
+        if (auto* x = dynamic_cast<SystolicUnit*>(u)) { x->set_scheduler(&sched);
+                                                         x->set_tensor_store(&ts); continue; }
         if (auto* x = dynamic_cast<DmaUnit*>     (u)) { x->set_scheduler(&sched);
                                                          x->set_tensor_store(&ts); continue; }
         if (auto* x = dynamic_cast<VectorUnit*>  (u)) { x->set_scheduler(&sched);
                                                          x->set_tensor_store(&ts); continue; }
         if (auto* x = dynamic_cast<AccessUnit*>  (u)) { x->set_scheduler(&sched);
                                                          x->set_tensor_store(&ts); continue; }
+        if (auto* x = dynamic_cast<BufferUnit*>  (u)) { x->set_scheduler(&sched); continue; }
     }
 }
 

@@ -16,6 +16,7 @@ set(SIM_CORE_SOURCES
     units/dma_unit.cpp
     units/vector_unit.cpp
     units/access_unit.cpp
+    units/buffer_unit.cpp
 )
 
 add_library(sim_core STATIC ${SIM_CORE_SOURCES})
