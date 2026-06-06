@@ -5,9 +5,15 @@
 
 namespace sim {
 
+static uint32_t stage_dtype_bytes(const std::string& precision) {
+    if (precision == "FP8")  return 1;
+    if (precision == "FP32") return 4;
+    return 2;  // BF16 / FP16
+}
+
 DmaUnit::DmaUnit(std::string name, const ArchConfig& cfg,
-                 TensorStore* ts, Scheduler* sched, std::ostream& os)
-    : Unit(std::move(name)), cfg_(cfg), ts_(ts), sched_(sched), os_(os) {}
+                 Scheduler* sched, std::ostream& os)
+    : Unit(std::move(name)), cfg_(cfg), sched_(sched), os_(os) {}
 
 // ---------------------------------------------------------------------------
 // transfer_latency  —  HBM ↔ IBUF
@@ -24,14 +30,23 @@ Cycle DmaUnit::transfer_latency(uint64_t bytes) const {
 
 // ---------------------------------------------------------------------------
 // stage_latency  —  IBUF → systolic array PE registers (on-chip)
-//   ceil(bytes / banking_factor)
-//   banking_factor parallel SRAM ports — no HBM latency penalty.
+//   ceil(elements / array_rows)   [no HBM latency penalty]
+//
+//   Staging feeds the array over its WIDE operand bus: `rows` input lanes
+//   (one per PE row) accept one column of `rows` elements per cycle. So the
+//   ingest bandwidth is `rows` elements/cycle = rows * dtype_bytes per cycle.
+//   This matches the K-cycle GEMM streaming model and is intentionally NOT
+//   bounded by the narrow SRAM banking_factor (that governs BufferUnit SRAM
+//   r/w, a separate path).
 // ---------------------------------------------------------------------------
 Cycle DmaUnit::stage_latency(uint64_t bytes) const {
-    if (bytes == 0 || cfg_.sram.banking_factor == 0) return 0;
+    const uint32_t lanes  = cfg_.systolic.rows;
+    const uint32_t dbytes = stage_dtype_bytes(cfg_.systolic.precision);
+    if (bytes == 0 || lanes == 0 || dbytes == 0) return 0;
+    const double bytes_per_cycle = static_cast<double>(lanes)
+                                 * static_cast<double>(dbytes);
     return static_cast<Cycle>(std::ceil(
-        static_cast<double>(bytes) /
-        static_cast<double>(cfg_.sram.banking_factor)));
+        static_cast<double>(bytes) / bytes_per_cycle));
 }
 
 void DmaUnit::handle(const Event& e, EventEngine& engine) {
@@ -72,20 +87,6 @@ void DmaUnit::handle(const Event& e, EventEngine& engine) {
         engine.schedule(done);
 
     } else if (e.type == EventType::OP_DONE) {
-
-        // Copy buffer in TensorStore to model data arriving at destination.
-        if (ts_) {
-            if (const auto* t = std::any_cast<DmaTransfer>(&e.payload)) {
-                if (!t->src_buf.empty() && !t->dst_buf.empty()
-                    && ts_->has(t->src_buf)) {
-                    ts_->set(t->dst_buf, ts_->get(t->src_buf));
-                    os_ << "  [" << name() << "]  "
-                        << (t->on_chip ? "STAGE_COPY" : "DMA_COPY")
-                        << "  \"" << t->src_buf
-                        << "\" → \"" << t->dst_buf << "\"\n";
-                }
-            }
-        }
 
         os_ << "  [" << name() << "]  DMA_DONE"
             << "  instr="  << e.instr

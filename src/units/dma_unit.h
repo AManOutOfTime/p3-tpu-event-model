@@ -1,6 +1,5 @@
 #pragma once
 #include "core/unit.h"
-#include "core/tensor_store.h"
 #include "config/arch_config.h"
 #include <iostream>
 #include <string>
@@ -12,20 +11,20 @@ class Scheduler;
 // ---------------------------------------------------------------------------
 // DmaTransfer — payload for dma_load / dma_store / dma_stage ops.
 //
-//   bytes    : number of bytes to transfer (determines latency)
-//   src_buf  : TensorStore key to copy FROM  (empty = no TensorStore copy)
-//   dst_buf  : TensorStore key to copy TO
-//   on_chip  : true = IBUF→array staging (no HBM latency penalty)
+//   bytes   : number of bytes to transfer (determines latency)
+//   src_buf : symbolic source buffer name (used in trace output only)
+//   dst_buf : symbolic destination buffer name
+//   on_chip : true = IBUF→array staging (no HBM latency penalty)
 //
 // Transfer latency formulas:
 //   HBM ↔ IBUF  : hbm_latency_cycles + ceil(bytes / (hbm_bw × channels))
-//   IBUF → array: ceil(bytes / banking_factor)
+//   IBUF → array: ceil(elements / array_rows)   (wide on-chip operand bus)
 // ---------------------------------------------------------------------------
 struct DmaTransfer {
-    uint64_t    bytes    = 0;
-    std::string src_buf;       // TensorStore source key (empty = no copy)
-    std::string dst_buf;       // TensorStore destination key
-    bool        on_chip  = false;  // true = IBUF→array staging
+    uint64_t    bytes   = 0;
+    std::string src_buf;
+    std::string dst_buf;
+    bool        on_chip = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -38,32 +37,26 @@ struct DmaTransfer {
 //     latency = same formula (symmetric bandwidth)
 //
 //   dma_stage   IBUF → systolic_array PE registers (on-chip)
-//     latency = ceil(bytes / sram.banking_factor)
-//
-// On OP_DONE the unit copies src_buf → dst_buf in the attached TensorStore
-// to model data arriving at destination.
+//     latency = ceil(elements / systolic.rows)   (wide operand bus, rows lanes)
 // ---------------------------------------------------------------------------
 class DmaUnit : public Unit {
 public:
     DmaUnit(std::string name, const ArchConfig& cfg,
-            TensorStore* ts    = nullptr,
-            Scheduler*   sched = nullptr,
-            std::ostream& os   = std::cout);
+            Scheduler*    sched = nullptr,
+            std::ostream& os    = std::cout);
 
-    void set_scheduler(Scheduler* s)       { sched_ = s; }
-    void set_tensor_store(TensorStore* ts) { ts_ = ts; }
+    void set_scheduler(Scheduler* s) { sched_ = s; }
 
     void handle(const Event& e, EventEngine& engine) override;
 
     // HBM ↔ IBUF latency: hbm_latency + ceil(bytes / (hbm_bw × channels))
     Cycle transfer_latency(uint64_t bytes) const;
 
-    // IBUF → array latency: ceil(bytes / banking_factor)
+    // IBUF → array latency: ceil(elements / systolic.rows) (wide operand bus)
     Cycle stage_latency(uint64_t bytes) const;
 
 private:
     const ArchConfig& cfg_;
-    TensorStore*      ts_;
     Scheduler*        sched_;
     std::ostream&     os_;
 };
