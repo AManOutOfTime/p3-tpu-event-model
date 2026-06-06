@@ -43,18 +43,20 @@ void BufferUnit::handle(const Event& e, EventEngine& engine) {
         const Cycle   eff_start = std::max(e.cycle, bank_free_at_[bank]);
         bank_free_at_[bank] = eff_start + lat;
 
-        os_ << "  [" << name() << "]  SRAM_" << (is_write ? "WRITE" : "READ")
-            << "  instr="  << e.instr
-            << "  @cycle=" << e.cycle;
-        if (from_cfg) {
-            os_ << "  bytes=" << bytes
-                << "  bank="  << static_cast<int>(bank)
-                << "  eff_start=" << eff_start
-                << "  lat=" << lat;
-        } else {
-            os_ << "  lat=" << lat;
+        if (verbose_) {
+            os_ << "  [" << name() << "]  SRAM_" << (is_write ? "WRITE" : "READ")
+                << "  instr="  << e.instr
+                << "  @cycle=" << e.cycle;
+            if (from_cfg) {
+                os_ << "  bytes=" << bytes
+                    << "  bank="  << static_cast<int>(bank)
+                    << "  eff_start=" << eff_start
+                    << "  lat=" << lat;
+            } else {
+                os_ << "  lat=" << lat;
+            }
+            os_ << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
         }
-        os_ << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
 
         Event done = e;
         done.type  = EventType::OP_DONE;
@@ -63,10 +65,11 @@ void BufferUnit::handle(const Event& e, EventEngine& engine) {
         engine.schedule(done);
 
     } else if (e.type == EventType::OP_DONE) {
-        os_ << "  [" << name() << "]  SRAM_DONE"
-            << "  instr="  << e.instr
-            << "  @cycle=" << e.cycle
-            << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
+        if (verbose_)
+            os_ << "  [" << name() << "]  SRAM_DONE"
+                << "  instr="  << e.instr
+                << "  @cycle=" << e.cycle
+                << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
         if (sched_) sched_->notify_done(e.instr);
     }
 }

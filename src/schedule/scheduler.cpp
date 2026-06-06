@@ -6,7 +6,9 @@ namespace sim {
 Scheduler::Scheduler(EventEngine& engine, OpRegistry& registry, Schedule schedule)
     : engine_(engine), registry_(registry), sched_(std::move(schedule)) {
 
+    by_id_.reserve(sched_.instructions.size());
     for (const auto& inst : sched_.instructions) {
+        by_id_[inst.id] = &inst;
         remaining_deps_[inst.id] = static_cast<int>(inst.depends_on.size());
         for (auto d : inst.depends_on)
             successors_[d].push_back(inst.id);
@@ -41,11 +43,10 @@ UnitReservation Scheduler::reserve_unit_pool(const std::vector<UnitId>& ids,
 void Scheduler::try_issue(InstructionId id) {
     if (!issued_.insert(id).second) return;  // already issued
 
-    const Instruction* inst = nullptr;
-    for (const auto& i : sched_.instructions)
-        if (i.id == id) { inst = &i; break; }
-    if (!inst)
+    auto it = by_id_.find(id);
+    if (it == by_id_.end())
         throw std::runtime_error("Scheduler: instruction id not found: " + std::to_string(id));
+    const Instruction* inst = it->second;
 
     registry_.get(inst->op)(IssueCtx{engine_, *this, *inst});
 }

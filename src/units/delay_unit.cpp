@@ -15,9 +15,10 @@ void DelayUnit::handle(const Event& e, EventEngine& engine) {
             buffer_bytes = p->buffer_bytes;
         }
 
-        os_ << "  [" << name() << "]  START  instr=" << e.instr
-            << "  @cycle=" << e.cycle << "  lat=" << lat
-            << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
+        if (verbose_)
+            os_ << "  [" << name() << "]  START  instr=" << e.instr
+                << "  @cycle=" << e.cycle << "  lat=" << lat
+                << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
 
         Event done  = e;
         done.type   = EventType::OP_DONE;
@@ -26,9 +27,10 @@ void DelayUnit::handle(const Event& e, EventEngine& engine) {
         engine.schedule(done);
 
     } else if (e.type == EventType::OP_DONE) {
-        os_ << "  [" << name() << "]  DONE   instr=" << e.instr
-            << "  @cycle=" << e.cycle
-            << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
+        if (verbose_)
+            os_ << "  [" << name() << "]  DONE   instr=" << e.instr
+                << "  @cycle=" << e.cycle
+                << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
 
         if (const auto* p = std::any_cast<DelayPayload>(&e.payload))
             engine.release_unit_buffer(e.target, p->buffer_bytes);

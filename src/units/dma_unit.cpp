@@ -58,26 +58,29 @@ void DmaUnit::handle(const Event& e, EventEngine& engine) {
             lat = t->on_chip ? stage_latency(t->bytes)
                              : transfer_latency(t->bytes);
 
-            os_ << "  [" << name() << "]  "
-                << (t->on_chip ? "STAGE_START" : "DMA_START")
-                << "  instr="  << e.instr
-                << "  @cycle=" << e.cycle
-                << "  bytes="  << t->bytes
-                << "  lat="    << lat;
-            if (!t->src_buf.empty())
-                os_ << "  " << t->src_buf << " → " << t->dst_buf;
-            os_ << (e.label.empty() ? "" : "  \"" + e.label + "\"")
-                << "\n";
+            if (verbose_) {
+                os_ << "  [" << name() << "]  "
+                    << (t->on_chip ? "STAGE_START" : "DMA_START")
+                    << "  instr="  << e.instr
+                    << "  @cycle=" << e.cycle
+                    << "  bytes="  << t->bytes
+                    << "  lat="    << lat;
+                if (!t->src_buf.empty())
+                    os_ << "  " << t->src_buf << " → " << t->dst_buf;
+                os_ << (e.label.empty() ? "" : "  \"" + e.label + "\"")
+                    << "\n";
+            }
 
         } else if (const auto* p = std::any_cast<int64_t>(&e.payload)) {
             // backward compat: op: delay
             lat = static_cast<Cycle>(*p);
-            os_ << "  [" << name() << "]  DMA_START"
-                << "  instr="  << e.instr
-                << "  @cycle=" << e.cycle
-                << "  lat="    << lat
-                << (e.label.empty() ? "" : "  \"" + e.label + "\"")
-                << "\n";
+            if (verbose_)
+                os_ << "  [" << name() << "]  DMA_START"
+                    << "  instr="  << e.instr
+                    << "  @cycle=" << e.cycle
+                    << "  lat="    << lat
+                    << (e.label.empty() ? "" : "  \"" + e.label + "\"")
+                    << "\n";
         }
 
         Event done  = e;
@@ -88,11 +91,12 @@ void DmaUnit::handle(const Event& e, EventEngine& engine) {
 
     } else if (e.type == EventType::OP_DONE) {
 
-        os_ << "  [" << name() << "]  DMA_DONE"
-            << "  instr="  << e.instr
-            << "  @cycle=" << e.cycle
-            << (e.label.empty() ? "" : "  \"" + e.label + "\"")
-            << "\n";
+        if (verbose_)
+            os_ << "  [" << name() << "]  DMA_DONE"
+                << "  instr="  << e.instr
+                << "  @cycle=" << e.cycle
+                << (e.label.empty() ? "" : "  \"" + e.label + "\"")
+                << "\n";
 
         if (sched_) sched_->notify_done(e.instr);
     }

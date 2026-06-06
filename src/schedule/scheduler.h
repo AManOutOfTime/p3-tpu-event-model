@@ -45,6 +45,11 @@ private:
     std::unordered_map<InstructionId, int>                        remaining_deps_;
     std::unordered_map<InstructionId, std::vector<InstructionId>> successors_;
     std::unordered_set<InstructionId>                             issued_;
+    // id -> instruction pointer, for O(1) lookup in try_issue (sched_ owns the
+    // instructions; the vector is never mutated after construction so the
+    // pointers stay valid). Replaces an O(N) linear scan that made dispatch
+    // O(N^2) over the whole schedule.
+    std::unordered_map<InstructionId, const Instruction*>         by_id_;
     size_t done_count_ = 0;
 };
 

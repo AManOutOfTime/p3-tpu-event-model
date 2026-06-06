@@ -1,14 +1,13 @@
 #include "units/systolic_unit.h"
 #include "core/event_engine.h"
 #include "schedule/scheduler.h"
-#include <algorithm>
 #include <cmath>
 
 namespace sim {
 
 SystolicUnit::SystolicUnit(std::string name, const SystolicConfig& cfg,
-                           Scheduler* sched, TensorStore* ts, std::ostream& os)
-    : Unit(std::move(name)), cfg_(cfg), sched_(sched), ts_(ts), os_(os) {}
+                           Scheduler* sched, std::ostream& os)
+    : Unit(std::move(name)), cfg_(cfg), sched_(sched), os_(os) {}
 
 // ---------------------------------------------------------------------------
 // fill_latency
@@ -48,69 +47,6 @@ Cycle SystolicUnit::compute_latency(uint32_t M, uint32_t K, uint32_t N) const {
     return tiles_m * tiles_n * per_tile;
 }
 
-// ---------------------------------------------------------------------------
-// do_gemm  —  tiled float GEMM matching the physical array layout.
-//
-//   C[M×N] = A[M×K] × B[K×N]    (row-major float32)
-//
-//   The outer tile loops match hardware routing: each (ti, tj) block is
-//   one physical array execution.  Inside each tile K values are streamed
-//   in, mirroring the K-cycle accumulation phase.
-//
-//   Buffer retrieval cost is already captured in compute_latency():
-//     src_a: zero (pre-staged by the preceding dma_stage instruction)
-//     src_b: the K term (one IBUF row per cycle)
-//     dst_c: pipelined write during accumulation (folded into latency)
-// ---------------------------------------------------------------------------
-void SystolicUnit::do_gemm(const GemmShape& shape) {
-    const uint32_t M = shape.M, K = shape.K, N = shape.N;
-
-    if (!ts_->has(shape.src_a) || !ts_->has(shape.src_b)) {
-        os_ << "  [" << name() << "]  GEMM_COMPUTE  SKIPPED"
-            << "  (buffers \"" << shape.src_a << "\" or \""
-            << shape.src_b << "\" not found in TensorStore)\n";
-        return;
-    }
-
-    const auto& A = ts_->get(shape.src_a);  // M×K, row-major
-    const auto& B = ts_->get(shape.src_b);  // K×N, row-major
-
-    if (A.size() < static_cast<size_t>(M) * K ||
-        B.size() < static_cast<size_t>(K) * N) {
-        os_ << "  [" << name() << "]  GEMM_COMPUTE  ERROR"
-            << "  buffer size mismatch (A=" << A.size()
-            << " need " << M * K
-            << ", B=" << B.size() << " need " << K * N << ")\n";
-        return;
-    }
-
-    std::vector<float> C(static_cast<size_t>(M) * N, 0.0f);
-
-    const uint32_t TM = cfg_.rows;
-    const uint32_t TN = cfg_.cols;
-
-    for (uint32_t ti = 0; ti < M; ti += TM) {
-        const uint32_t ib = std::min(TM, M - ti);
-        for (uint32_t tj = 0; tj < N; tj += TN) {
-            const uint32_t jb = std::min(TN, N - tj);
-            for (uint32_t k = 0; k < K; k++) {
-                for (uint32_t i = 0; i < ib; i++) {
-                    const float a = A[(ti + i) * K + k];
-                    for (uint32_t j = 0; j < jb; j++) {
-                        C[(ti + i) * N + (tj + j)] += a * B[k * N + (tj + j)];
-                    }
-                }
-            }
-        }
-    }
-
-    ts_->set(shape.dst_c, std::move(C));
-
-    os_ << "  [" << name() << "]  GEMM_COMPUTE"
-        << "  \"" << shape.src_a << "\" [" << M << "x" << K << "]"
-        << " x \"" << shape.src_b << "\" [" << K << "x" << N << "]"
-        << " → \"" << shape.dst_c << "\" [" << M << "x" << N << "]\n";
-}
 
 void SystolicUnit::handle(const Event& e, EventEngine& engine) {
 
@@ -126,18 +62,19 @@ void SystolicUnit::handle(const Event& e, EventEngine& engine) {
         const Cycle per_tile = static_cast<Cycle>(K) + fill;
         const Cycle lat      = tiles_m * tiles_n * per_tile;
 
-        os_ << "  [" << name() << "]  GEMM_START"
-            << "  instr="     << e.instr
-            << "  @cycle="    << e.cycle
-            << "  shape=["    << M << "x" << K << "x" << N << "]"
-            << "  array=["    << cfg_.rows << "x" << cfg_.cols << "]"
-            << "  mode="      << (cfg_.bidirectional ? "bidir" : "unidir")
-            << "  tiles=["    << tiles_m << "x" << tiles_n << "]"
-            << "  fill="      << fill
-            << "  per_tile="  << per_tile
-            << "  total_lat=" << lat
-            << (e.label.empty() ? "" : "  \"" + e.label + "\"")
-            << "\n";
+        if (verbose_)
+            os_ << "  [" << name() << "]  GEMM_START"
+                << "  instr="     << e.instr
+                << "  @cycle="    << e.cycle
+                << "  shape=["    << M << "x" << K << "x" << N << "]"
+                << "  array=["    << cfg_.rows << "x" << cfg_.cols << "]"
+                << "  mode="      << (cfg_.bidirectional ? "bidir" : "unidir")
+                << "  tiles=["    << tiles_m << "x" << tiles_n << "]"
+                << "  fill="      << fill
+                << "  per_tile="  << per_tile
+                << "  total_lat=" << lat
+                << (e.label.empty() ? "" : "  \"" + e.label + "\"")
+                << "\n";
 
         Event done  = e;
         done.type   = EventType::OP_DONE;
@@ -147,19 +84,12 @@ void SystolicUnit::handle(const Event& e, EventEngine& engine) {
 
     } else if (e.type == EventType::OP_DONE) {
 
-        if (ts_) {
-            if (const auto* s = std::any_cast<GemmShape>(&e.payload)) {
-                if (!s->src_a.empty() && !s->src_b.empty() && !s->dst_c.empty()) {
-                    do_gemm(*s);
-                }
-            }
-        }
-
-        os_ << "  [" << name() << "]  GEMM_DONE"
-            << "  instr="  << e.instr
-            << "  @cycle=" << e.cycle
-            << (e.label.empty() ? "" : "  \"" + e.label + "\"")
-            << "\n";
+        if (verbose_)
+            os_ << "  [" << name() << "]  GEMM_DONE"
+                << "  instr="  << e.instr
+                << "  @cycle=" << e.cycle
+                << (e.label.empty() ? "" : "  \"" + e.label + "\"")
+                << "\n";
 
         if (sched_) sched_->notify_done(e.instr);
     }

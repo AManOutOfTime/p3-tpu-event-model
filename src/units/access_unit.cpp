@@ -6,7 +6,7 @@
 namespace sim {
 
 AccessUnit::AccessUnit(std::string name, const AccessCoreConfig& cfg,
-                       Scheduler* sched, TensorStore*, std::ostream& os)
+                       Scheduler* sched, std::ostream& os)
     : Unit(std::move(name)), cfg_(cfg), sched_(sched), os_(os) {}
 
 Cycle AccessUnit::compute_latency(uint64_t elements) const {
@@ -20,17 +20,20 @@ void AccessUnit::handle(const Event& e, EventEngine& engine) {
         Cycle lat = 0;
         if (const auto* op = std::any_cast<AccessOp>(&e.payload)) {
             lat = compute_latency(op->elements);
-            os_ << "  [" << name() << "]  ACCESS_START"
-                << "  instr=" << e.instr << "  @cycle=" << e.cycle
-                << "  kind=" << op->kind << "  elems=" << op->elements
-                << "  lat=" << lat;
+            if (verbose_)
+                os_ << "  [" << name() << "]  ACCESS_START"
+                    << "  instr=" << e.instr << "  @cycle=" << e.cycle
+                    << "  kind=" << op->kind << "  elems=" << op->elements
+                    << "  lat=" << lat;
         } else if (const auto* p = std::any_cast<int64_t>(&e.payload)) {
             lat = static_cast<Cycle>(*p);
-            os_ << "  [" << name() << "]  ACCESS_START"
-                << "  instr=" << e.instr << "  @cycle=" << e.cycle
-                << "  lat=" << lat;
+            if (verbose_)
+                os_ << "  [" << name() << "]  ACCESS_START"
+                    << "  instr=" << e.instr << "  @cycle=" << e.cycle
+                    << "  lat=" << lat;
         }
-        os_ << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
+        if (verbose_)
+            os_ << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
 
         Event done = e;
         done.type  = EventType::OP_DONE;
@@ -39,9 +42,10 @@ void AccessUnit::handle(const Event& e, EventEngine& engine) {
         engine.schedule(done);
 
     } else if (e.type == EventType::OP_DONE) {
-        os_ << "  [" << name() << "]  ACCESS_DONE"
-            << "  instr=" << e.instr << "  @cycle=" << e.cycle
-            << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
+        if (verbose_)
+            os_ << "  [" << name() << "]  ACCESS_DONE"
+                << "  instr=" << e.instr << "  @cycle=" << e.cycle
+                << (e.label.empty() ? "" : "  \"" + e.label + "\"") << "\n";
 
         if (sched_) sched_->notify_done(e.instr);
     }

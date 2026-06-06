@@ -17,10 +17,19 @@ public:
     UnitId             id()   const { return id_; }
     const std::string& name() const { return name_; }
 
+    // Per-unit trace logging toggle. When false, handle() skips its per-event
+    // os_ << ... writes entirely (the formatting itself is the cost, so this
+    // must gate the work, not just redirect the stream). Timing is unaffected.
+    void set_verbose(bool v) { verbose_ = v; }
+    bool verbose() const     { return verbose_; }
+
     // Called by the engine when an event targeting this unit fires. The
     // engine's current_cycle() == event.cycle inside this call. The unit may
     // schedule new events on the engine.
     virtual void handle(const Event& e, EventEngine& engine) = 0;
+
+protected:
+    bool verbose_ = true;              // default on: preserves existing trace output
 
 private:
     friend class EventEngine;          // engine assigns id_ on registration

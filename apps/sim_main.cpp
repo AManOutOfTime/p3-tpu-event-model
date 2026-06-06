@@ -1,6 +1,5 @@
 #include "core/event_engine.h"
 #include "core/logger.h"
-#include "core/tensor_store.h"
 #include "config/arch_config.h"
 #include "schedule/schedule.h"
 #include "schedule/op_registry.h"
@@ -26,20 +25,16 @@ static uint32_t precision_bytes(const std::string& precision) {
 }
 
 // ---------------------------------------------------------------------------
-// Wire scheduler + tensor store into every unit
+// Wire scheduler into every unit
 // ---------------------------------------------------------------------------
-static void wire_units(EventEngine& engine, Scheduler& sched, TensorStore& ts) {
+static void wire_units(EventEngine& engine, Scheduler& sched) {
     for (UnitId uid = 0; uid < (UnitId)engine.num_units(); uid++) {
         Unit* u = engine.get_unit(uid);
         if (auto* x = dynamic_cast<DelayUnit*>   (u)) { x->set_scheduler(&sched); continue; }
-        if (auto* x = dynamic_cast<SystolicUnit*>(u)) { x->set_scheduler(&sched);
-                                                         x->set_tensor_store(&ts); continue; }
-        if (auto* x = dynamic_cast<DmaUnit*>     (u)) { x->set_scheduler(&sched);
-                                                         x->set_tensor_store(&ts); continue; }
-        if (auto* x = dynamic_cast<VectorUnit*>  (u)) { x->set_scheduler(&sched);
-                                                         x->set_tensor_store(&ts); continue; }
-        if (auto* x = dynamic_cast<AccessUnit*>  (u)) { x->set_scheduler(&sched);
-                                                         x->set_tensor_store(&ts); continue; }
+        if (auto* x = dynamic_cast<SystolicUnit*>(u)) { x->set_scheduler(&sched); continue; }
+        if (auto* x = dynamic_cast<DmaUnit*>     (u)) { x->set_scheduler(&sched); continue; }
+        if (auto* x = dynamic_cast<VectorUnit*>  (u)) { x->set_scheduler(&sched); continue; }
+        if (auto* x = dynamic_cast<AccessUnit*>  (u)) { x->set_scheduler(&sched); continue; }
         if (auto* x = dynamic_cast<BufferUnit*>  (u)) { x->set_scheduler(&sched); continue; }
     }
 }
@@ -86,7 +81,6 @@ int main(int argc, char** argv) {
               << "  access_bw=" << arch.access_core.bandwidth << "\n\n";
 
     // ── Schedule ───────────────────────────────────────────────────────
-    TensorStore       ts;
     Schedule          schedule;
     TileDecomposition tile_decomp;
     bool              used_tiler = false;
@@ -125,31 +119,37 @@ int main(int argc, char** argv) {
     // Systolic/MXU pool
     for (uint32_t i = 0; i < arch.systolic_units; i++)
         engine.register_unit(std::make_unique<SystolicUnit>(
-            "systolic_" + std::to_string(i), arch.systolic, nullptr, &ts));
+            "systolic_" + std::to_string(i), arch.systolic));
 
     // DMA channel pool
     for (uint32_t i = 0; i < arch.dma.channels; i++)
         engine.register_unit(std::make_unique<DmaUnit>(
-            "dma_" + std::to_string(i), arch, &ts));
+            "dma_" + std::to_string(i), arch));
 
     // Vector core pool
     for (uint32_t i = 0; i < arch.vector_cores; i++)
         engine.register_unit(std::make_unique<VectorUnit>(
-            "vector_core_" + std::to_string(i), arch.vector_core, nullptr, &ts));
+            "vector_core_" + std::to_string(i), arch.vector_core));
 
     // Access core pool
     for (uint32_t i = 0; i < arch.access_cores; i++)
         engine.register_unit(std::make_unique<AccessUnit>(
-            "access_core_" + std::to_string(i), arch.access_core, nullptr, &ts));
+            "access_core_" + std::to_string(i), arch.access_core));
 
     // ── Ops + scheduler ───────────────────────────────────────────────────
     OpRegistry reg;
     register_builtin_ops(reg, arch);
 
     Scheduler scheduler(engine, reg, schedule);
-    wire_units(engine, scheduler, ts);
+    wire_units(engine, scheduler);
 
     // ── Trace ─────────────────────────────────────────────────────────────
+    // --no-trace must silence BOTH the engine-level event log AND the
+    // per-unit OP_START/OP_DONE prints. The latter dominate wall-clock time
+    // on large schedules (formatting millions of lines), so gate them off.
+    for (UnitId uid = 0; uid < (UnitId)engine.num_units(); uid++)
+        if (Unit* u = engine.get_unit(uid)) u->set_verbose(trace);
+
     ConsoleLogger logger(engine);
     if (trace) engine.set_trace([&](const Event& e) { logger(e); });
 
