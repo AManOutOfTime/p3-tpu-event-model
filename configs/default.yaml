@@ -8,8 +8,18 @@ systolic:
   rows: 256
   cols: 256
   precision: BF16          # FP8 | FP16 | BF16 | FP32
-  bidirectional: true
+  bidirectional: false
   d_head: 128              # attention head dimension (= K streaming axis)
+  # P0.1 dataflow / GEMM latency model:
+  dataflow: weight_stationary   # weight_stationary | output_stationary
+  weight_load_cycles: 0         # per-K-block weight load; 0 => auto (= rows)
+  weight_double_buffer: true    # P1.4: hide weight-load(i+1) behind stream(i)
+
+# P1.2 SRAM-pressure / partial-sum modeling (all default off — infinite SRAM,
+# analytical in-array accumulation, single-buffered staging):
+structural_k_tiling: false      # emit explicit per-K-block GEMMs + accumulate ops
+model_sram: false               # bind IBUF+OBUF capacity; over-capacity sets spill
+stage_double_buffer: false      # S2: overlap operand staging with compute
 
 systolic_units: 1
 vector_cores: 3
@@ -24,6 +34,8 @@ sram:
 hbm:
   bandwidth_tb_s: 2.0       # H100 ~3.35 TB/s; TPUv4 ~1.2 TB/s
   latency_cycles: 200
+  pipelined: true           # P1.5: channel occupancy = bandwidth term only
+                            #       (latency overlaps adjacent transfers)
 
 dma:
   channels: 1

@@ -63,28 +63,47 @@ TileDecomposition Tiler::decompose(const WorkloadGemm& wl,
     InstructionId prev_gemm_id = 0;
     bool          has_prev_gemm = false;
 
+    // S2 (double-buffered operand staging): ping-pong two operand banks so the
+    // next Q sub-tile can be staged into the idle bank while the array still
+    // computes from the busy one. Each bank's staging only needs to wait for the
+    // GEMM that last *read* that same bank, not the immediately-previous GEMM.
+    const bool   dbuf = arch.stage_double_buffer;
+    InstructionId prev_gemm_for_bank[2] = {0, 0};
+    bool          has_gemm_for_bank[2]  = {false, false};
+
     // ── Q-stationary outer loop ─────────────────────────────────────────
     for (uint32_t i = 0; i < TM; i++) {
         const uint32_t row_start = i * SA_R;
         const uint32_t tm        = std::min(SA_R, wl.M - row_start);
+        const uint32_t bank      = dbuf ? (i & 1u) : 0u;
+        const std::string operand = dbuf
+            ? "systolic_array.Q_operand.b" + std::to_string(bank)
+            : std::string("systolic_array.Q_operand");
 
         const std::string name_a = "shared_ibuf.Q_sub_r" + std::to_string(i);
 
-        // ── STAGE: IBUF → systolic_array.Q_operand ─────────────────────
-        // Must wait for array to drain (prev GEMM) before overwriting Q_operand.
+        // ── STAGE: IBUF → systolic_array operand bank ──────────────────
+        // Single-buffer: must wait for the array to drain (prev GEMM) before
+        // overwriting the one operand register. Double-buffer (S2): only wait
+        // for the GEMM that last used THIS bank, enabling stage/compute overlap.
         Instruction stage;
         stage.id   = next_id++;
         stage.op   = "dma_stage";
         stage.unit = "dma";
-        if (has_prev_gemm)
+        if (dbuf) {
+            if (has_gemm_for_bank[bank])
+                stage.depends_on.push_back(prev_gemm_for_bank[bank]);
+        } else if (has_prev_gemm) {
             stage.depends_on.push_back(prev_gemm_id);
+        }
         stage.params["source"]      = name_a;
-        stage.params["destination"] = std::string("systolic_array.Q_operand");
+        stage.params["destination"] = operand;
         stage.params["rows"]        = static_cast<int64_t>(tm);
         stage.params["cols"]        = static_cast<int64_t>(wl.K);
         stage.label = "STAGE Q_sub_r" + std::to_string(i)
                     + " [rows " + std::to_string(row_start)
-                    + ":" + std::to_string(row_start + tm) + "]";
+                    + ":" + std::to_string(row_start + tm) + "]"
+                    + (dbuf ? " bank" + std::to_string(bank) : "");
         td.instructions.push_back(stage);
         const InstructionId stage_id = stage.id;
 
@@ -121,7 +140,7 @@ TileDecomposition Tiler::decompose(const WorkloadGemm& wl,
             gemm.params["M"]           = static_cast<int64_t>(tm);
             gemm.params["K"]           = static_cast<int64_t>(wl.K);
             gemm.params["N"]           = static_cast<int64_t>(tn);
-            gemm.params["source_a"]    = std::string("systolic_array.Q_operand");
+            gemm.params["source_a"]    = operand;
             gemm.params["source_b"]    = name_b;
             gemm.params["destination"] = name_c;
             gemm.label = "S[r" + std::to_string(i) + ",c" + std::to_string(j)
@@ -134,6 +153,9 @@ TileDecomposition Tiler::decompose(const WorkloadGemm& wl,
             prev_gemm_id  = gemm.id;
             has_prev_gemm = true;
         }
+        // S2: record this Q sub-tile's final GEMM as the last reader of its bank.
+        prev_gemm_for_bank[bank] = prev_gemm_id;
+        has_gemm_for_bank[bank]  = true;
     }
 
     return td;
@@ -142,8 +164,30 @@ TileDecomposition Tiler::decompose(const WorkloadGemm& wl,
 // ---------------------------------------------------------------------------
 // expand_gemm_subtiles
 // ---------------------------------------------------------------------------
-Schedule Tiler::expand_gemm_subtiles(const Schedule& sched,
+Schedule Tiler::expand_gemm_subtiles(Schedule sched,
                                      const ArchConfig& arch) {
+    // Fast path: nothing to expand. When no GEMM exceeds the array dimensions
+    // and structural K-tiling is off, expansion would just deep-copy every
+    // instruction into a fresh vector (doubling peak host RAM on large
+    // schedules). Detect that case and return the input unchanged (moved). The
+    // input was already validated by its builder/loader.
+    if (!arch.structural_k_tiling) {
+        bool any_needs = false;
+        for (const auto& inst : sched.instructions) {
+            if (inst.op != "gemm") continue;
+            const uint32_t M = static_cast<uint32_t>(
+                pget_int(inst.params, "M", arch.systolic.rows));
+            const uint32_t N = static_cast<uint32_t>(
+                pget_int(inst.params, "N", arch.systolic.cols));
+            if (M > arch.systolic.rows || N > arch.systolic.cols) {
+                any_needs = true;
+                break;
+            }
+        }
+        if (!any_needs)
+            return sched;
+    }
+
     Schedule expanded;
     expanded.instructions.reserve(sched.instructions.size());
 
@@ -204,8 +248,101 @@ Schedule Tiler::expand_gemm_subtiles(const Schedule& sched,
         }
     }
 
+    // P1.2: optional structural K-tiling pass (partial-sum traffic modeling).
+    if (arch.structural_k_tiling)
+        expanded = expand_k_subtiles(expanded, arch);
+
     expanded.validate();
     return expanded;
+}
+
+// ---------------------------------------------------------------------------
+// expand_k_subtiles (P1.2)
+// ---------------------------------------------------------------------------
+Schedule Tiler::expand_k_subtiles(const Schedule& sched, const ArchConfig& arch) {
+    const uint32_t SA_R = arch.systolic.rows;
+
+    Schedule out;
+    out.instructions.reserve(sched.instructions.size());
+
+    InstructionId next_id = 0;
+    for (const auto& inst : sched.instructions)
+        next_id = std::max(next_id, inst.id + 1);
+
+    std::unordered_map<InstructionId, InstructionId> terminal_by_original;
+
+    for (const auto& inst : sched.instructions) {
+        if (inst.op != "gemm") { out.instructions.push_back(inst); continue; }
+
+        const uint32_t K = static_cast<uint32_t>(
+            pget_int(inst.params, "K", arch.systolic.d_head));
+        if (K <= SA_R) { out.instructions.push_back(inst); continue; }  // one K-block
+
+        const uint32_t M = static_cast<uint32_t>(pget_int(inst.params, "M", SA_R));
+        const uint32_t N = static_cast<uint32_t>(pget_int(inst.params, "N", arch.systolic.cols));
+        const std::string sa  = pget_str(inst.params, "source_a");
+        const std::string sb  = pget_str(inst.params, "source_b");
+        const std::string dst = pget_str(inst.params, "destination");
+        const uint32_t tiles_k = (K + SA_R - 1) / SA_R;
+
+        InstructionId acc_term  = 0;     // running output / final accumulate
+        InstructionId prev_gemm = 0;
+        bool          has_prev  = false;
+
+        for (uint32_t kb = 0; kb < tiles_k; kb++) {
+            const uint32_t ks = std::min(SA_R, K - kb * SA_R);
+
+            Instruction g;
+            g.id   = next_id++;
+            g.op   = "gemm";
+            g.unit = "systolic";
+            if (kb == 0) g.depends_on = inst.depends_on;       // inherit original deps
+            if (has_prev) g.depends_on.push_back(prev_gemm);    // one array, serialize
+            g.params["M"] = static_cast<int64_t>(M);
+            g.params["K"] = static_cast<int64_t>(ks);
+            g.params["N"] = static_cast<int64_t>(N);
+            g.params["source_a"]    = sa;
+            g.params["source_b"]    = sb;
+            g.params["destination"] = (kb == 0) ? dst
+                                                : dst + ".kpart" + std::to_string(kb);
+            g.params["k_block"]     = static_cast<int64_t>(kb);
+            g.label = inst.label + " / Kblk" + std::to_string(kb);
+            const InstructionId gid = g.id;
+            out.instructions.push_back(std::move(g));
+            prev_gemm = gid;
+            has_prev  = true;
+
+            if (kb == 0) {
+                acc_term = gid;
+            } else {
+                // accumulate dst += partial   (models partial-sum OBUF traffic)
+                Instruction a;
+                a.id   = next_id++;
+                a.op   = "accumulate";
+                a.unit = "vector_core";
+                a.depends_on = {acc_term, gid};
+                a.params["source_a"]    = dst;
+                a.params["source_b"]    = dst + ".kpart" + std::to_string(kb);
+                a.params["destination"] = dst;
+                a.params["rows"] = static_cast<int64_t>(M);
+                a.params["cols"] = static_cast<int64_t>(N);
+                a.label = inst.label + " / Kacc" + std::to_string(kb);
+                acc_term = a.id;
+                out.instructions.push_back(std::move(a));
+            }
+        }
+        terminal_by_original[inst.id] = acc_term;
+    }
+
+    // Rewire any dependents of a split GEMM to its final accumulate.
+    for (auto& inst : out.instructions)
+        for (auto& dep : inst.depends_on) {
+            auto it = terminal_by_original.find(dep);
+            if (it != terminal_by_original.end())
+                dep = it->second;
+        }
+
+    return out;
 }
 
 // ---------------------------------------------------------------------------

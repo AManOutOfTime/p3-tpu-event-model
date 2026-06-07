@@ -29,15 +29,25 @@ struct LlamaScheduleConfig {
     uint32_t kv_cache_block_tokens = 0;
     uint32_t kv_stage_buffers = 2;
     bool kv_cache_enabled = false;
+    // P1.3: FA2 causal block-skip. When true, KV tiles that are entirely above
+    // the diagonal for a Q tile (all keys in the future) are skipped — not even
+    // loaded — and causal_mask ops are emitted only on diagonal-straddling
+    // tiles. Correctness-preserving (skipped blocks are fully masked to zero).
+    // Yields the ~1.7-1.8x prefill speedup reported in the FA2 paper.
+    bool causal_block_skip = true;
     std::string kv_cache_location = "sram";  // sram | hbm
     std::string kv_prefetch = "double_buffer";  // none | double_buffer
     std::string kv_cache_eviction_policy = "fail";  // fail | spill_to_hbm
 };
 
-Schedule build_attention_schedule(const LlamaScheduleConfig& cfg);
-Schedule build_transformer_layer_schedule(const LlamaScheduleConfig& cfg);
-Schedule build_prefill_decode_schedule(const LlamaScheduleConfig& cfg);
-Schedule build_llama_schedule(const LlamaScheduleConfig& cfg);
+// `minimal` drops trace-only metadata (labels + symbolic buffer-name string
+// params) from the generated instructions to cut host RAM on large schedules.
+// It is timing-neutral (the timing model reads only numeric params) and is
+// intended to be enabled when tracing is off.
+Schedule build_attention_schedule(const LlamaScheduleConfig& cfg, bool minimal = false);
+Schedule build_transformer_layer_schedule(const LlamaScheduleConfig& cfg, bool minimal = false);
+Schedule build_prefill_decode_schedule(const LlamaScheduleConfig& cfg, bool minimal = false);
+Schedule build_llama_schedule(const LlamaScheduleConfig& cfg, bool minimal = false);
 
 LlamaScheduleConfig llama_config_from_yaml_file(const std::string& path);
 LlamaScheduleConfig llama_config_from_yaml_string(const std::string& yaml);

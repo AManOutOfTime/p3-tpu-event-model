@@ -1,6 +1,6 @@
 llama:
   mode: prefill_decode
-  prompt_len: 4
+  prompt_len: 2048
   generation_steps: 1
   num_layers: 32
   num_q_heads: 32

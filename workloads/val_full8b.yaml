@@ -1,0 +1,18 @@
+# Validation: ENTIRE LLaMA-3-8B forward pass (prefill of 2048 tokens, all 32 layers)
+llama:
+  mode: layer
+  seq_len: 2048
+  prompt_len: 2048
+  num_layers: 32
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  hidden_dim: 4096
+  intermediate_dim: 14336
+  vocab_size: 128256
+  dtype_bytes: 2
+  tile_rows: 128
+  tile_cols: 128
+  linear_tile_rows: 128
+  linear_tile_cols: 128
+  causal_block_skip: true

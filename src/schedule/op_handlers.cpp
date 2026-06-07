@@ -86,10 +86,17 @@ void register_builtin_ops(OpRegistry& reg, const ArchConfig& arch) {
         xfer.bytes = (rows && cols)
             ? static_cast<uint64_t>(rows) * cols * dtype_bytes(arch.systolic.precision)
             : static_cast<uint64_t>(len) * dtype_bytes(arch.systolic.precision);
+        ctx.engine.add_hbm_bytes(xfer.bytes);   // P0.2/P1.5: off-chip traffic
         double bw = arch.hbm_bytes_per_cycle() * arch.dma.channels;
-        Cycle lat = static_cast<Cycle>(arch.hbm.latency_cycles)
-                  + static_cast<Cycle>(std::ceil(static_cast<double>(xfer.bytes) / bw));
-        auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
+        Cycle band = static_cast<Cycle>(std::ceil(static_cast<double>(xfer.bytes) / bw));
+        // P1.5: channel occupancy is the bandwidth term only when pipelined; the
+        // latency is fill that overlaps neighbouring transfers. When not
+        // pipelined, the channel is held for the full latency+bandwidth.
+        // (The DmaUnit always completes the data after latency+bandwidth.)
+        Cycle occ = arch.hbm.pipelined
+            ? band
+            : static_cast<Cycle>(arch.hbm.latency_cycles) + band;
+        auto res = ctx.scheduler.reserve_unit_pool(targets, occ);
         Event e;
         e.type = EventType::OP_START;
         e.target = res.id;
@@ -245,14 +252,29 @@ void register_builtin_ops(OpRegistry& reg, const ArchConfig& arch) {
         s.src_a = pget_str(p, "source_a");
         s.src_b = pget_str(p, "source_b");
         s.dst_c = pget_str(p, "destination");
-        if (s.M > arch.systolic.rows || s.N > arch.systolic.cols) {
-            throw std::runtime_error(
-                "gemm: oversized GEMM reached runtime; run Tiler::expand_gemm_subtiles before scheduling");
+
+        // P0.2: exact MAC count (independent of how the GEMM is tiled).
+        ctx.engine.add_macs(static_cast<uint64_t>(s.M) * s.K * s.N);
+
+        // P0.1/P1.4: weight-stationary latency (single source of truth). This
+        // fragments (K,N) and streams M analytically, so oversized dims are
+        // valid — Tiler pre-tiling is optional and additive.
+        Cycle lat = systolic_gemm_latency(arch.systolic, s.M, s.K, s.N);
+
+        // P1.2: tag the GEMM with its SRAM working set (input + weight + output
+        // tile) and a spill penalty. The set is actually acquired/released by
+        // the SystolicUnit across [OP_START, OP_DONE] — i.e. when the GEMM truly
+        // executes — so concurrency (and thus peak SRAM) reflects the hardware,
+        // not the scheduler's issue-ahead. Acquiring here would over-count.
+        if (arch.model_sram) {
+            const uint64_t db = dtype_bytes(arch.systolic.precision);
+            s.buffer_bytes =
+                (static_cast<uint64_t>(s.M) * s.K +
+                 static_cast<uint64_t>(s.K) * s.N +
+                 static_cast<uint64_t>(s.M) * s.N) * db;
+            s.spill_penalty = arch.hbm.latency_cycles;
         }
-        Cycle fill = arch.systolic.bidirectional
-            ? (arch.systolic.rows - 1 + 1) / 2 + (arch.systolic.cols - 1 + 1) / 2
-            : (arch.systolic.rows - 1) + (arch.systolic.cols - 1);
-        Cycle lat = static_cast<Cycle>(s.K) + fill;
+
         auto res = ctx.scheduler.reserve_unit_pool(targets, lat);
         Event e;
         e.type = EventType::OP_START;

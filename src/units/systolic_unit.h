@@ -1,6 +1,5 @@
 #pragma once
 #include "core/unit.h"
-#include "core/tensor_store.h"
 #include "config/arch_config.h"
 #include <iostream>
 
@@ -9,24 +8,31 @@ namespace sim {
 class Scheduler;
 
 // ---------------------------------------------------------------------------
-// GemmShape — GEMM dimensions + optional tensor buffer names.
+// GemmShape — GEMM dimensions passed as event payload.
 //
-//   M, K, N       : matrix dimensions  C[M×N] = A[M×K] × B[K×N]
-//   src_a, src_b  : names of A and B buffers in a TensorStore
-//   dst_c         : name of the output C buffer
-//
-//   If src_a / src_b / dst_c are non-empty AND a TensorStore is attached to
-//   the SystolicUnit, the unit will compute actual float values (C = A×B) on
-//   OP_DONE, in addition to modelling the cycle-accurate latency.
-//
-//   If the names are empty (default), the unit is timing-only.
+//   M, K, N : matrix dimensions  C[M×N] = A[M×K] × B[K×N]
+//   src_a, src_b, dst_c : symbolic buffer names (used in labels only)
 // ---------------------------------------------------------------------------
 struct GemmShape {
     uint32_t    M = 0, K = 0, N = 0;
-    std::string src_a;    // TensorStore key for A [M×K]  (empty = timing-only)
-    std::string src_b;    // TensorStore key for B [K×N]
-    std::string dst_c;    // TensorStore key for C [M×N]
+    std::string src_a;
+    std::string src_b;
+    std::string dst_c;
+    uint64_t    buffer_bytes  = 0;  // P1.2: SRAM working set held during the GEMM
+    uint32_t    spill_penalty = 0;  // P1.2: cycles added if the set overflows SRAM
 };
+
+// ---------------------------------------------------------------------------
+// Shared GEMM latency model (single source of truth — used by both SystolicUnit
+// and the `gemm` op handler so the OP_DONE timing and the reservation duration
+// can never desync).
+//
+//   systolic_fill_latency : pipeline fill/drain ((r-1)+(c-1), halved if bidir)
+//   systolic_gemm_latency : full per-GEMM latency for the configured dataflow
+// ---------------------------------------------------------------------------
+Cycle systolic_fill_latency(const SystolicConfig& cfg);
+Cycle systolic_gemm_latency(const SystolicConfig& cfg,
+                            uint32_t M, uint32_t K, uint32_t N);
 
 // ---------------------------------------------------------------------------
 // SystolicUnit  —  2-D systolic array model (unidirectional OR bidirectional).
@@ -62,17 +68,15 @@ struct GemmShape {
 //
 // ── EVENT PROTOCOL ───────────────────────────────────────────────────────
 //   OP_START → decode GemmShape → compute_latency → schedule OP_DONE
-//   OP_DONE  → optional do_gemm → scheduler.notify_done(instr)
+//   OP_DONE  → scheduler.notify_done(instr)
 // ---------------------------------------------------------------------------
 class SystolicUnit : public Unit {
 public:
     SystolicUnit(std::string name, const SystolicConfig& cfg,
                  Scheduler*    sched = nullptr,
-                 TensorStore*  ts    = nullptr,
                  std::ostream& os    = std::cout);
 
-    void set_scheduler(Scheduler* s)       { sched_ = s; }
-    void set_tensor_store(TensorStore* ts) { ts_ = ts; }
+    void set_scheduler(Scheduler* s) { sched_ = s; }
 
     void handle(const Event& e, EventEngine& engine) override;
 
@@ -82,12 +86,8 @@ public:
     const SystolicConfig& config() const { return cfg_; }
 
 private:
-    // Blocked float GEMM: C[M×N] = A[M×K] × B[K×N].  Reads/writes ts_.
-    void do_gemm(const GemmShape& shape);
-
     SystolicConfig cfg_;
     Scheduler*     sched_;
-    TensorStore*   ts_;
     std::ostream&  os_;
 };
 

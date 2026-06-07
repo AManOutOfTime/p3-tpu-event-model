@@ -13,7 +13,10 @@
 #include "units/buffer_unit.h"
 #include "units/vector_unit.h"
 #include "units/access_unit.h"
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <map>
 #include <string>
 
 using namespace sim;
@@ -81,18 +84,23 @@ int main(int argc, char** argv) {
               << "  access_bw=" << arch.access_core.bandwidth << "\n\n";
 
     // ── Schedule ───────────────────────────────────────────────────────
-    Schedule          schedule;
-    TileDecomposition tile_decomp;
-    bool              used_tiler = false;
-    bool              used_llama = false;
+    Schedule            schedule;
+    TileDecomposition   tile_decomp;
+    LlamaScheduleConfig llama_cfg;
+    bool                used_tiler = false;
+    bool                used_llama = false;
 
     if (!llama_path.empty()) {
-        LlamaScheduleConfig llama_cfg = llama_config_from_yaml_file(llama_path);
+        llama_cfg = llama_config_from_yaml_file(llama_path);
         llama_cfg.dtype_bytes = precision_bytes(arch.systolic.precision);
         if (llama_cfg.sram_kv_capacity_kb == 0) {
             llama_cfg.sram_kv_capacity_kb = arch.sram.ibuf_kb + arch.sram.obuf_kb;
         }
-        schedule = Tiler::expand_gemm_subtiles(build_llama_schedule(llama_cfg), arch);
+        // Build in "minimal" metadata mode when tracing is off — drops
+        // trace-only labels/buffer-name strings to cut host RAM on large
+        // schedules (timing-neutral; the timing model reads only numeric params).
+        schedule = Tiler::expand_gemm_subtiles(
+            build_llama_schedule(llama_cfg, /*minimal=*/!trace), arch);
         used_llama = true;
         std::cout << "llama_mode=" << llama_cfg.mode
                   << "  q_heads=" << llama_cfg.num_q_heads
@@ -110,11 +118,16 @@ int main(int argc, char** argv) {
     } else {
         // --schedule: hand-written YAML
         schedule = Schedule::from_yaml_file(sched_path);
-        schedule = Tiler::expand_gemm_subtiles(schedule, arch);
+        schedule = Tiler::expand_gemm_subtiles(std::move(schedule), arch);
     }
 
     // ── Build engine ─────────────────────────────────────────────────────
     EventEngine engine(arch.clock_ghz);
+
+    // P1.2: bind shared IBUF+OBUF capacity so over-capacity working sets spill.
+    if (arch.model_sram)
+        engine.set_sram_capacity(
+            static_cast<uint64_t>(arch.sram.ibuf_kb + arch.sram.obuf_kb) * 1024);
 
     // Systolic/MXU pool
     for (uint32_t i = 0; i < arch.systolic_units; i++)
@@ -140,7 +153,11 @@ int main(int argc, char** argv) {
     OpRegistry reg;
     register_builtin_ops(reg, arch);
 
-    Scheduler scheduler(engine, reg, schedule);
+    // Move the (potentially multi-million-instruction) schedule into the
+    // Scheduler instead of copying it — the local `schedule` is not needed
+    // afterward except for its size, which we capture first.
+    const size_t n_instructions = schedule.instructions.size();
+    Scheduler scheduler(engine, reg, std::move(schedule));
     wire_units(engine, scheduler);
 
     // ── Trace ─────────────────────────────────────────────────────────────
@@ -155,13 +172,79 @@ int main(int argc, char** argv) {
 
     // ── Run ───────────────────────────────────────────────────────────────
     std::cout << "== simulation start  instructions="
-              << schedule.instructions.size() << " ==\n";
+              << n_instructions << " ==\n";
     scheduler.launch();
     Cycle final_cycle = engine.run();
     std::cout << "== simulation done"
               << "  cycle=" << final_cycle
               << "  (" << cycles_to_ns(final_cycle, arch.clock_ghz) << " ns)"
               << "  outstanding=" << scheduler.outstanding() << " ==\n";
+
+    // ── Metrics (P0.2) ─────────────────────────────────────────────────────
+    {
+        const double clk_hz = arch.clock_ghz * 1e9;
+        const double sec    = (final_cycle > 0) ? final_cycle / clk_hz : 0.0;
+
+        std::cout << "\n== metrics ==\n";
+
+        // Per-pool utilization (group physical units by logical name prefix).
+        std::map<std::string, std::pair<uint64_t, uint64_t>> pool;  // -> (busy, count)
+        for (UnitId uid = 0; uid < (UnitId)engine.num_units(); uid++) {
+            Unit* u = engine.get_unit(uid);
+            if (!u) continue;
+            const std::string& n = u->name();
+            auto pos = n.rfind('_');
+            std::string pre = (pos == std::string::npos) ? n : n.substr(0, pos);
+            pool[pre].first  += engine.unit_busy_cycles(uid);
+            pool[pre].second += 1;
+        }
+        for (const auto& kv : pool) {
+            const uint64_t busy = kv.second.first;
+            const uint64_t cnt  = kv.second.second;
+            const double util = (final_cycle > 0 && cnt > 0)
+                ? 100.0 * static_cast<double>(busy) / (static_cast<double>(final_cycle) * cnt)
+                : 0.0;
+            std::cout << "  " << kv.first << " x" << cnt
+                      << "   busy=" << busy
+                      << "   util=" << util << "%\n";
+        }
+
+        // Roofline.
+        const uint64_t macs      = engine.total_macs();
+        const uint64_t hbm_bytes = engine.total_hbm_bytes();
+        const double peak_macs_cyc =
+            static_cast<double>(arch.systolic.rows) * arch.systolic.cols * arch.systolic_units;
+        const double hbm_bpc = arch.hbm_bytes_per_cycle() * arch.dma.channels;
+        const double compute_cyc = peak_macs_cyc > 0 ? std::ceil(macs / peak_macs_cyc) : 0.0;
+        const double mem_cyc     = hbm_bpc > 0 ? std::ceil(hbm_bytes / hbm_bpc) : 0.0;
+        const double bound       = std::max(compute_cyc, mem_cyc);
+        std::cout << "  MACs=" << macs << "   HBM_bytes=" << hbm_bytes << "\n";
+        std::cout << "  roofline: compute=" << compute_cyc << "cyc"
+                  << "  memory=" << mem_cyc << "cyc"
+                  << "  bound=" << bound
+                  << " (" << (compute_cyc >= mem_cyc ? "compute" : "memory") << "-bound)\n";
+        if (final_cycle > 0)
+            std::cout << "  roofline_efficiency="
+                      << (100.0 * bound / static_cast<double>(final_cycle)) << "%\n";
+
+        // SRAM pressure (P1.2).
+        if (arch.model_sram)
+            std::cout << "  sram: capacity=" << engine.sram_capacity()
+                      << "B  peak=" << engine.sram_peak()
+                      << "B  spills=" << engine.sram_spills() << "\n";
+
+        // Throughput (LLaMA workloads only — we know the token count there).
+        if (used_llama) {
+            uint64_t tokens = 0;
+            if      (llama_cfg.mode == "decode")  tokens = llama_cfg.generation_steps;
+            else if (llama_cfg.mode == "prefill") tokens = llama_cfg.prompt_len;
+            else                                  tokens = llama_cfg.seq_len;
+            std::cout << "  TTFT=" << cycles_to_ns(final_cycle, arch.clock_ghz) << " ns\n";
+            if (tokens > 0 && sec > 0)
+                std::cout << "  throughput=" << (tokens / sec) << " tok/s"
+                          << "  (" << tokens << " tokens)\n";
+        }
+    }
 
     // ── Output ────────────────────────────────────────────────────────
     if (used_tiler) {
@@ -171,9 +254,9 @@ int main(int argc, char** argv) {
                   << tile_decomp.tiles.size() << " array execution(s)\n";
     } else if (used_llama) {
         std::cout << "\nGenerated LLaMA schedule instructions="
-                  << schedule.instructions.size() << "\n";
+                  << n_instructions << "\n";
     } else {
-        std::cout << "\nSchedule instructions=" << schedule.instructions.size() << "\n";
+        std::cout << "\nSchedule instructions=" << n_instructions << "\n";
     }
 
     return scheduler.all_done() ? 0 : 1;

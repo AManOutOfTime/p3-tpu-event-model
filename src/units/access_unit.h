@@ -1,6 +1,5 @@
 #pragma once
 #include "core/unit.h"
-#include "core/tensor_store.h"
 #include "config/arch_config.h"
 #include <iostream>
 #include <string>
@@ -39,11 +38,9 @@ class AccessUnit : public Unit {
 public:
     AccessUnit(std::string name, const AccessCoreConfig& cfg,
                Scheduler*    sched = nullptr,
-               TensorStore*  ts    = nullptr,
                std::ostream& os    = std::cout);
 
-    void set_scheduler(Scheduler* s)       { sched_ = s; }
-    void set_tensor_store(TensorStore*) {}
+    void set_scheduler(Scheduler* s) { sched_ = s; }
 
     void  handle(const Event& e, EventEngine& engine) override;
     Cycle compute_latency(uint64_t elements) const;

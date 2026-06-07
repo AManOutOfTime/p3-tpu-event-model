@@ -23,7 +23,13 @@ ArchConfig parse(const YAML::Node& root) {
         try_load(s, "precision",     c.systolic.precision);
         try_load(s, "bidirectional", c.systolic.bidirectional);
         try_load(s, "d_head",        c.systolic.d_head);
+        try_load(s, "dataflow",             c.systolic.dataflow);
+        try_load(s, "weight_load_cycles",   c.systolic.weight_load_cycles);
+        try_load(s, "weight_double_buffer", c.systolic.weight_double_buffer);
     }
+    try_load(root, "structural_k_tiling", c.structural_k_tiling);
+    try_load(root, "model_sram",          c.model_sram);
+    try_load(root, "stage_double_buffer", c.stage_double_buffer);
     try_load(root, "systolic_units", c.systolic_units);
     if (c.systolic_units == 0)
         throw std::runtime_error("systolic_units must be > 0");
@@ -39,6 +45,7 @@ ArchConfig parse(const YAML::Node& root) {
     if (auto s = root["hbm"]) {
         try_load(s, "bandwidth_tb_s", c.hbm.bandwidth_tb_s);
         try_load(s, "latency_cycles", c.hbm.latency_cycles);
+        try_load(s, "pipelined",      c.hbm.pipelined);
     }
     if (auto s = root["dma"]) {
         try_load(s, "channels", c.dma.channels);
@@ -71,7 +78,15 @@ std::string ArchConfig::to_yaml_string() const {
             << YAML::Key << "rows"      << YAML::Value << systolic.rows
             << YAML::Key << "cols"      << YAML::Value << systolic.cols
             << YAML::Key << "precision" << YAML::Value << systolic.precision
+            << YAML::Key << "bidirectional"       << YAML::Value << systolic.bidirectional
+            << YAML::Key << "d_head"              << YAML::Value << systolic.d_head
+            << YAML::Key << "dataflow"            << YAML::Value << systolic.dataflow
+            << YAML::Key << "weight_load_cycles"  << YAML::Value << systolic.weight_load_cycles
+            << YAML::Key << "weight_double_buffer"<< YAML::Value << systolic.weight_double_buffer
             << YAML::EndMap
+        << YAML::Key << "structural_k_tiling" << YAML::Value << structural_k_tiling
+        << YAML::Key << "model_sram"          << YAML::Value << model_sram
+        << YAML::Key << "stage_double_buffer" << YAML::Value << stage_double_buffer
         << YAML::Key << "systolic_units" << YAML::Value << systolic_units
         << YAML::Key << "vector_cores" << YAML::Value << vector_cores
         << YAML::Key << "access_cores" << YAML::Value << access_cores
@@ -84,6 +99,7 @@ std::string ArchConfig::to_yaml_string() const {
         << YAML::Key << "hbm"          << YAML::BeginMap
             << YAML::Key << "bandwidth_tb_s" << YAML::Value << hbm.bandwidth_tb_s
             << YAML::Key << "latency_cycles" << YAML::Value << hbm.latency_cycles
+            << YAML::Key << "pipelined"      << YAML::Value << hbm.pipelined
             << YAML::EndMap
         << YAML::Key << "dma"          << YAML::BeginMap
             << YAML::Key << "channels" << YAML::Value << dma.channels

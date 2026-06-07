@@ -2,6 +2,7 @@
 #include <yaml-cpp/yaml.h>
 #include <algorithm>
 #include <stdexcept>
+#include <variant>
 
 namespace sim {
 namespace {
@@ -9,6 +10,14 @@ namespace {
 struct Builder {
     std::vector<Instruction> out;
     InstructionId next = 0;
+    // When set, trace-only metadata is dropped to slash host RAM on huge
+    // schedules: the human-readable label and the symbolic buffer-name string
+    // params (source/destination/source_a/...). The timing model reads only
+    // numeric params (M/K/N/rows/cols/length/...) — the LLaMA builder always
+    // stores those as int64, so dropping string params is timing-neutral. Only
+    // enabled when tracing is off (the strings exist purely for the trace log
+    // and the currently-dead numerical data path).
+    bool minimal = false;
 
     InstructionId add(std::string op, std::string unit, std::string label,
                       ParamMap params = {}, std::vector<InstructionId> deps = {}) {
@@ -16,8 +25,17 @@ struct Builder {
         inst.id = next++;
         inst.op = std::move(op);
         inst.unit = std::move(unit);
-        inst.label = std::move(label);
-        inst.params = std::move(params);
+        if (minimal) {
+            // Keep numeric params plus init_value (a fill semantic that can be
+            // stored as the string "-inf"); drop buffer-name strings + label.
+            for (auto& kv : params)
+                if (!std::holds_alternative<std::string>(kv.second)
+                    || kv.first == "init_value")
+                    inst.params[kv.first] = std::move(kv.second);
+        } else {
+            inst.label = std::move(label);
+            inst.params = std::move(params);
+        }
         inst.depends_on = std::move(deps);
         out.push_back(std::move(inst));
         return out.back().id;
@@ -936,6 +954,21 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
 
         std::vector<InstructionId> slot_free(cfg.kv_stage_buffers);
         for (uint32_t kt = 0; kt < kv_tiles; kt++) {
+            // P1.3: FA2 causal block-skip. KV tile kt covers absolute key
+            // positions [kv_first, kv_last]. It is fully above the diagonal for
+            // a Q tile when kv_first > q_last (every key is in the future).
+            const uint32_t kv_first = kt * cfg.tile_cols;
+            const uint32_t kv_rows  = tile_extent(kv_len, cfg.tile_cols, kt);
+            const uint32_t kv_last  = kv_first + (kv_rows ? kv_rows - 1 : 0);
+            if (cfg.causal_block_skip) {
+                bool any_needed = false;
+                for (const auto& state : states) {
+                    const uint32_t q_last = state.q_start + state.rows - 1;
+                    if (kv_first <= q_last) { any_needed = true; break; }
+                }
+                if (!any_needed) continue;   // whole KV tile is in the future
+            }
+
             std::vector<InstructionId> read_deps = cache_write_deps;
             const uint32_t slot = cfg.kv_prefetch == "double_buffer"
                 ? kt % cfg.kv_stage_buffers
@@ -946,6 +979,16 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
             std::vector<InstructionId> slot_consumers;
 
             for (auto& state : states) {
+                // P1.3: per (q-tile, kv-tile) causal skip + conditional mask.
+                const uint32_t q_first = state.q_start;
+                const uint32_t q_last  = state.q_start + state.rows - 1;
+                if (cfg.causal_block_skip && kv_first > q_last)
+                    continue;                         // this block is all future
+                // Masking is only needed where the tile straddles the diagonal
+                // (some keys ahead of some queries). Fully-below-diagonal tiles
+                // (kv_last <= q_first) need no mask.
+                const bool need_mask = !cfg.causal_block_skip || (kv_last > q_first);
+
                 const std::string tile_tag = kv_load.tag + ".qh"
                                            + std::to_string(state.qh)
                                            + ".qt" + std::to_string(state.qt);
@@ -976,11 +1019,14 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                 InstructionId scale_id = b.add("scale", "vector_core", "scale " + tile_tag,
                                                scale, {mat_qk});
 
-                ParamMap mask = scale;
-                mask["row_start"] = static_cast<int64_t>(state.q_start);
-                mask["col_start"] = static_cast<int64_t>(kv_load.start);
-                InstructionId mask_id = b.add("causal_mask", "vector_core",
-                                              "causal mask " + tile_tag, mask, {scale_id});
+                InstructionId pre_rowmax = scale_id;
+                if (need_mask) {
+                    ParamMap mask = scale;
+                    mask["row_start"] = static_cast<int64_t>(state.q_start);
+                    mask["col_start"] = static_cast<int64_t>(kv_load.start);
+                    pre_rowmax = b.add("causal_mask", "vector_core",
+                                       "causal mask " + tile_tag, mask, {scale_id});
+                }
 
                 ParamMap rowmax;
                 rowmax["source"] = "shared_obuf." + tile_tag + ".S";
@@ -988,7 +1034,7 @@ AttentionIds append_attention(Builder& b, const LlamaScheduleConfig& cfg,
                 rowmax["rows"] = static_cast<int64_t>(state.rows);
                 rowmax["cols"] = static_cast<int64_t>(kv_load.rows);
                 InstructionId rowmax_id = b.add("rowmax", "vector_core", "rowmax " + tile_tag,
-                                                rowmax, {mask_id});
+                                                rowmax, {pre_rowmax});
 
                 ParamMap upd_m;
                 upd_m["source_m_old"] = "shared_obuf." + state.tag + ".m";
@@ -1253,9 +1299,10 @@ Schedule finish(Builder& b) {
 
 }  // namespace
 
-Schedule build_attention_schedule(const LlamaScheduleConfig& input_cfg) {
+Schedule build_attention_schedule(const LlamaScheduleConfig& input_cfg, bool minimal) {
     const LlamaScheduleConfig cfg = normalize_cfg(input_cfg);
     Builder b;
+    b.minimal = minimal;
     const uint32_t q_len = cfg.mode == "decode" ? 1
                          : (cfg.mode == "prefill" ? cfg.prompt_len : cfg.seq_len);
     const uint32_t kv_len = cfg.mode == "decode" ? cfg.prompt_len + 1 : q_len;
@@ -1263,9 +1310,10 @@ Schedule build_attention_schedule(const LlamaScheduleConfig& input_cfg) {
     return finish(b);
 }
 
-Schedule build_transformer_layer_schedule(const LlamaScheduleConfig& input_cfg) {
+Schedule build_transformer_layer_schedule(const LlamaScheduleConfig& input_cfg, bool minimal) {
     const LlamaScheduleConfig cfg = normalize_cfg(input_cfg);
     Builder b;
+    b.minimal = minimal;
     const uint32_t q_len = cfg.mode == "decode" ? 1
                          : (cfg.mode == "prefill" ? cfg.prompt_len : cfg.seq_len);
     const uint32_t kv_len = cfg.mode == "decode" ? cfg.prompt_len + 1 : q_len;
@@ -1282,9 +1330,10 @@ Schedule build_transformer_layer_schedule(const LlamaScheduleConfig& input_cfg) 
     return finish(b);
 }
 
-Schedule build_prefill_decode_schedule(const LlamaScheduleConfig& input_cfg) {
+Schedule build_prefill_decode_schedule(const LlamaScheduleConfig& input_cfg, bool minimal) {
     const LlamaScheduleConfig cfg = normalize_cfg(input_cfg);
     Builder b;
+    b.minimal = minimal;
     LlamaScheduleConfig prefill = cfg;
     prefill.mode = "prefill";
     prefill.kv_cache_enabled = true;
@@ -1322,11 +1371,11 @@ Schedule build_prefill_decode_schedule(const LlamaScheduleConfig& input_cfg) {
     return finish(b);
 }
 
-Schedule build_llama_schedule(const LlamaScheduleConfig& cfg) {
-    if (cfg.mode == "attention") return build_attention_schedule(cfg);
+Schedule build_llama_schedule(const LlamaScheduleConfig& cfg, bool minimal) {
+    if (cfg.mode == "attention") return build_attention_schedule(cfg, minimal);
     if (cfg.mode == "layer" || cfg.mode == "prefill" || cfg.mode == "decode")
-        return build_transformer_layer_schedule(cfg);
-    if (cfg.mode == "prefill_decode") return build_prefill_decode_schedule(cfg);
+        return build_transformer_layer_schedule(cfg, minimal);
+    if (cfg.mode == "prefill_decode") return build_prefill_decode_schedule(cfg, minimal);
     throw std::runtime_error("LlamaScheduleConfig: unsupported mode '" + cfg.mode + "'");
 }
 
@@ -1363,6 +1412,7 @@ LlamaScheduleConfig llama_config_from_node(const YAML::Node& root) {
     read_scalar(n, "kv_cache_block_tokens", cfg.kv_cache_block_tokens);
     read_scalar(n, "kv_stage_buffers", cfg.kv_stage_buffers);
     read_scalar(n, "kv_cache_enabled", cfg.kv_cache_enabled);
+    read_scalar(n, "causal_block_skip", cfg.causal_block_skip);
     read_scalar(n, "kv_cache_location", cfg.kv_cache_location);
     read_scalar(n, "kv_prefetch", cfg.kv_prefetch);
     read_scalar(n, "kv_cache_eviction_policy", cfg.kv_cache_eviction_policy);

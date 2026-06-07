@@ -94,8 +94,26 @@ public:
     // produced by decompose(). Instructions that already fit the array are left
     // unchanged; dependencies on expanded instructions are rewired to the last
     // generated sub-event.
-    static Schedule expand_gemm_subtiles(const Schedule& sched,
+    //
+    // When arch.structural_k_tiling is set, this also runs expand_k_subtiles()
+    // as a final pass so partial-sum traffic is modeled explicitly.
+    //
+    // Takes the schedule BY VALUE so callers can std::move into it: when no GEMM
+    // exceeds the array and structural K-tiling is off (e.g. every LLaMA path,
+    // whose builder already emits hardware-sized tiles), this is a no-op and the
+    // input is returned unchanged (moved) — avoiding a full duplicate of a
+    // multi-million-instruction schedule, which previously doubled peak RAM.
+    static Schedule expand_gemm_subtiles(Schedule sched,
                                          const ArchConfig& arch);
+
+    // P1.2: structural K-tiling. Split every GEMM whose K exceeds the array
+    // rows into ceil(K/rows) partial GEMMs (each K ≤ rows) plus `accumulate`
+    // ops that sum the partial products. This turns the in-array partial-sum
+    // accumulation (which the analytical latency folds into a term) into real
+    // instructions + OBUF traffic, so accumulator/OBUF bandwidth can be studied.
+    // Dependents of a split GEMM are rewired to its final accumulate.
+    static Schedule expand_k_subtiles(const Schedule& sched,
+                                      const ArchConfig& arch);
 
     // Parse a workload YAML file / string.
     static WorkloadGemm from_yaml_file(const std::string& path);

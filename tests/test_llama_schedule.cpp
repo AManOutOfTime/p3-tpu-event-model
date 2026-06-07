@@ -5,7 +5,6 @@
 #include <vector>
 #include "config/arch_config.h"
 #include "core/event_engine.h"
-#include "core/tensor_store.h"
 #include "schedule/llama_schedule.h"
 #include "schedule/op_handlers.h"
 #include "schedule/schedule.h"
@@ -65,24 +64,23 @@ bool depends_on(const Instruction& inst, InstructionId dependency) {
            != inst.depends_on.end();
 }
 
-void register_real_units(EventEngine& engine, TensorStore& ts, const ArchConfig& arch) {
-    for (uint32_t i = 0; i < arch.systolic_units; i++) {
+void register_real_units(EventEngine& engine, const ArchConfig& arch) {
+    for (uint32_t i = 0; i < arch.systolic_units; i++)
         engine.register_unit(std::make_unique<SystolicUnit>(
-            "systolic_" + std::to_string(i), arch.systolic, nullptr, &ts));
-    }
-    engine.register_unit(std::make_unique<DmaUnit>("dma_0", arch, &ts));
-    engine.register_unit(std::make_unique<VectorUnit>("vector_core_0", arch.vector_core, nullptr, &ts));
-    engine.register_unit(std::make_unique<VectorUnit>("vector_core_1", arch.vector_core, nullptr, &ts));
-    engine.register_unit(std::make_unique<AccessUnit>("access_core_0", arch.access_core, nullptr, &ts));
+            "systolic_" + std::to_string(i), arch.systolic));
+    engine.register_unit(std::make_unique<DmaUnit>("dma_0", arch));
+    engine.register_unit(std::make_unique<VectorUnit>("vector_core_0", arch.vector_core));
+    engine.register_unit(std::make_unique<VectorUnit>("vector_core_1", arch.vector_core));
+    engine.register_unit(std::make_unique<AccessUnit>("access_core_0", arch.access_core));
 }
 
-void wire(EventEngine& engine, Scheduler& sched, TensorStore& ts) {
+void wire(EventEngine& engine, Scheduler& sched) {
     for (UnitId uid = 0; uid < static_cast<UnitId>(engine.num_units()); uid++) {
         Unit* u = engine.get_unit(uid);
-        if (auto* x = dynamic_cast<SystolicUnit*>(u)) { x->set_scheduler(&sched); x->set_tensor_store(&ts); }
-        if (auto* x = dynamic_cast<DmaUnit*>(u))      { x->set_scheduler(&sched); x->set_tensor_store(&ts); }
-        if (auto* x = dynamic_cast<VectorUnit*>(u))   { x->set_scheduler(&sched); x->set_tensor_store(&ts); }
-        if (auto* x = dynamic_cast<AccessUnit*>(u))   { x->set_scheduler(&sched); x->set_tensor_store(&ts); }
+        if (auto* x = dynamic_cast<SystolicUnit*>(u)) x->set_scheduler(&sched);
+        if (auto* x = dynamic_cast<DmaUnit*>(u))      x->set_scheduler(&sched);
+        if (auto* x = dynamic_cast<VectorUnit*>(u))   x->set_scheduler(&sched);
+        if (auto* x = dynamic_cast<AccessUnit*>(u))   x->set_scheduler(&sched);
     }
 }
 
@@ -97,15 +95,14 @@ TEST_CASE("typed FA2 schedule runs through reusable builtin op handlers as timin
     arch.access_core.bandwidth = 16;
     arch.sram.banking_factor = 16;
 
-    TensorStore ts;
     Schedule schedule = Schedule::from_yaml_file(
         std::string(SIM_PROJECT_ROOT) + "/schedules/fa2_single_tile.yaml");
     EventEngine engine(arch.clock_ghz);
-    register_real_units(engine, ts, arch);
+    register_real_units(engine, arch);
     OpRegistry reg;
     register_builtin_ops(reg, arch);
     Scheduler sched(engine, reg, schedule);
-    wire(engine, sched, ts);
+    wire(engine, sched);
 
     sched.launch();
     Cycle final_cycle = engine.run();
@@ -131,18 +128,21 @@ TEST_CASE("multiple systolic units execute independent GEMMs in parallel") {
                     {}, "independent GEMM 1"},
     };
 
-    TensorStore ts;
     EventEngine engine(arch.clock_ghz);
-    register_real_units(engine, ts, arch);
+    register_real_units(engine, arch);
     OpRegistry reg;
     register_builtin_ops(reg, arch);
     Scheduler sched(engine, reg, schedule);
-    wire(engine, sched, ts);
+    wire(engine, sched);
 
     sched.launch();
     Cycle final_cycle = engine.run();
     REQUIRE(sched.all_done());
-    REQUIRE(final_cycle == 22);
+    // Two independent GEMMs on two units run in parallel, so the run finishes at
+    // a single GEMM's latency (weight-stationary model), NOT 2x (serial).
+    const Cycle one = systolic_gemm_latency(arch.systolic, 4, 16, 4);
+    REQUIRE(final_cycle == one);
+    REQUIRE(final_cycle < 2 * one);
 }
 
 TEST_CASE("attention schedule includes GQA grouped cache reads and causal mask") {
@@ -158,6 +158,8 @@ TEST_CASE("attention schedule includes GQA grouped cache reads and causal mask")
     cfg.tile_cols = 2;
     cfg.kv_cache_enabled = true;
     cfg.kv_cache_location = "hbm";
+    cfg.causal_block_skip = false;  // this case validates the full FA2 inner-loop
+                                    // chain; causal-skip is covered separately.
 
     Schedule s = build_attention_schedule(cfg);
     REQUIRE(!s.instructions.empty());
@@ -240,6 +242,42 @@ TEST_CASE("attention schedule includes GQA grouped cache reads and causal mask")
     CHECK(depends_on(*lse, upd1->id));
     CHECK(depends_on(*lse, l1->id));
     CHECK(depends_on(*lse, norm->id));
+}
+
+TEST_CASE("P1.3 causal block-skip removes fully-future KV tiles and masks") {
+    LlamaScheduleConfig cfg;
+    cfg.mode = "attention";
+    cfg.seq_len = 4;
+    cfg.num_q_heads = 2;
+    cfg.num_kv_heads = 2;
+    cfg.gqa_group_size = 1;
+    cfg.head_dim = 8;
+    cfg.hidden_dim = 16;
+    cfg.tile_rows = 2;
+    cfg.tile_cols = 2;
+    cfg.kv_cache_enabled = true;
+    cfg.kv_cache_location = "hbm";
+
+    cfg.causal_block_skip = false;
+    Schedule full = build_attention_schedule(cfg);
+    cfg.causal_block_skip = true;
+    Schedule skip = build_attention_schedule(cfg);
+
+    // q-tile qt0 covers positions 0..1; KV tile1 covers 2..3 (entirely future).
+    // Present without skip, gone with skip.
+    CHECK(find_label_op(full, "update m L0.S128.kv0.tile1.qh0.qt0", "update_rowmax") != nullptr);
+    CHECK(find_label_op(skip, "update m L0.S128.kv0.tile1.qh0.qt0", "update_rowmax") == nullptr);
+
+    // q-tile qt1 covers 2..3 and straddles the diagonal at KV tile1 -> kept.
+    CHECK(find_label_op(skip, "update m L0.S128.kv0.tile1.qh0.qt1", "update_rowmax") != nullptr);
+
+    // Fully-below-diagonal block (qt1 q=2..3, KV tile0 kv=0..1) needs no mask.
+    CHECK(find_label_op(skip, "causal mask L0.S128.kv0.tile0.qh0.qt1", "causal_mask") == nullptr);
+    // Diagonal block still masked.
+    CHECK(find_label_op(skip, "causal mask L0.S128.kv0.tile1.qh0.qt1", "causal_mask") != nullptr);
+
+    // Skipping strictly reduces work.
+    CHECK(skip.instructions.size() < full.instructions.size());
 }
 
 TEST_CASE("SRAM KV cache uses access-core copies instead of HBM DMA movement") {
@@ -617,13 +655,12 @@ TEST_CASE("attention_merge handler charges for tile contributions plus output as
     s.instructions.push_back(std::move(merge));
     s.validate();
 
-    TensorStore ts;
     EventEngine engine(arch.clock_ghz);
-    engine.register_unit(std::make_unique<VectorUnit>("vector_core_0", arch.vector_core, nullptr, &ts));
+    engine.register_unit(std::make_unique<VectorUnit>("vector_core_0", arch.vector_core));
     OpRegistry reg;
     register_builtin_ops(reg, arch);
     Scheduler sched(engine, reg, s);
-    wire(engine, sched, ts);
+    wire(engine, sched);
 
     sched.launch();
     Cycle final_cycle = engine.run();

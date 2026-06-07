@@ -42,6 +42,27 @@ public:
     uint64_t unit_buffer_used(UnitId id) const;
     uint64_t unit_buffer_capacity(UnitId id) const;
 
+    // ---- Metrics (P0.2) -----------------------------------------------------
+    // Per-unit cycles spent reserved (occupancy). Accumulated in reserve_unit_pool.
+    Cycle    unit_busy_cycles(UnitId id) const;
+    // Global counters incremented by op handlers at issue time.
+    void     add_macs(uint64_t n)      { total_macs_ += n; }
+    void     add_hbm_bytes(uint64_t n) { total_hbm_bytes_ += n; }
+    uint64_t total_macs()      const { return total_macs_; }
+    uint64_t total_hbm_bytes() const { return total_hbm_bytes_; }
+
+    // ---- SRAM-pressure accounting (P1.2) -----------------------------------
+    // Shared IBUF+OBUF working-set tracker. Capacity 0 == unlimited (default).
+    void     set_sram_capacity(uint64_t bytes) { sram_capacity_bytes_ = bytes; }
+    uint64_t sram_capacity()  const { return sram_capacity_bytes_; }
+    uint64_t sram_used()      const { return sram_used_bytes_; }
+    uint64_t sram_peak()      const { return sram_peak_bytes_; }
+    uint64_t sram_spills()    const { return sram_spills_; }
+    // Acquire `bytes` of SRAM working set. Returns true if it fit; false if it
+    // overflowed capacity (caller models a spill). Always tracks peak usage.
+    bool     sram_acquire(uint64_t bytes);
+    void     sram_release(uint64_t bytes);
+
     // ---- Event scheduling ---------------------------------------------------
     // Insert an event. If e.seq == 0 the engine assigns a fresh seq for stable
     // ordering. Throws if the event is in the past (cycle < current_cycle).
@@ -73,11 +94,18 @@ private:
         Cycle    available_at = 0;
         uint64_t buffer_capacity_bytes = 0;
         uint64_t buffer_used_bytes = 0;
+        Cycle    busy_cycles = 0;          // P0.2: total reserved occupancy
     };
 
-    double  clock_ghz_;
-    Cycle   now_      = 0;
-    EventId next_seq_ = 1;
+    double   clock_ghz_;
+    Cycle    now_      = 0;
+    EventId  next_seq_ = 1;
+    uint64_t total_macs_      = 0;         // P0.2
+    uint64_t total_hbm_bytes_ = 0;         // P0.2
+    uint64_t sram_capacity_bytes_ = 0;     // P1.2 (0 == unlimited)
+    uint64_t sram_used_bytes_     = 0;
+    uint64_t sram_peak_bytes_     = 0;
+    uint64_t sram_spills_         = 0;
     MinHeap queue_;
     std::vector<std::unique_ptr<Unit>>  units_;
     std::vector<HardwareState>          hardware_;

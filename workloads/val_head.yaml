@@ -1,0 +1,19 @@
+# Validation: ONE full FA2 attention head (single-head multi-tile, no GQA)
+# LLaMA-3-8B head_dim = 128. Single head => hidden_dim = head_dim.
+llama:
+  mode: attention
+  seq_len: 2048
+  prompt_len: 2048
+  num_layers: 1
+  num_q_heads: 1
+  num_kv_heads: 1
+  head_dim: 128
+  hidden_dim: 128
+  intermediate_dim: 14336
+  vocab_size: 128256
+  dtype_bytes: 2
+  tile_rows: 128
+  tile_cols: 128
+  linear_tile_rows: 128
+  linear_tile_cols: 128
+  causal_block_skip: true

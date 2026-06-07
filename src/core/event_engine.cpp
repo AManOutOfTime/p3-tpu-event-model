@@ -9,7 +9,7 @@ UnitId EventEngine::register_unit(std::unique_ptr<Unit> unit, uint64_t buffer_ca
     unit->id_ = id;                           // assigned via friend
     name_index_[unit->name()] = id;
     units_.push_back(std::move(unit));
-    hardware_.push_back(HardwareState{0, buffer_capacity_bytes, 0});
+    hardware_.push_back(HardwareState{0, buffer_capacity_bytes, 0, 0});
     return id;
 }
 
@@ -77,7 +77,29 @@ UnitReservation EventEngine::reserve_unit_pool(const std::vector<UnitId>& ids,
     HardwareState& chosen = hardware_[best.id];
     chosen.available_at = best.start + duration;
     chosen.buffer_used_bytes += buffer_bytes;
+    chosen.busy_cycles += duration;          // P0.2: occupancy accounting
     return best;
+}
+
+Cycle EventEngine::unit_busy_cycles(UnitId id) const {
+    if (id == INVALID_UNIT || id >= static_cast<UnitId>(hardware_.size()))
+        return 0;
+    return hardware_[id].busy_cycles;
+}
+
+bool EventEngine::sram_acquire(uint64_t bytes) {
+    sram_used_bytes_ += bytes;
+    if (sram_used_bytes_ > sram_peak_bytes_)
+        sram_peak_bytes_ = sram_used_bytes_;
+    if (sram_capacity_bytes_ != 0 && sram_used_bytes_ > sram_capacity_bytes_) {
+        sram_spills_++;
+        return false;            // overflow: caller models a spill
+    }
+    return true;
+}
+
+void EventEngine::sram_release(uint64_t bytes) {
+    sram_used_bytes_ = bytes > sram_used_bytes_ ? 0 : sram_used_bytes_ - bytes;
 }
 
 void EventEngine::release_unit_buffer(UnitId id, uint64_t buffer_bytes) {
