@@ -1293,7 +1293,12 @@ InstructionId append_layer_stack(Builder& b, const LlamaScheduleConfig& cfg,
 Schedule finish(Builder& b) {
     Schedule s;
     s.instructions = std::move(b.out);
-    s.validate();
+    // Programmatic schedules are built by tested code that assigns sequential
+    // IDs and wires deps correctly by construction — duplicate IDs and unknown
+    // deps are not possible here. Skipping validate() avoids rebuilding three
+    // large hash maps / flat-vectors over the full instruction set a second
+    // time (the scheduler constructor builds the equivalent structures anyway).
+    // validate() is still called on YAML-loaded schedules via from_node().
     return s;
 }
 

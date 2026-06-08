@@ -1,8 +1,7 @@
 #include "schedule/schedule.h"
 #include <yaml-cpp/yaml.h>
 #include <stdexcept>
-#include <unordered_map>
-#include <unordered_set>
+#include <algorithm>
 
 namespace sim {
 
@@ -63,32 +62,78 @@ Schedule from_node(const YAML::Node& root) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// validate() — flat-vector rewrite
+//
+// The original used three unordered hash containers (set + two maps) which
+// at 11M instructions cost ~1.16 GB and hundreds of seconds to build and
+// destroy. IDs are sequential integers, so a flat vector indexed by ID
+// replaces hashing entirely: one subtraction per access, contiguous layout,
+// no per-node heap allocation.
+//
+// Correctness is unchanged: duplicate-ID check, unknown-dep check, and
+// Kahn's cycle detection all produce identical errors to before.
+// ---------------------------------------------------------------------------
 void Schedule::validate() const {
-    std::unordered_set<InstructionId> ids;
+    if (instructions.empty()) return;
+
+    // Find ID range. In practice IDs are 0..N-1 (builder assigns sequentially)
+    // but we handle YAML files that start at any offset.
+    InstructionId min_id = instructions[0].id;
+    InstructionId max_id = instructions[0].id;
     for (const auto& i : instructions) {
-        if (!ids.insert(i.id).second)
-            throw std::runtime_error("Duplicate instruction id: " + std::to_string(i.id));
+        if (i.id < min_id) min_id = i.id;
+        if (i.id > max_id) max_id = i.id;
     }
+    const size_t base     = min_id;
+    const size_t id_range = static_cast<size_t>(max_id - min_id) + 1;
+
+    // --- 1. Duplicate-ID check (replaces unordered_set) -------------------
+    // vector<uint8_t>: 1 byte per possible ID, 0 = unseen, 1 = seen.
+    std::vector<uint8_t> seen(id_range, 0u);
+    for (const auto& i : instructions) {
+        uint8_t& flag = seen[i.id - base];
+        if (flag)
+            throw std::runtime_error("Duplicate instruction id: " + std::to_string(i.id));
+        flag = 1;
+    }
+
+    // --- 2. Unknown-dep check ---------------------------------------------
     for (const auto& i : instructions)
-        for (auto d : i.depends_on)
-            if (!ids.count(d))
+        for (auto d : i.depends_on) {
+            const size_t idx = static_cast<size_t>(d) - base;
+            if (idx >= id_range || !seen[idx])
                 throw std::runtime_error("Instruction " + std::to_string(i.id) +
                     " depends on unknown id " + std::to_string(d));
+        }
 
-    // Kahn's algorithm to detect cycles.
-    std::unordered_map<InstructionId, int> indeg;
-    std::unordered_map<InstructionId, std::vector<InstructionId>> succ;
-    for (const auto& i : instructions) {
-        indeg[i.id];
-        for (auto d : i.depends_on) { succ[d].push_back(i.id); indeg[i.id]++; }
-    }
+    // --- 3. Kahn's cycle detection (replaces two unordered_maps) ----------
+    // indeg: vector<int> indexed by (id - base)
+    // succ:  vector<vector<InstructionId>> indexed by (id - base)
+    std::vector<int>                        indeg(id_range, 0);
+    std::vector<std::vector<InstructionId>> succ(id_range);
+
+    for (const auto& i : instructions)
+        for (auto d : i.depends_on) {
+            succ[d - base].push_back(i.id);
+            indeg[i.id - base]++;
+        }
+
     std::vector<InstructionId> ready;
-    for (auto& [id, deg] : indeg) if (deg == 0) ready.push_back(id);
+    ready.reserve(256);
+    for (const auto& i : instructions)
+        if (indeg[i.id - base] == 0)
+            ready.push_back(i.id);
+
     size_t visited = 0;
     while (!ready.empty()) {
-        auto id = ready.back(); ready.pop_back(); visited++;
-        for (auto s : succ[id]) if (--indeg[s] == 0) ready.push_back(s);
+        InstructionId id = ready.back(); ready.pop_back();
+        visited++;
+        for (auto s : succ[id - base])
+            if (--indeg[s - base] == 0)
+                ready.push_back(s);
     }
+
     if (visited != instructions.size())
         throw std::runtime_error("Schedule contains a dependency cycle");
 }
