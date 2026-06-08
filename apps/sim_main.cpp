@@ -16,6 +16,7 @@
 #include "units/access_unit.h"
 #include <iostream>
 #include <string>
+#include <cstdio>
 
 using namespace sim;
 
@@ -70,6 +71,12 @@ int main(int argc, char** argv) {
     }
     if (sched_path.empty() && workload_path.empty() && llama_path.empty())
         sched_path = "schedules/dummy_example.yaml";
+
+    // Redirect stdout (fd 1) to /dev/null when --no-trace is set.
+    // This silences std::cout, printf, fprintf(stdout,...) and any other
+    // stdout writes from library code we don't control.
+    // std::cerr (fd 2) is left untouched so real errors still surface.
+    if (!trace) freopen("/dev/null", "w", stdout);
 
     ArchConfig arch = ArchConfig::from_yaml_file(config_path);
 

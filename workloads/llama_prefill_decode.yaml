@@ -2,17 +2,17 @@ llama:
   mode: prefill_decode
   prompt_len: 4
   generation_steps: 1
-  num_layers: 32
+  num_layers: 1
   num_q_heads: 32
   num_kv_heads: 8 # num after grouping
-  gqa_group_size: 4
+  gqa_group_size: 4 #in each grp
   head_dim: 128
   hidden_dim: 4096
   intermediate_dim: 14336
   vocab_size: 128256
   max_seq_len: 8192
   dtype_bytes: 2  # BF16
-  tile_rows: 256
-  tile_cols: 256
+  tile_rows: 256 #Br
+  tile_cols: 256 #Bc
   kv_cache_enabled: true
   kv_cache_location: hbm

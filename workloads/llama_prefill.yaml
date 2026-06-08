@@ -1,0 +1,17 @@
+llama:
+  mode: prefill
+  prompt_len: 512
+  num_layers: 4
+  num_q_heads: 32
+  num_kv_heads: 8
+  gqa_group_size: 4
+  head_dim: 128
+  hidden_dim: 4096
+  intermediate_dim: 14336
+  vocab_size: 128256
+  max_seq_len: 8192
+  dtype_bytes: 2
+  tile_rows: 256
+  tile_cols: 256
+  kv_cache_enabled: true
+  kv_cache_location: hbm

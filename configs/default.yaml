@@ -11,8 +11,8 @@ systolic:
   bidirectional: true
   d_head: 128              # attention head dimension (= K streaming axis)
 
-systolic_units: 1
-vector_cores: 3
+systolic_units: 4 # 4 sys arrays
+vector_cores: 6 # increase to 6 
 access_cores: 1
 
 sram:

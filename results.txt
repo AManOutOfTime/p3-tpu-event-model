@@ -1,0 +1,32 @@
+
+--- 1 layer | prefill| TTFT measure | prompt_len=512 | steps=1 ---
+
+real	0m4.444s try milliseconds , 500 ms
+user	0m4.343s
+sys	0m0.272s
+
+--- 4 layer | prefill| tokens/sec measure | prompt_len=512 | steps=1 ---
+
+real	2m14.514s
+user	2m11.758s
+sys	0m1.788s
+
+--- 8 layer | prefill| TTFT measure | prompt_len=512 | steps=1 ---
+
+real	15m27.119s
+user	15m21.158s
+sys	0m5.049s
+
+--- 1 layer | prefill_decode| tokens/sec measure | prompt_len=512 | steps=20 ---
+
+real	8m43.415s
+user	8m41.506s
+sys	0m2.835s
+
+real	2m12.816s
+user	2m11.629s
+sys	0m1.422s
+
+real	1m54.140s
+user	1m52.627s
+sys	0m1.117s
