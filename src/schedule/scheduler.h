@@ -2,7 +2,6 @@
 #include "schedule/schedule.h"
 #include "schedule/op_registry.h"
 #include "core/event_engine.h"
-#include <unordered_map>
 #include <vector>
 
 namespace sim {
@@ -69,14 +68,12 @@ private:
     std::vector<std::vector<InstructionId>> successors_;      // [idx(id)] dependents
 
     // id -> instruction pointer for O(1) lookup in try_issue.
-    // Kept as a hash map (not a pointer-vector) to preserve its role as the
-    // explicit guard against unknown instruction IDs: a missing key here
-    // throws, surfacing schedule-construction bugs that a raw pointer-vector
-    // would silently mishandle as a null dereference. This is the key
-    // substitution that prevents O(N²) dispatch on multi-million-instruction
-    // schedules; sched_ owns the instructions and never mutates them after
-    // construction, so the raw pointers remain valid for the scheduler's life.
-    std::unordered_map<InstructionId, const Instruction*> by_id_;
+    // Now a flat vector indexed by (id - id_base_), same as the other
+    // three structures above. Saves ~310 MB vs the unordered_map at
+    // 11.1M instructions (eliminates the bucket array + per-node overhead).
+    // A null entry means the id was never registered — same error semantics
+    // as the old map::find() returning end().
+    std::vector<const Instruction*> by_id_;
 
     size_t done_count_ = 0;
 };

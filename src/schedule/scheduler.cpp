@@ -28,13 +28,11 @@ Scheduler::Scheduler(EventEngine& engine, OpRegistry& registry, Schedule schedul
     // (which fills successor lists) can push_back unconditionally.
     remaining_deps_.assign(id_range, 0);
     issued_.assign(id_range, 0u);
-    successors_.resize(id_range);  // default-constructs empty vectors
-
-    // Reserve the by_id_ hash map up front to avoid incremental rehashing.
-    by_id_.reserve(N);
+    successors_.resize(id_range);
+    by_id_.assign(id_range, nullptr);
 
     for (const auto& inst : sched_.instructions) {
-        by_id_[inst.id] = &inst;
+        by_id_[idx(inst.id)] = &inst;
         remaining_deps_[idx(inst.id)] = static_cast<int>(inst.depends_on.size());
         for (auto d : inst.depends_on)
             successors_[idx(d)].push_back(inst.id);
@@ -77,11 +75,9 @@ void Scheduler::try_issue(InstructionId id) {
     if (flag) return;   // already issued — guard against double-fire
     flag = 1;
 
-    auto it = by_id_.find(id);
-    if (it == by_id_.end())
+    const Instruction* inst = by_id_[idx(id)];
+    if (!inst)
         throw std::runtime_error("Scheduler: instruction id not found: " + std::to_string(id));
-    const Instruction* inst = it->second;
-
     registry_.get(inst->op)(IssueCtx{engine_, *this, *inst});
 }
 
