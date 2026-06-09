@@ -61,6 +61,13 @@ public:
     std::size_t size()  const { return data_.size(); }
     bool        empty() const { return data_.empty(); }
 
+    // Release excess vector capacity after all params have been added.
+    // Each call to operator[] can trigger a capacity doubling (0→1→2→4→8→...),
+    // leaving up to 50% of the heap block unused. For 11M instructions this
+    // wasted capacity is ~1-2 GB. Swap-with-exact-copy is the guaranteed way
+    // to reallocate to size == capacity.
+    void shrink() { storage{data_}.swap(data_); }
+
 private:
     storage data_;
 };

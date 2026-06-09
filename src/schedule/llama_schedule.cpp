@@ -32,9 +32,18 @@ struct Builder {
                 if (!std::holds_alternative<std::string>(kv.second)
                     || kv.first == "init_value")
                     inst.params[kv.first] = std::move(kv.second);
+            // Each operator[] call above can double the vector capacity,
+            // leaving up to 50% unused. Shrink to exactly the number of
+            // params kept so the wasted capacity doesn't persist for the
+            // lifetime of the simulation.
+            inst.params.shrink();
         } else {
             inst.label = std::move(label);
             inst.params = std::move(params);
+            // In non-minimal mode params arrive via initializer_list (exact
+            // capacity), but shrink defensively in case any caller grew via
+            // operator[].
+            inst.params.shrink();
         }
         inst.depends_on = std::move(deps);
         out.push_back(std::move(inst));
@@ -1308,6 +1317,7 @@ Schedule build_attention_schedule(const LlamaScheduleConfig& input_cfg, bool min
     const LlamaScheduleConfig cfg = normalize_cfg(input_cfg);
     Builder b;
     b.minimal = minimal;
+    b.out.reserve(25000UL * cfg.num_kv_heads + 10000);
     const uint32_t q_len = cfg.mode == "decode" ? 1
                          : (cfg.mode == "prefill" ? cfg.prompt_len : cfg.seq_len);
     const uint32_t kv_len = cfg.mode == "decode" ? cfg.prompt_len + 1 : q_len;
@@ -1315,10 +1325,49 @@ Schedule build_attention_schedule(const LlamaScheduleConfig& input_cfg, bool min
     return finish(b);
 }
 
+// ---------------------------------------------------------------------------
+// Estimate how many instructions the schedule will contain.
+//
+// Pre-reserving Builder::out to (approximately) the right size is the key
+// RAM optimisation: without a reservation the vector doubles ~24 times on a
+// full 8B run, leaving ~2 GB of freed old buffers scattered through the heap
+// (glibc never releases these pages for sub-mmap-threshold allocations because
+// they are interleaved with live param data above them).  A single upfront
+// reservation means ONE allocation, zero doublings, zero freed holes.
+//
+// The estimate intentionally runs ~10% hot so we never under-reserve and fall
+// back to doubling.  The small over-reserve sits at the end of the sched_
+// block in the Scheduler and is freed at program exit.
+// ---------------------------------------------------------------------------
+static size_t estimate_instruction_count(const LlamaScheduleConfig& cfg) {
+    // Empirical per-layer instruction counts (LLaMA-3-8B, tile 256×256):
+    //   val_layer  (1 layer,  mode=layer)        → 366 654  ≈ 367K / layer
+    //   val_full8b (32 layers, mode=layer)        → 11 600 000 ≈ 363K / layer
+    //   llama_prefill_decode (32 layers, 1 step)  → 11 168 084
+    //     ≈ 340K / prefill-layer + 8.5K / decode-layer
+    //
+    // Use 10 % margin to guarantee no doubling even for slightly larger models.
+    const size_t kLayer   = 400000UL;   // 363K actual × 1.10
+    const size_t kDecode  =  10000UL;   // 8.5K actual × 1.18
+    const size_t kFixed   =  300000UL;  // embedding + output head + misc
+
+    if (cfg.mode == "layer" || cfg.mode == "prefill")
+        return kLayer * cfg.num_layers + kFixed;
+    if (cfg.mode == "decode")
+        return kDecode * cfg.num_layers + kFixed;
+    if (cfg.mode == "prefill_decode")
+        return kLayer  * cfg.num_layers
+             + kDecode * cfg.num_layers * static_cast<size_t>(cfg.generation_steps)
+             + kFixed;
+    // attention / unknown: generous fallback
+    return kLayer * cfg.num_layers + kFixed;
+}
+
 Schedule build_transformer_layer_schedule(const LlamaScheduleConfig& input_cfg, bool minimal) {
     const LlamaScheduleConfig cfg = normalize_cfg(input_cfg);
     Builder b;
     b.minimal = minimal;
+    b.out.reserve(estimate_instruction_count(cfg));
     const uint32_t q_len = cfg.mode == "decode" ? 1
                          : (cfg.mode == "prefill" ? cfg.prompt_len : cfg.seq_len);
     const uint32_t kv_len = cfg.mode == "decode" ? cfg.prompt_len + 1 : q_len;
@@ -1339,6 +1388,7 @@ Schedule build_prefill_decode_schedule(const LlamaScheduleConfig& input_cfg, boo
     const LlamaScheduleConfig cfg = normalize_cfg(input_cfg);
     Builder b;
     b.minimal = minimal;
+    b.out.reserve(estimate_instruction_count(cfg));
     LlamaScheduleConfig prefill = cfg;
     prefill.mode = "prefill";
     prefill.kv_cache_enabled = true;

@@ -8,6 +8,7 @@
 #include "schedule/tiler.h"
 #include "schedule/llama_schedule.h"
 #include "units/delay_unit.h"
+#include <malloc.h>
 #include "units/systolic_unit.h"
 #include "units/dma_unit.h"
 #include "units/buffer_unit.h"
@@ -229,6 +230,8 @@ int main(int argc, char** argv) {
               << "  instructions=" << n_instructions
               << "  wall=" << preproc_ms << " ms ==\n\n";
 
+    malloc_trim(0);
+
     // ── Build engine ──────────────────────────────────────────────────────
     EventEngine engine(arch.clock_ghz);
 
@@ -261,10 +264,10 @@ int main(int argc, char** argv) {
     OpRegistry reg;
     register_builtin_ops(reg, arch);
 
-    // Move the (potentially multi-million-instruction) schedule into the
-    // Scheduler instead of copying it.
     Scheduler scheduler(engine, reg, std::move(pp.schedule));
     wire_units(engine, scheduler);
+
+    malloc_trim(0);
 
     // ── Trace ─────────────────────────────────────────────────────────────
     // --no-trace must silence BOTH the engine-level event log AND the
