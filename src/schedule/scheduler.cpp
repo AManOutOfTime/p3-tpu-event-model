@@ -78,7 +78,8 @@ void Scheduler::try_issue(InstructionId id) {
     const Instruction* inst = by_id_[idx(id)];
     if (!inst)
         throw std::runtime_error("Scheduler: instruction id not found: " + std::to_string(id));
-    registry_.get(inst->op)(IssueCtx{engine_, *this, *inst});
+    // Use the uint8_t fast path — integer key lookup, no string hash.
+    registry_.get(inst->op.code())(IssueCtx{engine_, *this, *inst});
 }
 
 }  // namespace sim

@@ -120,12 +120,10 @@ TEST_CASE("multiple systolic units execute independent GEMMs in parallel") {
 
     Schedule schedule;
     schedule.instructions = {
-        Instruction{1, "gemm", "systolic",
-                    {{"M", int64_t{4}}, {"K", int64_t{16}}, {"N", int64_t{4}}},
-                    {}, "independent GEMM 0"},
-        Instruction{2, "gemm", "systolic",
-                    {{"M", int64_t{4}}, {"K", int64_t{16}}, {"N", int64_t{4}}},
-                    {}, "independent GEMM 1"},
+        Instruction{1, "gemm", "systolic", "independent GEMM 0",
+                    {{{"M", int64_t{4}}, {"K", int64_t{16}}, {"N", int64_t{4}}}}},
+        Instruction{2, "gemm", "systolic", "independent GEMM 1",
+                    {{{"M", int64_t{4}}, {"K", int64_t{16}}, {"N", int64_t{4}}}}},
     };
 
     EventEngine engine(arch.clock_ghz);

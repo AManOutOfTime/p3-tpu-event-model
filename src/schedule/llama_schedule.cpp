@@ -29,8 +29,7 @@ struct Builder {
             // Keep numeric params plus init_value (a fill semantic that can be
             // stored as the string "-inf"); drop buffer-name strings + label.
             for (auto& kv : params)
-                if (!std::holds_alternative<std::string>(kv.second)
-                    || kv.first == "init_value")
+                if (!kv.second.is_string() || kv.first == "init_value")
                     inst.params[kv.first] = std::move(kv.second);
             // Each operator[] call above can double the vector capacity,
             // leaving up to 50% unused. Shrink to exactly the number of

@@ -388,10 +388,10 @@ void Tiler::print_decomposition(const TileDecomposition& td, std::ostream& os) {
         for (auto d : inst.depends_on) deps += std::to_string(d) + " ";
         std::string lbl = inst.label.size() > 28
                         ? inst.label.substr(0, 25) + "..."
-                        : inst.label;
+                        : inst.label.str();
         os << "│  " << std::left
            << std::setw(5)  << inst.id
-           << std::setw(12) << inst.op
+           << std::setw(12) << inst.op.str()
            << std::setw(30) << lbl
            << (deps.empty() ? "-" : deps) << "\n";
     }
