@@ -8,7 +8,7 @@ systolic:
   rows: 256
   cols: 256
   precision: BF16          # FP8 | FP16 | BF16 | FP32
-  bidirectional: false
+  bidirectional: true
   d_head: 128              # attention head dimension (= K streaming axis)
   # P0.1 dataflow / GEMM latency model:
   dataflow: weight_stationary   # weight_stationary | output_stationary
@@ -21,7 +21,7 @@ structural_k_tiling: false      # emit explicit per-K-block GEMMs + accumulate o
 model_sram: false               # bind IBUF+OBUF capacity; over-capacity sets spill
 stage_double_buffer: false      # S2: overlap operand staging with compute
 
-systolic_units: 1
+systolic_units: 2
 vector_cores: 3
 access_cores: 1
 
