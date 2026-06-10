@@ -8,8 +8,8 @@
 clock_ghz: 1.5
 
 systolic:
-  rows: 32
-  cols: 32
+  rows: 64
+  cols: 64
   precision: BF16
   bidirectional: false
   d_head: 128

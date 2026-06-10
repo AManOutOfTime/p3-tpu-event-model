@@ -18,7 +18,7 @@ structural_k_tiling: false
 model_sram: true
 stage_double_buffer: true
 
-systolic_units: 4 # try with 8 - TPUv1 thru TPUv5
+systolic_units: 8 # try with 8 - TPUv1 thru TPUv5
 vector_cores: 6
 access_cores: 2
 
@@ -34,7 +34,7 @@ hbm:
   pipelined: true
 
 dma:
-  channels: 2
+  channels: 4
 
 vector_core:
   simd_width:  128
