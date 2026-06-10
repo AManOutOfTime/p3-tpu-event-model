@@ -642,7 +642,7 @@ def main():
                     if "8b" in mdl.lower():
                         we["prompt_len"] = 512
                     elif "70b" in mdl.lower():
-                        we["prompt_len"] = 128  # Safe down-scaling to prevent Pod exit code 137
+                        we["prompt_len"] = 64  # Safe down-scaling to prevent Pod exit code 137
 
                 if mode == "decode":
                     we["gen_steps"] = 32
