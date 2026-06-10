@@ -629,13 +629,20 @@ def main():
     hw_configs = {Path(p).stem: (p, read_arch(p)) for p in hw_paths}
     wl_configs = {tag: (p, read_workload(p)) for tag, p in wl_pairs}
 
-    # ── Build cross-product run matrix ────────────────────────────────────
+# ── Build cross-product run matrix ────────────────────────────────────
     # Order: hw × model × mode  (group by hw for readable output)
     matrix = []
     for hw_lbl, (_, ae) in hw_configs.items():
         for mdl, (_, we_base) in wl_configs.items():
             for mode in modes:
                 we = {**we_base, "mode": mode}
+
+                # ── Memory Safety Caps for Edge Device ───────────────────
+                if "edge_dev" in hw_lbl.lower():
+                    if "8b" in mdl.lower():
+                        we["prompt_len"] = 512
+                    elif "70b" in mdl.lower():
+                        we["prompt_len"] = 128  # Safe down-scaling to prevent Pod exit code 137
 
                 if mode == "decode":
                     we["gen_steps"] = 32
@@ -645,7 +652,7 @@ def main():
                     )
 
                 matrix.append((hw_lbl, mdl, mode, ae, we))
-
+                
     if args.dry_run:
         print_dry_run(matrix, hw_paths, wl_pairs, modes)
         return
