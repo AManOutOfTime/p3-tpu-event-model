@@ -1,0 +1,18 @@
+llama:
+  mode: prefill_decode
+  prompt_len: 2048
+  generation_steps: 1
+  num_layers: 16          # was 32
+  num_q_heads: 32         # same
+  num_kv_heads: 8         # same
+  gqa_group_size: 4       # 32/8
+  head_dim: 64            # was 128
+  hidden_dim: 2048        # was 4096
+  intermediate_dim: 8192  # was 14336
+  vocab_size: 128256      # same
+  max_seq_len: 8192     # actual uses 128K context but for test purposes keep it same
+  dtype_bytes: 2
+  tile_rows: 256
+  tile_cols: 256
+  kv_cache_enabled: true
+  kv_cache_location: hbm
