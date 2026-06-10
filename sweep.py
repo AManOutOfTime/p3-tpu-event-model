@@ -492,7 +492,11 @@ def make_sweep(hw, wl1b, wl8b, wl70b, models):
             mode_sfx = "_pd" if mode == "prefill_decode" else "_dec"
             add("4a_gqa_8b", f"kv{kv}_{tag.split()[0]}{mode_sfx}",
                 f"8B kv_heads={kv} gqa_group={grp_sz} ({tag}) [mode={mode}]",
-                wl_ov=dict(num_kv_heads=kv, gqa_group=grp_sz, mode=mode),
+                wl_ov=dict(
+                num_kv_heads=kv,
+                gqa_group=grp_sz,
+                mode=mode,
+                gen_steps=32 if mode == "decode" else wl8b.get("gen_steps", 1)),
                 model="8b")
 
     # ── 4b. GQA sweep 70B ────────────────────────────────────────────────────
@@ -533,8 +537,8 @@ def make_sweep(hw, wl1b, wl8b, wl70b, models):
         kv_gb = 2 * 32 * 8 * 128 * ctx * 2 / 1e9
         addm("3e_decode_ctx", f"ctx{ctx}",
              f"mode=decode  ctx={ctx}  kv={kv_gb:.2f}GB  true_decode_tps",
-             wl_ov=dict(mode="decode", prompt_len=ctx, gen_steps=1,
-                        max_seq_len=max(ctx + 1, 8192)),
+             wl_ov=dict(mode="decode", prompt_len=ctx, gen_steps=32,
+                        max_seq_len=max(ctx + 32, 8192)),
              modes=("decode",))
 
     # ── 6. Calibration ───────────────────────────────────────────────────────

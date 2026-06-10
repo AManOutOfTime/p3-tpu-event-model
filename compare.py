@@ -636,6 +636,14 @@ def main():
         for mdl, (_, we_base) in wl_configs.items():
             for mode in modes:
                 we = {**we_base, "mode": mode}
+
+                if mode == "decode":
+                    we["gen_steps"] = 32
+                    we["max_seq_len"] = max(
+                        we["prompt_len"] + 32,
+                        we["max_seq_len"],
+                    )
+
                 matrix.append((hw_lbl, mdl, mode, ae, we))
 
     if args.dry_run:
