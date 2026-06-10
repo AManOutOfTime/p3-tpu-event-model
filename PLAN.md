@@ -142,6 +142,9 @@
   - `sim_main` now registers `systolic_0..N-1`; existing GEMM instructions still target logical `systolic` and use the event-engine unit pool.
   - Added regression coverage showing two independent GEMMs complete in parallel with `systolic_units = 2`.
 
+- [x] Removed `sweep.py` PyYAML dependency.
+  - Replaced `yaml.safe_load` usage with a small reader for the repo's simple key/value YAML config shape.
+
 ## Changed Files
 
 - `README.md`
@@ -158,6 +161,7 @@
 - `src/units/systolic_unit.cpp`
 - `tests/test_config.cpp`
 - `tests/test_llama_schedule.cpp`
+- `sweep.py`
 - `PLAN.md`
 
 ## Tests Run
@@ -166,6 +170,8 @@
 - `ctest --test-dir build --output-on-failure`
 - `./build/apps/sim_main --config configs/default.yaml --schedule schedules/fa2_single_tile.yaml --no-trace`
 - `./build/apps/sim_main --config configs/default.yaml --llama-workload /private/tmp/llama_event_only_smoke.yaml --no-trace` (temporary YAML removed after run)
+- `python3 -m py_compile sweep.py`
+- `python3 sweep.py --model 1b --workload1b workloads/llama_prefill_decode_1B.yaml --group 1a --dry-run`
 
 ## Remaining Issues / Next Steps
 

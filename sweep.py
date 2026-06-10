@@ -63,13 +63,14 @@ FFN vs attention crossover (8B): S ≈ 3 × intermediate_dim / 2 ≈ 21K tokens
   S=2048: FFN 91% / attn 9%     S=8192: FFN 70% / attn 30%
 """
 
-import argparse, csv, os, re, subprocess, sys, tempfile, time, yaml
+import argparse, csv, os, re, subprocess, sys, tempfile, time
 from datetime import datetime
 from pathlib import Path
 
 DEFAULT_BINARY  = "./build/apps/sim_main"
 DEFAULT_OUTFILE = f"sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 DEFAULT_HW      = "configs/default.yaml"
+DEFAULT_WL1B    = "workloads/llama_prefill_decode_1B.yaml"
 DEFAULT_WL8B    = "workloads/llama_prefill_decode_8B.yaml"
 DEFAULT_WL70B   = "workloads/llama_prefill_decode_70B.yaml"
 SIM_TIMEOUT_S   = 600   # 10 min hard cap per run
@@ -120,8 +121,40 @@ CSV_FIELDS = [
 
 
 # ── YAML readers ─────────────────────────────────────────────────────────────
+def parse_yaml_value(value):
+    v = value.strip().strip('"').strip("'")
+    if v.lower() == "true": return True
+    if v.lower() == "false": return False
+    try:
+        return int(v)
+    except ValueError:
+        try:
+            return float(v)
+        except ValueError:
+            return v
+
+def read_simple_yaml(path):
+    root, stack = {}, [(-1, {})]
+    stack[0] = (-1, root)
+    with open(path) as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].rstrip()
+            if not line.strip(): continue
+            indent = len(line) - len(line.lstrip())
+            key, sep, value = line.strip().partition(":")
+            if not sep: continue
+            while indent <= stack[-1][0]:
+                stack.pop()
+            parent = stack[-1][1]
+            if value.strip():
+                parent[key] = parse_yaml_value(value)
+            else:
+                parent[key] = {}
+                stack.append((indent, parent[key]))
+    return root
+
 def read_arch(path):
-    with open(path) as f: d = yaml.safe_load(f)
+    d = read_simple_yaml(path)
     s  = d.get("systolic", {})
     h  = d.get("hbm", {})
     vc = d.get("vector_core", {})
@@ -149,7 +182,7 @@ def read_arch(path):
     )
 
 def read_workload(path):
-    with open(path) as f: d = yaml.safe_load(f)
+    d = read_simple_yaml(path)
     ll = d.get("llama", {})
     return dict(
         mode             = ll.get("mode",          "prefill_decode"),
@@ -254,7 +287,7 @@ for chip, p in CALIB.items():
 
 
 # ── Sweep builder ─────────────────────────────────────────────────────────────
-def make_sweep(hw, wl8b, wl70b, models):
+def make_sweep(hw, wl1b, wl8b, wl70b, models):
     """
     Returns list of (group, name, desc, arch_dict, wl_dict, model_tag).
     Every run overrides ONE axis on top of the default hw/workload config.
@@ -263,7 +296,7 @@ def make_sweep(hw, wl8b, wl70b, models):
 
     def add(grp, name, desc, arch_ov=None, wl_ov=None, model="8b"):
         if model not in models: return
-        base = wl8b if model == "8b" else wl70b
+        base = wl1b if model == "1b" else (wl8b if model == "8b" else wl70b)
         runs.append((grp, name, desc,
                      {**hw,   **(arch_ov or {})},
                      {**base, **(wl_ov  or {})},
@@ -764,10 +797,11 @@ def main():
         description=__doc__)
     p.add_argument("--binary",      default=DEFAULT_BINARY)
     p.add_argument("--hw",          default=DEFAULT_HW)
+    p.add_argument("--workload1b",  default=DEFAULT_WL1B)
     p.add_argument("--workload8b",  default=DEFAULT_WL8B)
     p.add_argument("--workload70b", default=DEFAULT_WL70B)
     p.add_argument("--model",       default="8b",
-                   choices=["8b", "70b", "both"])
+                   choices=["1b", "8b", "70b", "both"])
     p.add_argument("--dry-run",     action="store_true")
     p.add_argument("--group",       default=None,
                    help="Run only groups whose name starts with PREFIX")
@@ -778,16 +812,20 @@ def main():
 
     # ── Load configs ──────────────────────────────────────────────────────
     for lbl, path in [("--hw", args.hw),
+                      ("--workload1b", args.workload1b),
                       ("--workload8b", args.workload8b),
                       ("--workload70b", args.workload70b)]:
         if not Path(path).exists():
             print(f"WARNING: {lbl} not found: {path}", file=sys.stderr)
 
     hw    = read_arch(args.hw)             if Path(args.hw).exists()           else None
+    wl1b  = read_workload(args.workload1b) if Path(args.workload1b).exists()   else None
     wl8b  = read_workload(args.workload8b) if Path(args.workload8b).exists()   else None
     wl70b = read_workload(args.workload70b)if Path(args.workload70b).exists()  else None
 
     if not hw:              sys.exit(f"Cannot read --hw: {args.hw}")
+    if "1b"  in models and not wl1b:
+        sys.exit(f"Cannot read --workload1b: {args.workload1b}")
     if "8b"  in models and not wl8b:
         sys.exit(f"Cannot read --workload8b: {args.workload8b}")
     if "70b" in models and not wl70b:
@@ -795,7 +833,7 @@ def main():
     if not wl8b:  wl8b  = {}
     if not wl70b: wl70b = {}
 
-    sweep = make_sweep(hw, wl8b, wl70b, models)
+    sweep = make_sweep(hw, wl1b, wl8b, wl70b, models)
     if args.group:
         sweep = [e for e in sweep if e[0].startswith(args.group)]
         if not sweep:
@@ -905,7 +943,7 @@ def main():
                       f" mcr={dv.get('mem_compute_ratio') or 0:5.2f}"
                       f" tps={r.get('decode_tps') or 0:6.1f}"
                       f" ttft/tok={dv.get('ttft_per_token_ns') or 0:8.0f}ns"
-                      f" {r.get('roofline_bound',''):>14}"
+                      f" {(r.get('roofline_bound') or ''):>14}"
                       f"  {r.get('wall_s',0):.0f}s{cal_str}")
             else:
                 print(f"FAILED: {r.get('error', '?')}")
