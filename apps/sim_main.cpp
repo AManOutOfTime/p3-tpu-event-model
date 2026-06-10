@@ -345,13 +345,21 @@ int main(int argc, char** argv) {
         // Throughput (LLaMA workloads only — we know the token count there).
         if (pp.used_llama) {
             uint64_t tokens = 0;
-            if      (pp.llama_cfg.mode == "decode")  tokens = pp.llama_cfg.generation_steps;
-            else if (pp.llama_cfg.mode == "prefill") tokens = pp.llama_cfg.prompt_len;
-            else                                      tokens = pp.llama_cfg.seq_len;
+            if      (pp.llama_cfg.mode == "decode")
+                tokens = pp.llama_cfg.generation_steps;
+            else if (pp.llama_cfg.mode == "prefill")
+                tokens = pp.llama_cfg.prompt_len;
+            else if (pp.llama_cfg.mode == "prefill_decode")
+                // seq_len defaults to 128 and is never set by the workload
+                // YAML — use the actual token count: prefill prompt + each
+                // generated decode step.
+                tokens = pp.llama_cfg.prompt_len + pp.llama_cfg.generation_steps;
+            else
+                tokens = pp.llama_cfg.seq_len;
             std::cout << "  TTFT=" << cycles_to_ns(final_cycle, arch.clock_ghz) << " ns\n";
             if (tokens > 0 && sec > 0)
                 std::cout << "  throughput=" << (tokens / sec) << " tok/s"
-                          << "  (" << tokens << " tokens)\n";
+                          << "  (" << tokens << " tokens) prefill tokens + 1 decode " << pp.llama_cfg.generation_steps << " decode tokens\n";
         }
     }
 
