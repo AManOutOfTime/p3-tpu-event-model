@@ -311,8 +311,18 @@ int main(int argc, char** argv) {
         // Roofline.
         const uint64_t macs      = engine.total_macs();
         const uint64_t hbm_bytes = engine.total_hbm_bytes();
+
+        // FIX Bug 3: bidirectional doubles MACs/cell/cycle — include the
+        // factor in the compute ceiling so sweep 1c's bidir vs unidir
+        // comparison reflects the correct roofline for each config.
+        // Without this, bidir compute ceiling is 2× too low, causing
+        // compute-bound bidir configs to be misclassified as memory-bound
+        // and roofline_efficiency to read ~50% of its true value.
+        const double bidir_factor  = arch.systolic.bidirectional ? 2.0 : 1.0;
         const double peak_macs_cyc =
-            static_cast<double>(arch.systolic.rows) * arch.systolic.cols * arch.systolic_units;
+            static_cast<double>(arch.systolic.rows) * arch.systolic.cols
+            * arch.systolic_units * bidir_factor;
+
         const double hbm_bpc = arch.hbm_bytes_per_cycle() * arch.dma.channels;
         const double compute_cyc = peak_macs_cyc > 0 ? std::ceil(macs / peak_macs_cyc) : 0.0;
         const double mem_cyc     = hbm_bpc > 0 ? std::ceil(hbm_bytes / hbm_bpc) : 0.0;

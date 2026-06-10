@@ -1,0 +1,44 @@
+# High-end datacenter accelerator
+# Models an H100-class chip: high BW HBM3, large systolic array, more units
+# Reference: NVIDIA H100 SXM5 (3.35 TB/s HBM3, 80GB), ~2 GHz boost clock
+
+clock_ghz: 2.0
+
+systolic:
+  rows: 256
+  cols: 256
+  precision: BF16
+  bidirectional: false
+  d_head: 128
+  dataflow: weight_stationary
+  weight_load_cycles: 0
+  weight_double_buffer: true
+
+structural_k_tiling: false
+model_sram: true
+stage_double_buffer: true
+
+systolic_units: 4 # try with 8 - TPUv1 thru TPUv5
+vector_cores: 6
+access_cores: 2
+
+sram:
+  ibuf_kb:           8192
+  obuf_kb:           8192
+  banking_factor:    16
+  private_vector_kb: 1024
+
+hbm:
+  bandwidth_tb_s: 3.35      # H100 HBM3
+  latency_cycles: 300       # ~150ns × 2 GHz
+  pipelined: true
+
+dma:
+  channels: 2
+
+vector_core:
+  simd_width:  128
+  exp_latency: 4
+
+access_core:
+  bandwidth: 128

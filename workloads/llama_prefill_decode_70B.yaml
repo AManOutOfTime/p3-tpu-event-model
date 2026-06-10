@@ -1,0 +1,36 @@
+# LLaMA-3 70B workload
+# Architecture (meta-llama/Meta-Llama-3-70B):
+#   hidden_dim:       8192
+#   intermediate_dim: 28672  (SwiGLU, rounded to multiple of 256)
+#   num_q_heads:      64
+#   num_kv_heads:     8  (GQA group=8)
+#   head_dim:         128
+#   num_layers:       80
+#   vocab_size:       128256
+#
+# Runtime note: 70B is ~4-5x heavier per token than 7B.
+# prompt_len=256 gives a representative per-layer profile while keeping
+# simulator RAM under 4 GB.  For full 80-layer runs the sim needs ~8+ GB RAM;
+# the workload uses num_layers=40 (half the model) so the result scales ×2.
+#
+# Tile sizes match the default 256x256 systolic array.  Reduce to 128 for
+# edge_device.yaml (32x32 array + 128-tile workload).
+
+llama:
+  mode: prefill_decode
+  prompt_len: 256
+  generation_steps: 1
+  num_layers: 40               # half model; scale results ×2 for full 70B
+  num_q_heads: 64
+  num_kv_heads: 8
+  gqa_group_size: 8
+  head_dim: 128
+  hidden_dim: 8192
+  intermediate_dim: 28672
+  vocab_size: 128256
+  max_seq_len: 8192
+  dtype_bytes: 2
+  tile_rows: 256
+  tile_cols: 256
+  kv_cache_enabled: true
+  kv_cache_location: hbm

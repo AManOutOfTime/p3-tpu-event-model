@@ -1,0 +1,47 @@
+# Edge / mobile device
+# Models an Apple M-class or Snapdragon-class SoC:
+# - LPDDR5X unified memory  (~77-136 GB/s = 0.077-0.136 TB/s)
+# - Small systolic array (16x16 or 32x32 NPU tile)
+# - Higher clock, much lower memory bandwidth than HBM
+# Reference: Apple M3 (memory BW ~150 GB/s), Qualcomm NPU (LPDDR5X ~77 GB/s)
+
+clock_ghz: 1.5
+
+systolic:
+  rows: 32
+  cols: 32
+  precision: BF16
+  bidirectional: false
+  d_head: 128
+  dataflow: weight_stationary
+  weight_load_cycles: 0
+  weight_double_buffer: true
+
+structural_k_tiling: false
+model_sram: true
+stage_double_buffer: true
+
+systolic_units: 1
+vector_cores: 2
+access_cores: 1
+
+sram:
+  ibuf_kb:           512
+  obuf_kb:           512
+  banking_factor:    4
+  private_vector_kb: 128
+
+hbm:
+  bandwidth_tb_s: 0.10      # LPDDR5X ~100 GB/s unified
+  latency_cycles: 60        # ~40ns × 1.5 GHz (LPDDR is lower latency than HBM)
+  pipelined: true
+
+dma:
+  channels: 1
+
+vector_core:
+  simd_width:  16
+  exp_latency: 8
+
+access_core:
+  bandwidth: 16
