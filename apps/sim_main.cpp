@@ -8,10 +8,11 @@
 #include "schedule/tiler.h"
 #include "schedule/llama_schedule.h"
 #include "units/delay_unit.h"
-#include <malloc.h>
+#if defined(__GLIBC__)
+#include <malloc.h>   // malloc_trim — release freed heap pages back to the OS
+#endif
 #include "units/systolic_unit.h"
 #include "units/dma_unit.h"
-#include "units/buffer_unit.h"
 #include "units/vector_unit.h"
 #include "units/access_unit.h"
 #include <algorithm>
@@ -42,7 +43,6 @@ static void wire_units(EventEngine& engine, Scheduler& sched) {
         if (auto* x = dynamic_cast<DmaUnit*>     (u)) { x->set_scheduler(&sched); continue; }
         if (auto* x = dynamic_cast<VectorUnit*>  (u)) { x->set_scheduler(&sched); continue; }
         if (auto* x = dynamic_cast<AccessUnit*>  (u)) { x->set_scheduler(&sched); continue; }
-        if (auto* x = dynamic_cast<BufferUnit*>  (u)) { x->set_scheduler(&sched); continue; }
     }
 }
 
@@ -230,7 +230,9 @@ int main(int argc, char** argv) {
               << "  instructions=" << n_instructions
               << "  wall=" << preproc_ms << " ms ==\n\n";
 
-    malloc_trim(0);
+#if defined(__GLIBC__)
+    malloc_trim(0);  // hint the allocator to return freed pages (glibc-only)
+#endif
 
     // ── Build engine ──────────────────────────────────────────────────────
     EventEngine engine(arch.clock_ghz);
@@ -267,7 +269,9 @@ int main(int argc, char** argv) {
     Scheduler scheduler(engine, reg, std::move(pp.schedule));
     wire_units(engine, scheduler);
 
-    malloc_trim(0);
+#if defined(__GLIBC__)
+    malloc_trim(0);  // hint the allocator to return freed pages (glibc-only)
+#endif
 
     // ── Trace ─────────────────────────────────────────────────────────────
     // --no-trace must silence BOTH the engine-level event log AND the

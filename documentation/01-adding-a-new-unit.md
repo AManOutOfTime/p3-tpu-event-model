@@ -239,7 +239,6 @@ Add the `.cpp` to `SIM_CORE_SOURCES` in [src/CMakeLists.txt](../src/CMakeLists.t
 set(SIM_CORE_SOURCES
     ...
     units/access_unit.cpp
-    units/buffer_unit.cpp
     units/scalar_unit.cpp        # <-- add this line
 )
 ```
@@ -286,7 +285,6 @@ static void wire_units(EventEngine& engine, Scheduler& sched) {
         if (auto* x = dynamic_cast<DmaUnit*>     (u)) { x->set_scheduler(&sched); continue; }
         if (auto* x = dynamic_cast<VectorUnit*>  (u)) { x->set_scheduler(&sched); continue; }
         if (auto* x = dynamic_cast<AccessUnit*>  (u)) { x->set_scheduler(&sched); continue; }
-        if (auto* x = dynamic_cast<BufferUnit*>  (u)) { x->set_scheduler(&sched); continue; }
         if (auto* x = dynamic_cast<ScalarUnit*>  (u)) { x->set_scheduler(&sched); continue; }  // <-- add
     }
 }

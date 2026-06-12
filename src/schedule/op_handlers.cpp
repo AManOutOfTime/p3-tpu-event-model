@@ -130,8 +130,8 @@ void register_builtin_ops(OpRegistry& reg, const ArchConfig& arch) {
         // column of `rows` elements per cycle, so latency = ceil(elements/rows).
         // This is the array's intrinsic ingest bandwidth and matches the K-cycle
         // GEMM streaming model. It is deliberately NOT bounded by the narrow SRAM
-        // banking_factor (that bounds OBUF/IBUF SRAM r/w in BufferUnit, a
-        // different, narrower path).
+        // banking_factor (that bounds OBUF/IBUF SRAM r/w, a different, narrower
+        // path).
         const uint32_t ingest_lanes = arch.systolic.rows ? arch.systolic.rows : 1;
         Cycle lat = static_cast<Cycle>(std::ceil(
             static_cast<double>(elems) / static_cast<double>(ingest_lanes)));

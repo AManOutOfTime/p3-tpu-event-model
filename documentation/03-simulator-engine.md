@@ -165,7 +165,6 @@ The concrete latency models, all timing-only (no float math):
 | `VectorUnit` | [vector_unit.cpp](../src/units/vector_unit.cpp) | `passes·groups + exp_ops·exp_latency·groups`, `groups = ceil(elements/simd_width)` |
 | `AccessUnit` | [access_unit.cpp](../src/units/access_unit.cpp) | `ceil(elements / bandwidth)` |
 | `DelayUnit` | [delay_unit.cpp](../src/units/delay_unit.cpp) | fixed or payload-supplied latency (reference stub) |
-| `BufferUnit` | [buffer_unit.cpp](../src/units/buffer_unit.cpp) | double-buffered SRAM model — *defined but not instantiated* in `sim_main` |
 
 The systolic latency function deserves a note because it encodes the "no free
 speedup" physics that the array-size sweep needs. Weight-stationary:

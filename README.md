@@ -79,11 +79,11 @@ p3-tpu-event-model/
 │   └── val_*.yaml          #   validation workloads (real LLaMA-3-8B dims)
 ├── src/
 │   ├── CMakeLists.txt      # add new .cpp files here — nothing else to touch
-│   ├── core/               # event engine, Event, Unit base, types, logger, tensor_store
+│   ├── core/               # event engine, Event, Unit base, types, logger
 │   ├── config/             # ArchConfig (YAML load + typed fields + round-trip)
 │   ├── schedule/           # Instruction, Schedule, Scheduler, OpRegistry,
 │   │                       #   op_handlers, Tiler, llama_schedule (builder)
-│   └── units/              # systolic, dma, vector, access, buffer, delay, printing
+│   └── units/              # systolic, dma, vector, access, delay, printing
 ├── apps/sim_main.cpp       # CLI driver
 ├── tests/                  # doctest unit tests (test_*.cpp)
 ├── sweep.py / sweep_safe.py / compare.py   # design-space sweep drivers

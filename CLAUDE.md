@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **sP3** is a C++17 cycle-level, event-driven simulator for heterogeneous LLM accelerators (systolic array + vector/access cores + DMA), targeting LLaMA-3-8B inference. It exists to drive design-space sweeps — array size (edge 64² ↔ datacenter 256²+), unit counts, HBM bandwidth, SRAM capacity, dataflow — and answer "diminishing returns" / "where's the bottleneck (compute vs memory)" questions.
 
-**This branch is timing-only.** Units compute a latency, schedule an `OP_DONE`, and call `notify_done()`; they do **not** perform real float math. `src/core/tensor_store.h` exists but is **not wired into any unit** (no `set_tensor_store`, no `#include` outside itself) — treat the "real computation / numerical verification" story as aspirational, not current. This matters when extending: e.g. structural K-tiling can split GEMMs purely for timing/traffic without worrying about numerical correctness. The simulator is parametric via YAML architecture configs and supports hand-written or programmatically-generated instruction schedules.
+**This branch is timing-only.** Units compute a latency, schedule an `OP_DONE`, and call `notify_done()`; they do **not** perform real float math. There is no numerical-result data bus — treat the "real computation / numerical verification" story as aspirational, not current. This matters when extending: e.g. structural K-tiling can split GEMMs purely for timing/traffic without worrying about numerical correctness. The simulator is parametric via YAML architecture configs and supports hand-written or programmatically-generated instruction schedules.
 
 ## Project Status & Workflow
 
@@ -116,12 +116,10 @@ Handlers are registered with `OpRegistry` and invoked with an `IssueCtx {engine,
 | `kv_stage_release` | access_core | 0 cycles (dependency marker only) |
 
 ### 5. Metrics (`src/core/event_engine.cpp`, `apps/sim_main.cpp`)
-P0.2 accounting lives on `EventEngine`: per-unit `busy_cycles` (summed in `reserve_unit_pool`), global `total_macs_`/`total_hbm_bytes_` (added by handlers), and a shared SRAM working-set tracker (`sram_acquire/release`, peak + spill counters; capacity 0 = unlimited). `sim_main` reads these after `run()` to print the `== metrics ==` block.
-
-> **Note:** `src/core/tensor_store.h` (a named `unordered_map<string, vector<float>>` with slicing/verification helpers) is present but **dead in this branch** — no unit includes it and `sim_main` never constructs or injects it. There is no numerical-result data bus today; everything is timing-only.
+P0.2 accounting lives on `EventEngine`: per-unit `busy_cycles` (summed in `reserve_unit_pool`), global `total_macs_`/`total_hbm_bytes_` (added by handlers), and a shared SRAM working-set tracker (`sram_acquire/release`, peak + spill counters; capacity 0 = unlimited). `sim_main` reads these after `run()` to print the `== metrics ==` block. Everything is timing-only; there is no numerical-result data bus.
 
 ### 6. Hardware Units (`src/units/`)
-All derive from `Unit` and implement `handle(const Event&, EventEngine&)`. Units are timing-only: on `OP_START` they compute a latency, schedule an `OP_DONE` event; on `OP_DONE` they call `scheduler.notify_done()`. `DelayUnit` is the reference stub. `SystolicUnit`, `DmaUnit`, `VectorUnit`, `AccessUnit` are the models. `SystolicUnit` additionally **acquires its SRAM working set at `OP_START` and releases at `OP_DONE`** (P1.2) — acquiring at issue time would over-count, since the scheduler issues handlers far ahead of execution. `BufferUnit` models a double-buffered SRAM (IBUF or OBUF) — least-busy bank, latency `ceil(bytes / banking_factor)` — but note it is **not instantiated** in `sim_main` today (the systolic/dma/vector/access pools carry the timing).
+All derive from `Unit` and implement `handle(const Event&, EventEngine&)`. Units are timing-only: on `OP_START` they compute a latency, schedule an `OP_DONE` event; on `OP_DONE` they call `scheduler.notify_done()`. `DelayUnit` is the reference stub. `SystolicUnit`, `DmaUnit`, `VectorUnit`, `AccessUnit` are the models. `SystolicUnit` additionally **acquires its SRAM working set at `OP_START` and releases at `OP_DONE`** (P1.2) — acquiring at issue time would over-count, since the scheduler issues handlers far ahead of execution.
 
 ## Extending the Simulator
 
@@ -129,7 +127,7 @@ All derive from `Unit` and implement `handle(const Event&, EventEngine&)`. Units
 1. Create `src/units/my_unit.h/.cpp` deriving from `Unit`; implement `handle()` — on `OP_START` compute latency and schedule `OP_DONE`; on `OP_DONE` call `scheduler_->notify_done(e.instr)`.
 2. Add `units/my_unit.cpp` to `SIM_CORE_SOURCES` in `src/CMakeLists.txt`.
 3. Instantiate and `register_unit()` in `apps/sim_main.cpp`.
-4. Add a `dynamic_cast<MyUnit*>` branch in `wire_units()` in `apps/sim_main.cpp` to inject the `Scheduler*` (via `set_scheduler`) — without this the unit can't call `notify_done()`. (`wire_units` only injects the scheduler today; there is no TensorStore to wire.)
+4. Add a `dynamic_cast<MyUnit*>` branch in `wire_units()` in `apps/sim_main.cpp` to inject the `Scheduler*` (via `set_scheduler`) — without this the unit can't call `notify_done()`.
 
 **Add a new op handler:**
 ```cpp
@@ -177,6 +175,4 @@ The unit's `handle()` on `OP_DONE` must call `notify_done`.
 | `sweep.py` / `sweep_safe.py` / `compare.py` | Design-space sweep and HW×workload comparison drivers (see Design-Space Sweeps) |
 | `PLAN.md` / `AGENTS.md` | Live project status + agent update workflow (see Project Status & Workflow) |
 | `VALIDATION.md` | Validation report: schedule/TPU-timing fidelity, MAC/cycle self-consistency, RAM optimization tables |
-| `src/core/tensor_store.h` | Named float-buffer store with verification helpers — **present but unused/unwired in this branch** |
-| `src/units/buffer_unit.h/cpp` | Double-buffered SRAM model (IBUF/OBUF) — defined but not instantiated in `sim_main` |
 | `src/core/logger.h/cpp` | `ConsoleLogger` — attach to engine with `engine.set_trace([&](const Event& e){ logger(e); })` |

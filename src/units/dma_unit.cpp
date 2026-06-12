@@ -36,7 +36,7 @@ Cycle DmaUnit::transfer_latency(uint64_t bytes) const {
 //   (one per PE row) accept one column of `rows` elements per cycle. So the
 //   ingest bandwidth is `rows` elements/cycle = rows * dtype_bytes per cycle.
 //   This matches the K-cycle GEMM streaming model and is intentionally NOT
-//   bounded by the narrow SRAM banking_factor (that governs BufferUnit SRAM
+//   bounded by the narrow SRAM banking_factor (that governs on-chip SRAM
 //   r/w, a separate path).
 // ---------------------------------------------------------------------------
 Cycle DmaUnit::stage_latency(uint64_t bytes) const {
