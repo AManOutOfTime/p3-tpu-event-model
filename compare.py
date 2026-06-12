@@ -6,7 +6,7 @@ Runs every combination of HW configs × workload configs and emits a
 structured CSV of KPIs, plus a console summary table.
 
 Hardcoded matrix:
-  HW        : datacenter.yaml, edge_dev.yaml
+  HW        : configs/datacenter.yaml, configs/edge_dev.yaml
   Workloads : workloads/llama_prefill_decode_1B.yaml
               workloads/llama_prefill_decode_8B.yaml
               workloads/llama_prefill_decode_70B.yaml
@@ -22,11 +22,11 @@ Memory safety
   treated as a generic failure. The CSV row is written with status=MEM_ERR
   and all metric columns left empty so downstream tooling can filter it out.
 
-Usage:
-  python3 scripts/compare.py [--binary PATH] [--dry-run] [--out FILE]
-                             [--modes prefill_decode,decode]
-                             [--hw datacenter.yaml,edge_dev.yaml]
-                             [--workloads wl1.yaml,wl2.yaml,wl3.yaml]
+Usage (run from the repo root):
+  python3 compare.py [--binary PATH] [--dry-run] [--out FILE]
+                     [--modes prefill_decode,decode]
+                     [--hw configs/datacenter.yaml,configs/edge_dev.yaml]
+                     [--workloads wl1.yaml,wl2.yaml,wl3.yaml]
 
 Output columns mirror sweep.py CSV_FIELDS so the two CSVs can be
 concatenated and analysed together.
@@ -42,8 +42,8 @@ DEFAULT_OUTFILE = f"compare_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 SIM_TIMEOUT_S   = 600   # 10 min hard cap per run
 
 DEFAULT_HW_CONFIGS = [
-    "datacenter.yaml",
-    "edge_dev.yaml",
+    "configs/datacenter.yaml",
+    "configs/edge_dev.yaml",
 ]
 
 DEFAULT_WORKLOADS = [

@@ -17,7 +17,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 # Configure and build
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build --parallel                     # Linux/macOS
+cmake --build build --config Release --parallel     # Windows (MSVC ignores CMAKE_BUILD_TYPE)
 
 # Run with defaults (configs/default.yaml + schedules/dummy_example.yaml)
 ./build/apps/sim_main
@@ -41,17 +42,18 @@ Every run ends with a `== metrics ==` block (P0.2): per-pool utilization, total 
 
 Dependencies (yaml-cpp 0.8.0, doctest v2.4.11) are auto-fetched by CMake — no manual install needed.
 
-On Windows (MSVC), the binary lands at `build\apps\Release\sim_main.exe` (use that path in place of `./build/apps/sim_main`).
+On Windows (MSVC), Visual Studio is a multi-config generator and **ignores** `-DCMAKE_BUILD_TYPE` — `cmake --build build` alone yields a Debug build under `build\apps\Debug\`. With `--config Release` (above) the binary lands at `build\apps\Release\sim_main.exe` (use that path in place of `./build/apps/sim_main`).
 
 ## Tests
 
 ```bash
 # Run all tests
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure             # Linux/macOS
+ctest --test-dir build -C Release --output-on-failure   # Windows (MSVC — must pass -C <config>)
 
 # Run the test binary directly
 ./build/tests/unit_tests                   # Linux/macOS
-build\tests\Debug\unit_tests.exe           # Windows (MSVC)
+build\tests\Release\unit_tests.exe         # Windows (MSVC; use Debug\ if built without --config Release)
 
 # Run a single named test case (doctest filter)
 ./build/tests/unit_tests -tc="My test name"
@@ -61,15 +63,15 @@ Test files live in `tests/`. To add a test: create a `.cpp` file and list it in 
 
 ## Design-Space Sweeps & Comparison Scripts
 
-The project's headline deliverable is sweep data answering "where's the bottleneck" questions across hardware configurations. Three root-level Python scripts drive `sim_main` in batches with `--no-trace` and write CSVs:
+The project's headline deliverable is sweep data answering "where's the bottleneck" questions across hardware configurations. Three Python scripts drive `sim_main` in batches with `--no-trace` and write CSVs. `compare.py` is at the repo root; `sweep.py` / `sweep_safe.py` live in `sweep/scripts/`. **Run all three from the repo root** — they resolve `configs/…`, `workloads/…`, and the `sim_main` binary by relative path. On Windows (MSVC), pass `--binary build/apps/Release/sim_main.exe` for real runs (the scripts default to the Linux path `./build/apps/sim_main`); `--dry-run` previews need no binary.
 
-- **`sweep.py`** — single-axis sweeps on top of a base config (default `configs/default.yaml`, no PyYAML dependency). Groups: `1a`-`1f` compute (array size, systolic unit count, bidirectional, vector cores, SIMD width × exp_latency, access bandwidth), `2a`-`2e` memory (HBM bandwidth, HBM latency, DMA channels, `stage_double_buffer`, SRAM pressure via `model_sram`), `3a`-`3e` software (prompt length, tile size, KV cache on/off, head_dim × hidden_dim, max_seq_len/KV footprint), `4a`/`4b` GQA group size (8B/70B), `5` array-size × HBM-bw Pareto grid, `6` calibration against published roofline efficiency (target ±20%).
+- **`sweep/scripts/sweep.py`** — single-axis sweeps on top of a base config (default `configs/default.yaml`, no PyYAML dependency). Groups: `1a`-`1f` compute (array size, systolic unit count, bidirectional, vector cores, SIMD width × exp_latency, access bandwidth), `2a`-`2e` memory (HBM bandwidth, HBM latency, DMA channels, `stage_double_buffer`, SRAM pressure via `model_sram`), `3a`-`3e` software (prompt length, tile size, KV cache on/off, head_dim × hidden_dim, max_seq_len/KV footprint), `4a`/`4b` GQA group size (8B/70B), `5` array-size × HBM-bw Pareto grid, `6` calibration against published roofline efficiency (target ±20%).
   ```bash
-  python3 sweep.py --dry-run --group 1b           # preview a group's config table
-  python3 sweep.py --model 8b --group 3e --out sweep_3e.csv
-  python3 sweep.py --model both                   # run every group on 8B and 70B (slow)
+  python3 sweep/scripts/sweep.py --dry-run --group 1b           # preview a group's config table
+  python3 sweep/scripts/sweep.py --model 8b --group 3e --out sweep_3e.csv
+  python3 sweep/scripts/sweep.py --model both                   # run every group on 8B and 70B (slow)
   ```
-- **`sweep_safe.py`** — memory-constrained variant (tuned for ~16 GB / 4-CPU pods, ~2.4 GB/run): caps `prompt_len`/`max_seq_len` (`SAFE_PLEN=512`, `SAFE_MAXSEQ=4096`), treats subprocess exit 137 as `OOM_KILLED` and other non-zero exits as `EXIT_N` (writes a `FAILED` row and continues), and adds `--focused` (high-signal groups `1b,1c,2a,2d,3c,4a` only, ~60 configs/~35 min) and `--no-modes` (run `prefill_decode` only, skipping the separate `decode` pass).
+- **`sweep/scripts/sweep_safe.py`** — memory-constrained variant (tuned for ~16 GB / 4-CPU pods, ~2.4 GB/run): caps `prompt_len`/`max_seq_len` (`SAFE_PLEN=512`, `SAFE_MAXSEQ=4096`), treats subprocess exit 137 as `OOM_KILLED` and other non-zero exits as `EXIT_N` (writes a `FAILED` row and continues), and adds `--focused` (high-signal groups `1b,1c,2a,2d,3c,4a` only, ~60 configs/~35 min) and `--no-modes` (run `prefill_decode` only, skipping the separate `decode` pass).
 - **`compare.py`** — fixed cross-product: `configs/datacenter.yaml` × `configs/edge_dev.yaml` × `workloads/llama_prefill_decode_{1B,8B,70B}.yaml` × `{prefill_decode, decode}` modes (12 runs), emitting KPI columns compatible with the sweep CSVs (TTFT for `prefill_decode`, decode tok/s for `decode`). Marks runs `MEM_ERR` (vs. a generic failure) when sim output matches known OOM signal strings.
 
 `configs/edge_dev.yaml` (64×64 array, 1 systolic unit, ~0.1 TB/s LPDDR5X-class HBM — modeled on Apple M3 / Snapdragon NPU) and `configs/datacenter.yaml` (256×256 array, 8 systolic units, 3.35 TB/s HBM3 — modeled on H100 SXM5) are the two preset HW profiles these scripts compare against `configs/default.yaml`. Pre-existing `sweep_*.csv` / `*_results.csv` / `edge_dev*.csv` / `datacenter.csv` files at repo root are prior sweep outputs — useful as a schema/value-range reference.
@@ -171,8 +173,8 @@ The unit's `handle()` on `OP_DONE` must call `notify_done`.
 | `schedules/dummy_example.yaml` | Minimal sample schedule (4 `delay` ops across units; the default if no schedule is given) |
 | `schedules/fa2_single_tile.yaml` | 22-instruction FlashAttention-2 single-tile schedule |
 | `workloads/val_*.yaml` | Validation workloads (real LLaMA-3-8B dims): single head, layer, full 8B, GQA vs MHA, causal vs non-causal |
-| `workloads/llama_prefill_decode_{1B,8B,70B}.yaml` | Model-size workloads driving `sweep.py`/`sweep_safe.py`/`compare.py` |
-| `sweep.py` / `sweep_safe.py` / `compare.py` | Design-space sweep and HW×workload comparison drivers (see Design-Space Sweeps) |
+| `workloads/llama_prefill_decode_{1B,8B,70B}.yaml` | Model-size workloads driving `sweep/scripts/sweep.py`/`sweep_safe.py`/`compare.py` |
+| `sweep/scripts/sweep.py` / `sweep/scripts/sweep_safe.py` / `compare.py` | Design-space sweep and HW×workload comparison drivers (see Design-Space Sweeps) |
 | `PLAN.md` / `AGENTS.md` | Live project status + agent update workflow (see Project Status & Workflow) |
 | `VALIDATION.md` | Validation report: schedule/TPU-timing fidelity, MAC/cycle self-consistency, RAM optimization tables |
 | `src/core/logger.h/cpp` | `ConsoleLogger` — attach to engine with `engine.set_trace([&](const Event& e){ logger(e); })` |

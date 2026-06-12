@@ -21,7 +21,8 @@ prefill runs in minutes.
 ```bash
 # 1. Configure + build (deps yaml-cpp + doctest are auto-fetched by CMake)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build --parallel                     # Linux/macOS
+cmake --build build --config Release --parallel    # Windows (MSVC ignores CMAKE_BUILD_TYPE — pass --config)
 
 # 2. Run the default smoke test (configs/default.yaml + schedules/dummy_example.yaml)
 ./build/apps/sim_main                     # Linux/macOS
@@ -34,7 +35,8 @@ build\apps\Release\sim_main.exe           # Windows (MSVC)
   --no-trace
 
 # 4. Run the tests
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure             # Linux/macOS
+ctest --test-dir build -C Release --output-on-failure  # Windows (MSVC — must pass -C <config>)
 ```
 
 Every run ends with a `== metrics ==` block: per-pool utilization, total MACs,
@@ -86,7 +88,8 @@ p3-tpu-event-model/
 │   └── units/              # systolic, dma, vector, access, delay, printing
 ├── apps/sim_main.cpp       # CLI driver
 ├── tests/                  # doctest unit tests (test_*.cpp)
-├── sweep.py / sweep_safe.py / compare.py   # design-space sweep drivers
+├── compare.py              # HW×workload comparison driver (repo root)
+├── sweep/scripts/          # sweep.py / sweep_safe.py design-space sweep drivers
 ├── documentation/          # developer guides (unit / op / engine internals)
 ├── CLAUDE.md               # architecture deep-dive + modeling knobs
 ├── VALIDATION.md           # fidelity + RAM/timing validation report
@@ -103,13 +106,20 @@ automatically by CMake on first configure; nothing to install manually.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build --parallel                     # Linux/macOS
+cmake --build build --config Release --parallel    # Windows (MSVC)
 ```
+
+> **Windows / MSVC note:** Visual Studio is a *multi-config* generator, so it
+> **ignores** `-DCMAKE_BUILD_TYPE=Release` at configure time — `cmake --build build`
+> alone produces a **Debug** build under `build\apps\Debug\`. Pass
+> `--config Release` (as above) to get the Release binary at the path below.
 
 | Platform | `sim_main` binary | test binary |
 |---|---|---|
 | Linux / macOS | `build/apps/sim_main` | `build/tests/unit_tests` |
-| Windows (MSVC) | `build\apps\Release\sim_main.exe` | `build\tests\Debug\unit_tests.exe` |
+| Windows (MSVC, `--config Release`) | `build\apps\Release\sim_main.exe` | `build\tests\Release\unit_tests.exe` |
+| Windows (MSVC, default Debug) | `build\apps\Debug\sim_main.exe` | `build\tests\Debug\unit_tests.exe` |
 
 Substitute the platform path wherever this README writes `./build/apps/sim_main`.
 
@@ -119,15 +129,20 @@ Substitute the platform path wherever this README writes `./build/apps/sim_main`
 
 ```bash
 # All tests via CTest
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure             # Linux/macOS
+ctest --test-dir build -C Release --output-on-failure  # Windows (MSVC — must pass -C <config>)
 
 # Or run the binary directly for full doctest output
 ./build/tests/unit_tests                   # Linux/macOS
-build\tests\Debug\unit_tests.exe           # Windows
+build\tests\Release\unit_tests.exe         # Windows (use Debug\ if built without --config Release)
 
 # A single test case by name (doctest filter)
 ./build/tests/unit_tests -tc="serial chain: total cycles = sum of individual latencies"
 ```
+
+> **Windows / MSVC note:** `ctest --test-dir build` without `-C <config>` fails with
+> *"Test not available without configuration. (Missing `-C <config>`?)"* — pass
+> `-C Release` (or `-C Debug`, matching how you built) as shown above.
 
 Test files live in [`tests/`](tests). To add one: create `tests/test_<thing>.cpp`
 and append the filename to `SIM_TEST_SOURCES` in
@@ -159,16 +174,17 @@ regardless of the working directory.)
 `--config` defaults to `configs/default.yaml`. If no input flag is given,
 `schedules/dummy_example.yaml` is used.
 
-Expected output for `dummy_example.yaml` (a 320-cycle serial chain
-`DMA 50 → transpose 30 → GEMM 200 → softmax 40`):
+Expected output for `dummy_example.yaml` (an 888-cycle serial chain
+`DMA 50 → transpose 30 → GEMM 768 → softmax 40`; the GEMM cost comes from the
+weight-stationary latency model on the 256² array, not a literal `200`):
 
 ```
 == simulation start  instructions=4 ==
 [cycle        0 | 0.000 ns]  OP_START     -> dma_0     "DMA load K_tile from HBM"
-  [dma_0]  START  instr=0  @cycle=0  lat=50  "DMA load K_tile from HBM"
-  [dma_0]  DONE   instr=0  @cycle=50  "DMA load K_tile from HBM"
+  [dma_0]  DMA_START  instr=0  @cycle=0  lat=50  "DMA load K_tile from HBM"
+  [dma_0]  DMA_DONE   instr=0  @cycle=50  "DMA load K_tile from HBM"
 ...
-== simulation done  cycle=320  (320.000 ns)  outstanding=0 ==
+== simulation done  cycle=888  (888.000 ns)  outstanding=0 ==
 
 == metrics ==
   ...per-pool utilization, MACs, HBM bytes, roofline, (SRAM, TTFT/throughput)...
@@ -323,22 +339,29 @@ alongside the usual metrics.
 
 ## Design-space sweeps
 
-Three root-level Python drivers run `sim_main` in batches (always with
-`--no-trace`) and write CSVs. They need only a working `sim_main` and Python 3 (no
-PyYAML required by `sweep.py`).
+Three Python drivers run `sim_main` in batches (always with `--no-trace`) and write
+CSVs. They need only a working `sim_main` and Python 3 (no PyYAML required by
+`sweep.py`). `compare.py` lives at the repo root; `sweep.py` / `sweep_safe.py` live
+in [`sweep/scripts/`](sweep/scripts). **Run all three from the repo root** — they
+resolve `configs/…`, `workloads/…`, and the `sim_main` binary by relative path.
 
 | Script | What it does |
 |---|---|
-| [`sweep.py`](sweep.py) | Varies **one axis at a time** on top of a base config. Groups `1a–1f` (compute: array size, systolic count, bidirectional, vector cores, SIMD width, access BW), `2a–2e` (memory: HBM BW/latency, DMA channels, `stage_double_buffer`, SRAM pressure), `3a–3e` (software: prompt length, tile size, KV cache, head/hidden dim, KV footprint), `4a/4b` (GQA group size), `5` (array × HBM-BW Pareto grid), `6` (calibration vs published roofline efficiency). |
-| [`sweep_safe.py`](sweep_safe.py) | Memory-constrained variant (~16 GB / 4-CPU pods): caps `prompt_len`/`max_seq_len`, treats OOM (exit 137) and other failures as recoverable `FAILED` rows, and adds `--focused` (high-signal groups only) and `--no-modes`. |
-| [`compare.py`](compare.py) | Fixed cross-product `datacenter.yaml × edge_dev.yaml × {1B,8B,70B} × {prefill_decode, decode}` (12 runs), emitting KPI columns compatible with the sweep CSVs. |
+| [`sweep/scripts/sweep.py`](sweep/scripts/sweep.py) | Varies **one axis at a time** on top of a base config. Groups `1a–1f` (compute: array size, systolic count, bidirectional, vector cores, SIMD width, access BW), `2a–2e` (memory: HBM BW/latency, DMA channels, `stage_double_buffer`, SRAM pressure), `3a–3e` (software: prompt length, tile size, KV cache, head/hidden dim, KV footprint), `4a/4b` (GQA group size), `5` (array × HBM-BW Pareto grid), `6` (calibration vs published roofline efficiency). |
+| [`sweep/scripts/sweep_safe.py`](sweep/scripts/sweep_safe.py) | Memory-constrained variant (~16 GB / 4-CPU pods): caps `prompt_len`/`max_seq_len`, treats OOM (exit 137) and other failures as recoverable `FAILED` rows, and adds `--focused` (high-signal groups only) and `--no-modes`. |
+| [`compare.py`](compare.py) | Fixed cross-product `configs/datacenter.yaml × configs/edge_dev.yaml × {1B,8B,70B} × {prefill_decode, decode}` (12 runs), emitting KPI columns compatible with the sweep CSVs. |
 
 ```bash
-python3 sweep.py --dry-run --group 1b               # preview a group's config table
-python3 sweep.py --model 8b --group 3e --out sweep_3e.csv
-python3 sweep_safe.py --focused --out sweep_focused.csv
+python3 sweep/scripts/sweep.py --dry-run --group 1b           # preview a group's config table
+python3 sweep/scripts/sweep.py --model 8b --group 3e --out sweep_3e.csv
+python3 sweep/scripts/sweep_safe.py --focused --out sweep_focused.csv
 python3 compare.py --dry-run
 ```
+
+> **Windows note:** `sweep.py`/`sweep_safe.py` default to the Linux binary path
+> (`./build/apps/sim_main`). For a real sweep on Windows (MSVC), point them at the
+> built binary: `--binary build/apps/Release/sim_main.exe`. `--dry-run` previews
+> need no binary. `compare.py` accepts the same `--binary` override.
 
 Key KPIs: TTFT (prefill latency), decode tok/s, `hbm_util_pct` (calibration
 target), `roofline_eff_pct`, `mem_compute_ratio` (>1 = memory-bound),

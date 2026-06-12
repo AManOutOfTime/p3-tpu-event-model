@@ -361,9 +361,14 @@ int main(int argc, char** argv) {
             else
                 tokens = pp.llama_cfg.seq_len;
             std::cout << "  TTFT=" << cycles_to_ns(final_cycle, arch.clock_ghz) << " ns\n";
-            if (tokens > 0 && sec > 0)
+            if (tokens > 0 && sec > 0) {
                 std::cout << "  throughput=" << (tokens / sec) << " tok/s"
-                          << "  (" << tokens << " tokens) prefill tokens + 1 decode " << pp.llama_cfg.generation_steps << " decode tokens\n";
+                          << "  (" << tokens << " tokens";
+                if (pp.llama_cfg.mode == "prefill_decode")
+                    std::cout << " = " << pp.llama_cfg.prompt_len << " prefill + "
+                              << pp.llama_cfg.generation_steps << " decode";
+                std::cout << ")\n";
+            }
         }
     }
 
