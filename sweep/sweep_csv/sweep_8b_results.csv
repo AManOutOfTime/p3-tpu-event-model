@@ -1,0 +1,14 @@
+group,name,model,description,clock_ghz,array_rows,array_cols,bidirectional,systolic_units,vector_cores,access_cores,vec_simd,exp_lat,access_bw,dma_channels,hbm_bw_tb_s,hbm_lat_cycles,ibuf_kb,obuf_kb,stage_double_buffer,model_sram,tile_rows,tile_cols,mode,num_layers,hidden_dim,head_dim,intermediate_dim,num_q_heads,num_kv_heads,gqa_group,prompt_len,gen_steps,max_seq_len,kv_cache,cycles,MACs,hbm_bytes,systolic_util_pct,systolic_0_util_pct,systolic_1_util_pct,dma_util_pct,vec_util_pct,access_util_pct,roofline_eff_pct,roofline_bound,compute_bound_cyc,memory_bound_cyc,ttft_ns,decode_tps,tflops_achieved,hbm_bw_achieved_tb_s,tflops_peak,hbm_util_pct,arith_intensity,ttft_per_token_ns,bytes_per_token,systolic_imbalance,mem_compute_ratio,ffn_mac_pct,attn_mac_pct,ffn_attn_crossover_tok,pub_hbm_util_pct,pub_tps_bs1,calib_hbm_err_pct,wall_s,peak_rss_mb,status
+3e_decode_ctx,ctx256,8b,mode=decode  ctx=256  kv=0.03GB  true_decode_tps,1.0,256,256,True,2,3,1,64,4,64,1,2.0,200,4096,4096,True,True,256,256,decode,32,4096,128,14336,32,8,4,256,32,4096,True,142296842,7572029440,15043690496,78.3842,90.4479,66.3204,26.1087,0.164083,0.122859,5.28602,memory-bound,28885.0,7521850.0,142297000.0,224.882,0.1064,0.1057,524.288,5.29,0.5,,470115328,24.13,260.407,80.0,20.0,21504,,,,3.6,,OK
+3e_decode_ctx,ctx512,8b,mode=decode  ctx=512  kv=0.07GB  true_decode_tps,1.0,256,256,True,2,3,1,64,4,64,1,2.0,200,4096,4096,True,True,256,256,decode,32,4096,128,14336,32,8,4,512,32,4096,True,143083274,7639138304,15077244928,78.503,90.5004,66.5055,25.9784,0.172962,0.213789,5.2687,memory-bound,29141.0,7538620.0,143083000.0,223.646,0.1068,0.1054,524.288,5.27,0.51,,471163904,23.99,258.695,79.2,20.8,21504,,,,3.7,,OK
+3e_decode_ctx,ctx1024,8b,mode=decode  ctx=1024  kv=0.13GB  true_decode_tps,1.0,256,256,True,2,3,1,64,4,64,1,2.0,200,4096,4096,True,True,256,256,decode,32,4096,128,14336,32,8,4,1024,32,4096,True,144656138,7773356032,15144353792,78.7367,90.6037,66.8697,25.7222,0.19043,0.392683,5.2346,memory-bound,29653.0,7572180.0,144656000.0,221.214,0.1075,0.1047,524.288,5.24,0.51,,473261056,23.73,255.36,77.8,22.2,21504,,,,3.8,,OK
+3e_decode_ctx,ctx2048,8b,mode=decode  ctx=2048  kv=0.27GB  true_decode_tps,1.0,256,256,True,2,3,1,64,4,64,1,2.0,200,4096,4096,True,True,256,256,decode,32,4096,128,14336,32,8,4,2048,32,4096,True,147801866,8041791488,15278571520,79.1893,90.8037,67.5748,25.226,0.224251,0.739049,5.1686,memory-bound,30677.0,7639290.0,147802000.0,216.506,0.1088,0.1034,524.288,5.17,0.53,,477455360,23.23,249.023,75.0,25.0,21504,,,,4.3,,OK
+
+
+# ===== CALIBRATION REFERENCE =====
+# Metric : hbm_util_pct = hbm_bw_achieved / hbm_bw_peak
+# Target : ±20% of pub_hbm_util_pct  with  stage_double_buffer=ON
+# chip,hbm_bw_tb_s,pub_bs1_tps,pub_hbm_util_pct
+# H100_SXM5,3.35,120,64.5
+# A100_SXM4,2.0,70,63.0
+# TPUv4_chip,1.2,60,90.0
