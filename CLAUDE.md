@@ -8,6 +8,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **This branch is timing-only.** Units compute a latency, schedule an `OP_DONE`, and call `notify_done()`; they do **not** perform real float math. `src/core/tensor_store.h` exists but is **not wired into any unit** (no `set_tensor_store`, no `#include` outside itself) — treat the "real computation / numerical verification" story as aspirational, not current. This matters when extending: e.g. structural K-tiling can split GEMMs purely for timing/traffic without worrying about numerical correctness. The simulator is parametric via YAML architecture configs and supports hand-written or programmatically-generated instruction schedules.
 
+## Project Status & Workflow
+
+`PLAN.md` is the living source of truth for project status — current verified build/test/runtime state, completed work, changed files, and remaining issues. Per `AGENTS.md`, read `PLAN.md` before editing code (identify the current incomplete step, verify existing code state, avoid redoing completed work), and update it after finishing (mark completed items, record changed files, note tests run and remaining issues).
+
 ## Build & Run
 
 ```bash
@@ -54,6 +58,21 @@ build\tests\Debug\unit_tests.exe           # Windows (MSVC)
 ```
 
 Test files live in `tests/`. To add a test: create a `.cpp` file and list it in `tests/CMakeLists.txt`.
+
+## Design-Space Sweeps & Comparison Scripts
+
+The project's headline deliverable is sweep data answering "where's the bottleneck" questions across hardware configurations. Three root-level Python scripts drive `sim_main` in batches with `--no-trace` and write CSVs:
+
+- **`sweep.py`** — single-axis sweeps on top of a base config (default `configs/default.yaml`, no PyYAML dependency). Groups: `1a`-`1f` compute (array size, systolic unit count, bidirectional, vector cores, SIMD width × exp_latency, access bandwidth), `2a`-`2e` memory (HBM bandwidth, HBM latency, DMA channels, `stage_double_buffer`, SRAM pressure via `model_sram`), `3a`-`3e` software (prompt length, tile size, KV cache on/off, head_dim × hidden_dim, max_seq_len/KV footprint), `4a`/`4b` GQA group size (8B/70B), `5` array-size × HBM-bw Pareto grid, `6` calibration against published roofline efficiency (target ±20%).
+  ```bash
+  python3 sweep.py --dry-run --group 1b           # preview a group's config table
+  python3 sweep.py --model 8b --group 3e --out sweep_3e.csv
+  python3 sweep.py --model both                   # run every group on 8B and 70B (slow)
+  ```
+- **`sweep_safe.py`** — memory-constrained variant (tuned for ~16 GB / 4-CPU pods, ~2.4 GB/run): caps `prompt_len`/`max_seq_len` (`SAFE_PLEN=512`, `SAFE_MAXSEQ=4096`), treats subprocess exit 137 as `OOM_KILLED` and other non-zero exits as `EXIT_N` (writes a `FAILED` row and continues), and adds `--focused` (high-signal groups `1b,1c,2a,2d,3c,4a` only, ~60 configs/~35 min) and `--no-modes` (run `prefill_decode` only, skipping the separate `decode` pass).
+- **`compare.py`** — fixed cross-product: `configs/datacenter.yaml` × `configs/edge_dev.yaml` × `workloads/llama_prefill_decode_{1B,8B,70B}.yaml` × `{prefill_decode, decode}` modes (12 runs), emitting KPI columns compatible with the sweep CSVs (TTFT for `prefill_decode`, decode tok/s for `decode`). Marks runs `MEM_ERR` (vs. a generic failure) when sim output matches known OOM signal strings.
+
+`configs/edge_dev.yaml` (64×64 array, 1 systolic unit, ~0.1 TB/s LPDDR5X-class HBM — modeled on Apple M3 / Snapdragon NPU) and `configs/datacenter.yaml` (256×256 array, 8 systolic units, 3.35 TB/s HBM3 — modeled on H100 SXM5) are the two preset HW profiles these scripts compare against `configs/default.yaml`. Pre-existing `sweep_*.csv` / `*_results.csv` / `edge_dev*.csv` / `datacenter.csv` files at repo root are prior sweep outputs — useful as a schema/value-range reference.
 
 ## Architecture
 
@@ -150,9 +169,13 @@ The unit's `handle()` on `OP_DONE` must call `notify_done`.
 | `src/schedule/llama_schedule.h/cpp` | Programmatic LLaMA workload generation |
 | `apps/sim_main.cpp` | CLI entry point |
 | `configs/default.yaml` | Architecture parameters (edit without rebuild) |
+| `configs/edge_dev.yaml` / `configs/datacenter.yaml` | Preset HW profiles (edge SoC vs. H100-class) for sweeps/`compare.py` |
 | `schedules/dummy_example.yaml` | Minimal sample schedule (4 `delay` ops across units; the default if no schedule is given) |
 | `schedules/fa2_single_tile.yaml` | 22-instruction FlashAttention-2 single-tile schedule |
 | `workloads/val_*.yaml` | Validation workloads (real LLaMA-3-8B dims): single head, layer, full 8B, GQA vs MHA, causal vs non-causal |
+| `workloads/llama_prefill_decode_{1B,8B,70B}.yaml` | Model-size workloads driving `sweep.py`/`sweep_safe.py`/`compare.py` |
+| `sweep.py` / `sweep_safe.py` / `compare.py` | Design-space sweep and HW×workload comparison drivers (see Design-Space Sweeps) |
+| `PLAN.md` / `AGENTS.md` | Live project status + agent update workflow (see Project Status & Workflow) |
 | `VALIDATION.md` | Validation report: schedule/TPU-timing fidelity, MAC/cycle self-consistency, RAM optimization tables |
 | `src/core/tensor_store.h` | Named float-buffer store with verification helpers — **present but unused/unwired in this branch** |
 | `src/units/buffer_unit.h/cpp` | Double-buffered SRAM model (IBUF/OBUF) — defined but not instantiated in `sim_main` |
