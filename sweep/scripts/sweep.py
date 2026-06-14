@@ -271,15 +271,40 @@ def regime(wl):
 
 # ── Calibration reference ─────────────────────────────────────────────────────
 # Metric: hbm_util_pct = hbm_bw_achieved / hbm_bw_peak  (NOT absolute TPS)
-# bytes_per_token ≈ 16 GB (8B BF16 weights) + 2 GB KV @ 2K ctx = 18 GB
-BYTES_PER_TOKEN = 18e9
+# Llama-3 8B, GQA: 8 KV heads, 32 layers, head_dim=128, BF16
+#   weights : 8 B params × 2 B                             = 16.000 GB
+#   KV cache: 2 × 32 × 8 × 128 × 2 B × 2 048 tok ≈ 0.268 GB
+#   total                                                  = 16.268 GB
+BYTES_PER_TOKEN = 16.27e9   # was 18e9 — old KV term (~2 GB) was ~8× too large
+
 CALIB = {
-    "H100_SXM5":  dict(hbm_bw_tb_s=3.35, hbm_lat_cycles=280, dma_channels=2,
-                       clock_ghz=1.98,  vector_cores=4, pub_tps_bs1=120),
-    "A100_SXM4":  dict(hbm_bw_tb_s=2.00, hbm_lat_cycles=200, dma_channels=1,
-                       clock_ghz=1.41,  vector_cores=3, pub_tps_bs1=70),
-    "TPUv4_chip": dict(hbm_bw_tb_s=1.20, hbm_lat_cycles=140, dma_channels=1,
-                       clock_ghz=0.275, vector_cores=2, pub_tps_bs1=60),
+    "H100_SXM5": dict(
+        hbm_bw_tb_s=3.35,
+        hbm_lat_cycles=280,     # 280 / 1.98 GHz ≈ 141 ns — same physical ns as A100 ✓
+        dma_channels=2,
+        clock_ghz=1.98,
+        vector_cores=4,
+        pub_tps_bs1=120,        # 16.27 GB / 3.35 TB/s → 58% BW util ✓ (unchanged)
+    ),
+    "A100_SXM4": dict(
+        hbm_bw_tb_s=2.00,
+        hbm_lat_cycles=200,     # 200 / 1.41 GHz ≈ 142 ns ✓ (unchanged)
+        dma_channels=1,
+        clock_ghz=1.41,
+        vector_cores=3,
+        pub_tps_bs1=70,         # 16.27 GB / 2.00 TB/s → 57% BW util ✓ (unchanged)
+    ),
+    "TPUv4_chip": dict(
+        hbm_bw_tb_s=1.20,
+        hbm_lat_cycles=140,     # 140 / 1.05 GHz ≈ 133 ns
+        dma_channels=1,
+        clock_ghz=1.05,
+        vector_cores=2,
+        pub_tps_bs1=43,         # was 60 → implied 90% util; 73.7 TPS max × 58% ≈ 43
+        array_rows=128,
+        array_cols=128,         # was 256; one MXU is 128×128  (→ YAML systolic.cols)
+        systolic_units=4,       # new; 4 MXUs per chip          (→ YAML systolic_units)
+    ),
 }
 for chip, p in CALIB.items():
     p["pub_hbm_util_pct"] = round(
