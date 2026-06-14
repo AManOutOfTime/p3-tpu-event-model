@@ -1,0 +1,6 @@
+[  1/6] 6_calibration/H100_SXM5_base [8b]  t=0s eta~?s ... 
+sys=82.1% dma=12.0% rl= 3.17% AI=  0.5 mcr=147.13 tps=  13.9 ttft/tok=       0ns   memory-bound  153s [B/tok=15.28GB ref=16.27GB err=-6.1% ✓]
+[  2/6] 6_calibration/H100_SXM5_sdb [8b]  t=152s eta~760s ... sys=82.1% dma=12.0% rl= 3.17% AI=  0.5 mcr=147.13 tps=  13.9 ttft/tok=       0ns   memory-bound  152s [B/tok=15.28GB ref=16.27GB err=-6.1% ✓]
+[  3/6] 6_calibration/A100_SXM4_base [8b]  t=304s eta~608s ... sys=77.6% dma=26.8% rl= 7.14% AI=  0.5 mcr=350.99 tps=   9.3 ttft/tok=       0ns   memory-bound  153s [B/tok=15.28GB ref=16.27GB err=-6.1% ✓]
+[  4/6] 6_calibration/A100_SXM4_sdb [8b]  t=457s eta~457s ... sys=77.6% dma=26.8% rl= 7.14% AI=  0.5 mcr=350.99 tps=   9.3 ttft/tok=       0ns   memory-bound  152s [B/tok=15.28GB ref=16.27GB err=-6.1% ✓]
+[  5/6] 6_calibration/TPUv4_chip_base [8b]  t=609s eta~304s ... command terminated with exit code 137
