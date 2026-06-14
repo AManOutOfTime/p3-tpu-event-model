@@ -350,6 +350,8 @@ int main(int argc, char** argv) {
         if (pp.used_llama) {
             uint64_t tokens = 0;
             if      (pp.llama_cfg.mode == "decode")
+                // generation_steps is now correct: the schedule loops that many
+                // sequential single-token steps (fixed in llama_schedule.cpp).
                 tokens = pp.llama_cfg.generation_steps;
             else if (pp.llama_cfg.mode == "prefill")
                 tokens = pp.llama_cfg.prompt_len;
@@ -360,7 +362,14 @@ int main(int argc, char** argv) {
                 tokens = pp.llama_cfg.prompt_len + pp.llama_cfg.generation_steps;
             else
                 tokens = pp.llama_cfg.seq_len;
+            // For decode, TTFT = total time for all generation_steps steps.
+            // Also print time_per_token so callers can identify per-step cost.
             std::cout << "  TTFT=" << cycles_to_ns(final_cycle, arch.clock_ghz) << " ns\n";
+            if (pp.llama_cfg.mode == "decode" && pp.llama_cfg.generation_steps > 0)
+                std::cout << "  time_per_token="
+                          << cycles_to_ns(final_cycle, arch.clock_ghz)
+                             / static_cast<double>(pp.llama_cfg.generation_steps)
+                          << " ns\n";
             if (tokens > 0 && sec > 0) {
                 std::cout << "  throughput=" << (tokens / sec) << " tok/s"
                           << "  (" << tokens << " tokens";

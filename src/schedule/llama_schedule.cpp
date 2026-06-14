@@ -1353,7 +1353,10 @@ static size_t estimate_instruction_count(const LlamaScheduleConfig& cfg) {
     if (cfg.mode == "layer" || cfg.mode == "prefill")
         return kLayer * cfg.num_layers + kFixed;
     if (cfg.mode == "decode")
-        return kDecode * cfg.num_layers + kFixed;
+        // Each of the generation_steps autoregressive steps emits one decode
+        // layer-stack worth of instructions.
+        return kDecode * cfg.num_layers * static_cast<size_t>(cfg.generation_steps)
+             + kFixed;
     if (cfg.mode == "prefill_decode")
         return kLayer  * cfg.num_layers
              + kDecode * cfg.num_layers * static_cast<size_t>(cfg.generation_steps)
@@ -1367,19 +1370,53 @@ Schedule build_transformer_layer_schedule(const LlamaScheduleConfig& input_cfg, 
     Builder b;
     b.minimal = minimal;
     b.out.reserve(estimate_instruction_count(cfg));
-    const uint32_t q_len = cfg.mode == "decode" ? 1
-                         : (cfg.mode == "prefill" ? cfg.prompt_len : cfg.seq_len);
-    const uint32_t kv_len = cfg.mode == "decode" ? cfg.prompt_len + 1 : q_len;
-    const uint32_t step = cfg.mode == "decode" ? cfg.prompt_len : 0;
-    InstructionId emb = append_embedding(b, cfg, "HBM.input_tokens",
-                                         "shared_obuf.S" + std::to_string(step) + ".embeddings",
-                                         q_len, {});
-    InstructionId layers = append_layer_stack(
-        b, cfg, q_len, kv_len, step,
-        "shared_obuf.S" + std::to_string(step) + ".embeddings", {emb});
-    append_output_head(b, cfg,
-                       "shared_obuf.L" + std::to_string(cfg.num_layers - 1) + ".layer_out",
-                       step, q_len, {layers});
+
+    if (cfg.mode == "decode") {
+        // True autoregressive decode: one q_len=1 GEMV per step, chained
+        // sequentially via token-feedback so each step depends on the previous.
+        // Step 0 reads from HBM.input_tokens (the seed / context token).
+        // Steps 1+ read from HBM.decode_token.posN written by the feedback op.
+        // KV cache grows by one entry each step (kv_len = prompt_len + step + 1).
+        InstructionId prev_sample{};
+        for (uint32_t step = 0; step < cfg.generation_steps; step++) {
+            const uint32_t pos    = cfg.prompt_len + step;
+            const uint32_t kv_len = cfg.prompt_len + step + 1;
+            std::vector<InstructionId> emb_deps;
+            std::string token_src;
+            if (step == 0) {
+                token_src = "HBM.input_tokens";
+            } else {
+                InstructionId fb = append_token_feedback(
+                    b, pos,
+                    "shared_obuf.S" + std::to_string(pos - 1) + ".sampled_token",
+                    {prev_sample});
+                token_src = "HBM.decode_token.pos" + std::to_string(pos);
+                emb_deps  = {fb};
+            }
+            InstructionId emb = append_embedding(
+                b, cfg, token_src,
+                "shared_obuf.S" + std::to_string(pos) + ".embeddings",
+                1, emb_deps);
+            InstructionId layers = append_layer_stack(
+                b, cfg, 1, kv_len, pos,
+                "shared_obuf.S" + std::to_string(pos) + ".embeddings", {emb});
+            prev_sample = append_output_head(
+                b, cfg,
+                "shared_obuf.L" + std::to_string(cfg.num_layers - 1) + ".layer_out",
+                pos, 1, {layers});
+        }
+    } else {
+        // prefill or layer mode: single-pass GEMM over the full sequence.
+        const uint32_t q_len = (cfg.mode == "prefill") ? cfg.prompt_len : cfg.seq_len;
+        InstructionId emb = append_embedding(
+            b, cfg, "HBM.input_tokens", "shared_obuf.S0.embeddings", q_len, {});
+        InstructionId layers = append_layer_stack(
+            b, cfg, q_len, q_len, 0, "shared_obuf.S0.embeddings", {emb});
+        append_output_head(
+            b, cfg,
+            "shared_obuf.L" + std::to_string(cfg.num_layers - 1) + ".layer_out",
+            0, q_len, {layers});
+    }
     return finish(b);
 }
 
