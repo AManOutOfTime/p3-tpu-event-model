@@ -29,7 +29,7 @@ Groups
   3b  SW      — tile size                    (3 cases: sub / exact / over)
   3c  SW      — KV cache on/off
   3d  SW      — head_dim × hidden_dim        ← NEW  (num_q_heads=32 fixed)
-  3e  SW      — max_seq_len / KV footprint   ← NEW  (gen_steps=8 for decode stats)
+  3e  SW      — max_seq_len / KV footprint   ← NEW  (gen_steps=32 for decode stats)
   4a  GQA     — 8B  MHA→MQA
   4b  GQA     — 70B MHA→MQA
   5   Pareto  — array-size × HBM-bw grid
@@ -471,7 +471,7 @@ def make_sweep(hw, wl1b, wl8b, wl70b, models):
     # Three meaningful cases only:
     #   sub-tile  → tiler actively decomposes, array underutilised
     #   exact fit → tiler is a passthrough (1 instr = 1 array execution)
-    #   over-size → tiler emits N²  passes per instruction
+    #   over-size → tiler emits N² passes per instruction
     for ts, note in [
         (128, f"sub-tile: tiler active, {128*128*100//(arr*arr)}% array util"),
         (256, "EXACT FIT: tiler passthrough"),
@@ -499,7 +499,7 @@ def make_sweep(hw, wl1b, wl8b, wl70b, models):
              f"  FFN={r['ffn_pct']}% attn={r['attn_pct']}%",
              wl_ov=dict(head_dim=hd, hidden_dim=hidd))
 
-    # 3e is intentionally omitted here — it uses gen_steps=2 which makes each
+    # 3e is intentionally omitted here — it uses gen_steps=32 which makes each
     # run ~10-20% slower. It runs AFTER group 5 (Pareto) so all fast
     # TTFT-producing configs complete first. See below.
 
@@ -518,10 +518,10 @@ def make_sweep(hw, wl1b, wl8b, wl70b, models):
             add("4a_gqa_8b", f"kv{kv}_{tag.split()[0]}{mode_sfx}",
                 f"8B kv_heads={kv} gqa_group={grp_sz} ({tag}) [mode={mode}]",
                 wl_ov=dict(
-                num_kv_heads=kv,
-                gqa_group=grp_sz,
-                mode=mode,
-                gen_steps=32 if mode == "decode" else wl8b.get("gen_steps", 1)),
+                    num_kv_heads=kv,
+                    gqa_group=grp_sz,
+                    mode=mode,
+                    gen_steps=32 if mode == "decode" else wl8b.get("gen_steps", 1)),
                 model="8b")
 
     # ── 4b. GQA sweep 70B ────────────────────────────────────────────────────
@@ -567,9 +567,11 @@ def make_sweep(hw, wl1b, wl8b, wl70b, models):
              modes=("decode",))
 
     # ── 6. Calibration ───────────────────────────────────────────────────────
-    # Runs in prefill_decode mode. hbm_util_pct (bandwidth fraction) is what
-    # we compare — not absolute TPS — so mode doesn't change the calibration
-    # conclusion. SDB=OFF shows baseline gap; SDB=ON is the ±20% target.
+    # Runs in decode mode (gen_steps=32) because published bs=1 TPS numbers
+    # are decode-only — prefill_decode would mix in prefill HBM traffic and
+    # inflate hbm_util_pct relative to the reference figures.
+    # hbm_util_pct (bandwidth fraction) is what we compare — not absolute TPS.
+    # SDB=OFF shows baseline gap; SDB=ON is the ±20% target.
     for chip, p in CALIB.items():
         for sdb in [False, True]:
             add("6_calibration",
@@ -579,7 +581,8 @@ def make_sweep(hw, wl1b, wl8b, wl70b, models):
                 f"  pub_hbm_util={p['pub_hbm_util_pct']}%",
                 arch_ov={k: v for k, v in p.items()
                          if k not in ("pub_tps_bs1", "pub_hbm_util_pct")}
-                        | {"stage_double_buffer": sdb})
+                        | {"stage_double_buffer": sdb},
+                wl_ov=dict(mode="decode", gen_steps=32))
 
     return runs
 
@@ -847,10 +850,10 @@ def main():
         if not Path(path).exists():
             print(f"WARNING: {lbl} not found: {path}", file=sys.stderr)
 
-    hw    = read_arch(args.hw)             if Path(args.hw).exists()           else None
-    wl1b  = read_workload(args.workload1b) if Path(args.workload1b).exists()   else None
-    wl8b  = read_workload(args.workload8b) if Path(args.workload8b).exists()   else None
-    wl70b = read_workload(args.workload70b)if Path(args.workload70b).exists()  else None
+    hw    = read_arch(args.hw)             if Path(args.hw).exists()            else None
+    wl1b  = read_workload(args.workload1b) if Path(args.workload1b).exists()    else None
+    wl8b  = read_workload(args.workload8b) if Path(args.workload8b).exists()    else None
+    wl70b = read_workload(args.workload70b) if Path(args.workload70b).exists()  else None
 
     if not hw:              sys.exit(f"Cannot read --hw: {args.hw}")
     if "1b"  in models and not wl1b:
@@ -908,10 +911,10 @@ def main():
 
     # Runtime estimate: prefill_decode ~35s for 8B, ~86s for 70B (80 layers).
     # Decode mode ~2s for 8B, ~4s for 70B (no prefill, just one decode step).
-    pd_8b  = sum(1 for e in sweep if e[4].get("mode")=="prefill_decode" and e[5]=="8b")
-    pd_70b = sum(1 for e in sweep if e[4].get("mode")=="prefill_decode" and e[5]=="70b")
-    dec_8b = sum(1 for e in sweep if e[4].get("mode")=="decode"          and e[5]=="8b")
-    dec_70b= sum(1 for e in sweep if e[4].get("mode")=="decode"          and e[5]=="70b")
+    pd_8b   = sum(1 for e in sweep if e[4].get("mode") == "prefill_decode" and e[5] == "8b")
+    pd_70b  = sum(1 for e in sweep if e[4].get("mode") == "prefill_decode" and e[5] == "70b")
+    dec_8b  = sum(1 for e in sweep if e[4].get("mode") == "decode"         and e[5] == "8b")
+    dec_70b = sum(1 for e in sweep if e[4].get("mode") == "decode"         and e[5] == "70b")
     total_est = (pd_8b*35 + pd_70b*86 + dec_8b*2 + dec_70b*4) // 60
     print(f"Sweep: {len(sweep)} configs (~{total_est} min est.)  "
           f"--model={args.model}  "
